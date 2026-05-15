@@ -241,8 +241,6 @@ class AleatoriedadeValidator:
                 'baseline_max_mean': float(max_mag_mean),
                 'baseline_max_std': float(max_mag_std),
                 'z_score_max': float(z_max),
-                'baseline_peaks_mean': float(peak_count_mean),
-                'baseline_peaks_std': float(peak_count_std),
                 'is_anomalous': abs(z_max) > 2
             }
         
@@ -696,8 +694,8 @@ class AleatoriedadeValidator:
     
         # FFT
         for feature, res in results['fft'].items():
-            all_pvalues.append(res['p_value_max'])
-            all_pvalues.append(res['p_value_peaks'])
+            p = 2 * (1 - norm.cdf(abs(res['z_score_max'])))
+            all_pvalues.append(p)
     
         # Permutation Entropy
         for feature, res in results['permutation_entropy'].items():
