@@ -742,7 +742,8 @@ class AleatoriedadeValidator:
         # Permutation Entropy
         for feature, res in results['permutation_entropy'].items():
             total_tests += 1
-            if res['is_different']:
+            z = abs(res.get('z_score', 0))
+            if z > 2:
                 significant_tests += 1
         
         # NIST
