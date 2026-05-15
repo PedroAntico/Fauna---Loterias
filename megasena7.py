@@ -315,14 +315,14 @@ class AleatoriedadeValidator:
                 'pe_baseline_mean': float(pe_mean),
                 'pe_baseline_std': float(pe_std),
                 'z_score': float((pe_real - pe_mean) / pe_std) if pe_std > 0 else 0,
-                'is_different': abs((pe_real - pe_mean) / pe_std) > 2 if pe_std > 0 else False
+                'p_value': float( 2 * (1 - norm.cdf(abs((pe_real - pe_mean) / pe_std)))) if pe_std > 0 else 1.0
             }
         
         print(f"\n📊 PERMUTATION ENTROPY:")
         for feature, results in self.permutation_entropy.items():
             print(f"   • {feature}: PE={results['pe_normalized']:.4f} "
                   f"(baseline: {results['pe_baseline_mean']:.4f}±{results['pe_baseline_std']:.4f}) "
-                  f"{'⚠️' if results['is_different'] else '✅'}")
+                  f"{'⚠️' if results['p_value'] < 0.05 else '✅'}")
         
         return self.permutation_entropy
     
