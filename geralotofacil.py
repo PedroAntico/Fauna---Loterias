@@ -405,7 +405,7 @@ class LotofacilCoverageOptimizer:
         
         # Simulação de cobertura de premiação
         # Gerar jogos de teste aleatórios e verificar quantos acertos parciais
-        prize_coverage = self._simulate_prize_coverage(pool, n_simulations=100)
+        prize_coverage = self._simulate_prize_coverage(pool, n_simulations=10000)
         
         return {
             'dezenas_cobertas': dezenas_cobertas,
