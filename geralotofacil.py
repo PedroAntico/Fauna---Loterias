@@ -439,7 +439,7 @@ class LotofacilCoverageOptimizer:
             for game in pool:
                 hits = len(set(game) & drawn)
                 
-                 if hits >= 11:
+                if hits >= 11:
                     found[hits] = True
         
             for k,v in found.items():
