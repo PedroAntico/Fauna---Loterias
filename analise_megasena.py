@@ -385,7 +385,7 @@ class MegaSenaAdvancedAnalyzer:
         
         print(f"   • Significativos (não corrigido): {significant_before}")
         print(f"   • Significativos (Bonferroni): {sum(1 for _, _, p in self.all_pvalues if p < 0.05/len(self.all_pvalues))}")
-        print(f"   • Significativos (BH): {sum(1 for r in self.bh_results if r['reject'])}")
+        print(f"   • Significativos (BH): {sum(1 for r in self.bh_results if r['bh_reject'])}")
         
         return self.comparison_results
     
