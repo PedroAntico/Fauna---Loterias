@@ -222,7 +222,6 @@ class AleatoriedadeValidator:
                 
                 # Contar picos (threshold = média + 2*std)
                 threshold = np.percentile(fft_random, 99)
-                fft_peak_counts.append(np.sum(fft_random > threshold))
             
             # Estatísticas do baseline
             max_mag_mean = np.mean(fft_max_magnitudes)
@@ -233,24 +232,18 @@ class AleatoriedadeValidator:
             # Valores observados
             observed_max = np.max(fft_real)
             threshold_obs = np.percentile(fft_real, 99)
-            observed_peaks = np.sum(fft_real > threshold_obs)
             
             # Z-scores
             z_max = (observed_max - max_mag_mean) / max_mag_std if max_mag_std > 0 else 0
-            z_peaks = (observed_peaks - peak_count_mean) / peak_count_std if peak_count_std > 0 else 0
             
             self.fft_baseline[feature] = {
                 'observed_max_magnitude': float(observed_max),
                 'baseline_max_mean': float(max_mag_mean),
                 'baseline_max_std': float(max_mag_std),
                 'z_score_max': float(z_max),
-                'observed_peaks': int(observed_peaks),
                 'baseline_peaks_mean': float(peak_count_mean),
                 'baseline_peaks_std': float(peak_count_std),
-                'z_score_peaks': float(z_peaks),
-                'p_value_max': float(2 * (1 - norm.cdf(abs(z_max)))),
-                'p_value_peaks': float(2 * (1 - norm.cdf(abs(z_peaks)))),
-                'is_anomalous': abs(z_max) > 2 or abs(z_peaks) > 2
+                'is_anomalous': abs(z_max) > 2
             }
         
         # Resultados
@@ -604,8 +597,8 @@ class AleatoriedadeValidator:
         
         print(f"\n📊 COMPRESSIBILIDADE:")
         for name, results in self.compressibility.items():
-            status = '⚠️ COMPRESSÍVEL' if results['is_compressible'] else '✅ INCOMPRESSÍVEL'
-            print(f"   • {name}: {results['ratio']:.3f} ({results['compressed_bytes']}/{results['original_bytes']} bytes) {status}")
+            status = '⚠️ ANÔMALO' if results['is_anomalous'] else '✅ NORMAL'
+            print(f"   • {name}: " f"ratio={results['ratio']:.3f} " f"(baseline={results['baseline_mean']:.3f}±{results['baseline_std']:.3f}) " f"z={results['z_score']:.2f} " f"{status}")
         
         return self.compressibility
     
