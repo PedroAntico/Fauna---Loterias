@@ -2,22 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
-SISTEMA AVANÇADO DE OTIMIZAÇÃO COMBINATÓRIA - LOTOFÁCIL
-========================================================
-Versão 1.0 - Otimização Global com Cobertura Explícita
-
-CARACTERÍSTICAS DA LOTOFÁCIL:
-✅ 25 números (01 a 25)
-✅ 15 números por aposta
-✅ Alta probabilidade de acertos parciais
-✅ Menor espaço amostral que Mega-Sena
-✅ Foco em cobertura de 11, 12, 13, 14 pontos
-
-ESTRATÉGIA:
-Maximizar cobertura de combinações parciais
-Otimizar diversidade estrutural
-Minimizar sobreposição entre bilhetes
-Manter estatísticas historicamente típicas
+SISTEMA AVANÇADO DE OTIMIZAÇÃO COMBINATÓRIA - LOTOFÁCIL v2.0
+=============================================================
+CORREÇÕES CRÍTICAS:
+✅ Penalidade pesada para sequências consecutivas
+✅ Anti-redundância de pares (pair redundancy)
+✅ Penalidade de sobreposição entre bilhetes
+✅ Restrições estruturais fortes (linhas/colunas)
+✅ Substituição de cobertura absoluta por cobertura útil
+✅ Balanceamento estrutural forçado
 """
 
 import pandas as pd
@@ -25,14 +18,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import stats
-from scipy.spatial.distance import mahalanobis, hamming, euclidean
+from scipy.spatial.distance import hamming, euclidean
 from scipy.stats import entropy
-from scipy.linalg import det
-from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
-from sklearn.covariance import EmpiricalCovariance
 from collections import Counter, defaultdict
-from itertools import combinations, product
+from itertools import combinations
 import warnings
 import os
 from datetime import datetime
@@ -46,189 +36,121 @@ sns.set_palette("husl")
 plt.rcParams['figure.figsize'] = (14, 8)
 plt.rcParams['figure.dpi'] = 150
 
-class LotofacilCoverageOptimizer:
+class LotofacilOptimizerV2:
     """
-    Otimizador Avançado de Cobertura para Lotofácil
+    Otimizador de Cobertura Lotofácil - Versão 2.0
     
-    Específico para 25 números, 15 por aposta
-    Foco em maximizar cobertura de acertos parciais (11-14 pontos)
+    FOCO EM:
+    - Cobertura ÚTIL (não absoluta)
+    - Anti-redundância de pares
+    - Penalidades estruturais fortes
+    - Balanceamento de padrões
     """
     
     def __init__(self, historical_csv='resultados_lotofacil.csv'):
-        """
-        Inicializa o otimizador para Lotofácil
-        
-        Args:
-            historical_csv: Arquivo CSV com resultados históricos
-                           Formato: concurso;data;b1;b2;...;b15
-        """
+        """Inicialização"""
         self.historical_csv = historical_csv
         self.df = None
         self.dezenas_historicas = None
         
-        # Parâmetros específicos da Lotofácil
+        # Parâmetros Lotofácil
         self.TOTAL_NUMBERS = 25
         self.NUMBERS_PER_GAME = 15
-        self.MIN_PRIZE = 11  # Mínimo para premiação
+        self.MIN_PRIZE = 11
         
-        # Features para análise multivariada
+        # Features simplificadas (foco combinatório)
         self.feature_names = [
-            'soma', 'pares', 'impares', 'primos', 'fibonacci',
-            'q1', 'q2', 'q3', 'q4', 'q5',  # 5 quadrantes de 5 números
-            'amplitude', 'distancia_media', 'consecutivas',
-            'multiplos_3', 'multiplos_5', 'numeros_baixos', 'numeros_altos'
+            'soma', 'pares', 'impares', 'primos',
+            'q1', 'q2', 'q3', 'q4', 'q5',
+            'amplitude', 'distancia_media', 'consecutivas'
         ]
         
         # Conjuntos matemáticos
         self.primes = self._gen_primes(25)
-        self.fibonacci = self._gen_fibonacci(25)
         
-        # Estatísticas
-        self.reference_stats = {}
-        self.cov_matrix = None
-        self.inv_cov_matrix = None
-        self.feature_means = None
-        
-        # Padrões humanos
-        self.human_patterns = self._define_human_patterns()
+        # Padrões estruturais proibidos/penalizados
+        self.structural_constraints = self._define_structural_constraints()
         
         # Carregar dados
         self._load_historical_data()
-        self._compute_multivariate_reference()
         
-        print("✅ Otimizador Lotofácil inicializado!")
-        print(f"📊 {len(self.df)} concursos históricos analisados")
-        print(f"🎯 Otimizando para {self.NUMBERS_PER_GAME} números em {self.TOTAL_NUMBERS}")
+        print("✅ Otimizador Lotofácil v2.0 inicializado!")
+        print(f"📊 {len(self.df)} concursos históricos")
+        print(f"🎯 Foco em cobertura ÚTIL e anti-redundância")
     
     def _gen_primes(self, limit):
-        """Gera números primos até o limite"""
         return {n for n in range(2, limit+1) 
                 if all(n % i != 0 for i in range(2, int(n**0.5)+1))}
     
-    def _gen_fibonacci(self, limit):
-        """Gera números Fibonacci até o limite"""
-        fib = [0, 1]
-        while fib[-1] <= limit:
-            fib.append(fib[-1] + fib[-2])
-        return set(f for f in fib[2:] if f <= limit)
-    
-    def _define_human_patterns(self):
+    def _define_structural_constraints(self):
         """
-        Define padrões humanos comuns na Lotofácil
+        Define restrições estruturais FORTES
+        para evitar padrões viciados
         """
-        # Sequências óbvias
-        sequences = [
-            set(range(1, 16)),      # 1-15
-            set(range(11, 26)),     # 11-25
-            set(range(1, 26, 2)),   # Todos ímpares
-            set(range(2, 26, 2)),   # Todos pares
-            {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15},  # Primeira metade
-            {11,12,13,14,15,16,17,18,19,20,21,22,23,24,25},  # Segunda metade
-        ]
-        
-        # Números "da sorte" populares
-        lucky_numbers = {1, 3, 7, 8, 13, 17, 21, 23, 25}
-        
-        # Padrões de data (dia + mês <= 25)
-        date_numbers = set(range(1, 32)) & set(range(1, 26))
-        
-        # Padrões de linha/coluna no volante (5x5)
-        line_patterns = [
-            {1,2,3,4,5},      # Linha 1
-            {6,7,8,9,10},     # Linha 2
-            {11,12,13,14,15}, # Linha 3
-            {16,17,18,19,20}, # Linha 4
-            {21,22,23,24,25}, # Linha 5
-        ]
-        
-        column_patterns = [
-            {1,6,11,16,21},   # Coluna 1
-            {2,7,12,17,22},   # Coluna 2
-            {3,8,13,18,23},   # Coluna 3
-            {4,9,14,19,24},   # Coluna 4
-            {5,10,15,20,25},  # Coluna 5
-        ]
-        
         return {
-            'sequences': sequences,
-            'lucky_numbers': lucky_numbers,
-            'date_numbers': date_numbers,
-            'line_patterns': line_patterns,
-            'column_patterns': column_patterns,
-            'common_pairs': self._generate_common_pairs()
+            # Blocos consecutivos MÁXIMOS permitidos
+            'max_consecutive_block': 4,  # Máximo 4 números consecutivos
+            
+            # Linhas completas PROIBIDAS (volante 5x5)
+            'forbidden_lines': [
+                {1,2,3,4,5},
+                {6,7,8,9,10},
+                {11,12,13,14,15},
+                {16,17,18,19,20},
+                {21,22,23,24,25}
+            ],
+            
+            # Colunas completas PROIBIDAS
+            'forbidden_columns': [
+                {1,6,11,16,21},
+                {2,7,12,17,22},
+                {3,8,13,18,23},
+                {4,9,14,19,24},
+                {5,10,15,20,25}
+            ],
+            
+            # Máximo de números em uma única linha
+            'max_per_line': 4,
+            
+            # Máximo de números em uma única coluna
+            'max_per_column': 4,
+            
+            # Penalidades
+            'consecutive_penalty_weight': 5.0,
+            'line_penalty_weight': 10.0,
+            'column_penalty_weight': 10.0,
+            'pair_redundancy_weight': 3.0,
+            'overlap_penalty_weight': 4.0
         }
     
-    def _generate_common_pairs(self):
-        """Pares frequentemente escolhidos juntos"""
-        common_pairs = set()
-        
-        # Consecutivos
-        for i in range(1, 25):
-            common_pairs.add((i, i+1))
-        
-        # Mesma coluna (diferença 5)
-        for i in range(1, 21):
-            common_pairs.add((i, i+5))
-        
-        # Datas comemorativas (pares de dia/mês)
-        date_pairs = [(1,1), (25,12), (7,9), (12,10), (15,11), (2,11)]
-        for d1, d2 in date_pairs:
-            if d1 <= 25 and d2 <= 25:
-                common_pairs.add((min(d1, d2), max(d1, d2)))
-        
-        return common_pairs
-    
     def _load_historical_data(self):
-        """Carrega dados históricos da Lotofácil"""
-        print("📂 Carregando dados históricos da Lotofácil...")
+        """Carrega dados históricos"""
+        print("📂 Carregando dados históricos...")
         
-        # Tentar carregar, se não existir, gerar dados sintéticos para demonstração
         try:
             self.df = pd.read_csv(self.historical_csv, sep=';', encoding='utf-8')
-            print("   ✅ Arquivo histórico encontrado")
+            bola_cols = [f'b{i}' for i in range(1, 16)]
+            self.df.columns = ['concurso', 'data'] + bola_cols
+            self.df['data'] = pd.to_datetime(self.df['data'], format='%d/%m/%Y', errors='coerce')
+            self.dezenas_historicas = self.df[bola_cols].values
+            print(f"   ✅ {len(self.df)} concursos carregados")
         except FileNotFoundError:
             print("   ⚠️  Arquivo não encontrado. Gerando dados sintéticos...")
             self._generate_synthetic_data()
-            return
-        
-        # Identificar colunas
-        bola_cols = [f'b{i}' for i in range(1, 16)]
-        self.df.columns = ['concurso', 'data'] + bola_cols
-        self.df['data'] = pd.to_datetime(self.df['data'], format='%d/%m/%Y', errors='coerce')
-        self.dezenas_historicas = self.df[bola_cols].values
-        
-        print(f"   ✅ {len(self.df)} concursos carregados")
     
-    def _generate_synthetic_data(self, n_games=2000):
-        """
-        Gera dados sintéticos baseados em distribuições realistas
-        para demonstração quando não há arquivo histórico
-        """
+    def _generate_synthetic_data(self, n_games=3000):
+        """Gera dados sintéticos balanceados"""
         print("   🔧 Gerando dados sintéticos realistas...")
         
         synthetic_games = []
-        
         for _ in range(n_games):
-            # Simular distribuição realista
-            # Na Lotofácil, as dezenas têm distribuição aproximadamente uniforme
-            # mas com pequenas variações
+            # Distribuição mais uniforme
+            weights = np.ones(25) + np.random.normal(0, 0.05, 25)
+            weights = np.abs(weights) / np.sum(np.abs(weights))
             
-            # Gerar pesos ligeiramente diferentes para simular não-uniformidade
-            weights = np.ones(25)
-            # Pequenas variações aleatórias nos pesos
-            weights += np.random.normal(0, 0.1, 25)
-            weights = np.abs(weights)
-            weights = weights / weights.sum()
-            
-            game = sorted(np.random.choice(
-                range(1, 26), 
-                size=15, 
-                replace=False, 
-                p=weights
-            ))
+            game = sorted(np.random.choice(range(1, 26), 15, replace=False, p=weights))
             synthetic_games.append(game)
         
-        # Criar DataFrame sintético
         self.df = pd.DataFrame({
             'concurso': range(1, n_games + 1),
             'data': pd.date_range(start='2003-09-29', periods=n_games, freq='3D')
@@ -242,420 +164,365 @@ class LotofacilCoverageOptimizer:
         
         print(f"   ✅ {len(self.df)} jogos sintéticos gerados")
     
-    def _extract_features(self, game):
+    def _count_consecutive_blocks(self, game):
         """
-        Extrai vetor de features para um jogo da Lotofácil
-        
-        Features específicas para 25 números, 15 por jogo
+        Conta blocos consecutivos e seus tamanhos
+        Retorna: (total_consecutivos, max_block_size, num_blocks)
         """
-        game = np.array(sorted(game))
+        d = sorted(game)
+        blocks = []
+        current_block = 1
         
-        # Quadrantes (5 regiões de 5 números cada)
-        q1 = np.sum((game >= 1) & (game <= 5))
-        q2 = np.sum((game >= 6) & (game <= 10))
-        q3 = np.sum((game >= 11) & (game <= 15))
-        q4 = np.sum((game >= 16) & (game <= 20))
-        q5 = np.sum((game >= 21) & (game <= 25))
-        
-        return np.array([
-            np.sum(game),                                    # soma
-            np.sum(game % 2 == 0),                          # pares
-            np.sum(game % 2 != 0),                          # impares
-            np.sum(np.isin(game, list(self.primes))),       # primos
-            np.sum(np.isin(game, list(self.fibonacci))),    # fibonacci
-            q1, q2, q3, q4, q5,                             # quadrantes
-            game.max() - game.min(),                         # amplitude
-            np.mean([game[i+1] - game[i] for i in range(14)]), # distancia_media
-            self._count_consecutive(game),                   # consecutivas
-            np.sum(game % 3 == 0),                          # multiplos_3
-            np.sum(game % 5 == 0),                          # multiplos_5
-            np.sum(game <= 12),                             # numeros_baixos
-            np.sum(game >= 14),                             # numeros_altos
-        ])
-    
-    def _count_consecutive(self, dezenas):
-        """Conta sequências consecutivas"""
-        d = sorted(dezenas)
-        count = 0
-        seq = 1
-        for i in range(len(d)-1):
+        for i in range(len(d) - 1):
             if d[i+1] - d[i] == 1:
-                seq += 1
+                current_block += 1
             else:
-                if seq >= 2:
-                    count += seq
-                seq = 1
-        if seq >= 2:
-            count += seq
-        return count
+                if current_block >= 2:
+                    blocks.append(current_block)
+                current_block = 1
+        
+        if current_block >= 2:
+            blocks.append(current_block)
+        
+        total = sum(blocks) if blocks else 0
+        max_block = max(blocks) if blocks else 0
+        
+        return total, max_block, len(blocks)
     
-    def _compute_multivariate_reference(self):
-        """Calcula referência multivariada completa"""
-        print("📊 Calculando referência multivariada...")
-        
-        # Extrair features de todos os concursos
-        X = np.array([self._extract_features(d) for d in self.dezenas_historicas])
-        
-        # Estatísticas
-        self.feature_means = np.mean(X, axis=0)
-        self.feature_stds = np.std(X, axis=0)
-        
-        # Matriz de covariância para Mahalanobis
-        cov_estimator = EmpiricalCovariance().fit(X)
-        self.cov_matrix = cov_estimator.covariance_
-        self.cov_matrix += np.eye(len(self.feature_names)) * 1e-6
-        self.inv_cov_matrix = np.linalg.inv(self.cov_matrix)
-        
-        # PCA
-        self.scaler = StandardScaler()
-        X_scaled = self.scaler.fit_transform(X)
-        self.pca = PCA(n_components=0.95)
-        self.pca.fit(X_scaled)
-        
-        # Frequência individual das dezenas
-        freq = np.bincount(self.dezenas_historicas.flatten(), minlength=26)[1:]
-        self.reference_stats['frequencia'] = freq / len(self.dezenas_historicas)
-        
-        # Distribuição de pares/ímpares
-        pares = np.sum(self.dezenas_historicas % 2 == 0, axis=1)
-        self.reference_stats['pares_dist'] = np.bincount(pares, minlength=16) / len(pares)
-        
-        print(f"   ✅ {len(self.feature_names)} features extraídas")
-        print(f"   ✅ PCA: {self.pca.n_components_} componentes principais")
-    
-    def mahalanobis_distance(self, game):
-        """Distância de Mahalanobis multivariada"""
-        features = self._extract_features(game)
-        return mahalanobis(features, self.feature_means, self.inv_cov_matrix)
-    
-    def _compute_human_score(self, game):
+    def _check_structural_violations(self, game):
         """
-        Calcula quão "humano" é um jogo (para EV Optimizer)
-        Quanto maior, mais provável que humanos escolham
+        Verifica violações estruturais e retorna penalidade
+        
+        Penalidades PESADAS para:
+        - Blocos consecutivos longos
+        - Linhas/colunas muito preenchidas
+        - Padrões de volante
         """
         game_set = set(game)
-        score = 0
+        penalty = 0
         
-        # Números de data
-        date_count = len(game_set & self.human_patterns['date_numbers'])
-        score += date_count * 2
+        constraints = self.structural_constraints
         
-        # Números da sorte
-        lucky_count = len(game_set & self.human_patterns['lucky_numbers'])
-        score += lucky_count * 3
+        # 1. Blocos consecutivos
+        total_cons, max_block, num_blocks = self._count_consecutive_blocks(game)
         
-        # Sequências conhecidas
-        for seq in self.human_patterns['sequences']:
-            overlap = len(game_set & seq)
-            if overlap >= 10:  # Mais rigoroso por ser 15 números
-                score += overlap * 3
+        if max_block > constraints['max_consecutive_block']:
+            # Penalidade exponencial para blocos muito longos
+            excess = max_block - constraints['max_consecutive_block']
+            penalty += excess * excess * constraints['consecutive_penalty_weight']
         
-        # Padrões de linha
-        for line in self.human_patterns['line_patterns']:
+        if total_cons >= 6:
+            # Penalidade adicional para muitos consecutivos
+            penalty += (total_cons - 5) * constraints['consecutive_penalty_weight']
+        
+        # 2. Linhas do volante
+        for line in constraints['forbidden_lines']:
             overlap = len(game_set & line)
-            if overlap >= 4:
-                score += overlap * 2
+            if overlap > constraints['max_per_line']:
+                penalty += (overlap - constraints['max_per_line']) * constraints['line_penalty_weight']
         
-        # Padrões de coluna
-        for col in self.human_patterns['column_patterns']:
+        # 3. Colunas do volante
+        for col in constraints['forbidden_columns']:
             overlap = len(game_set & col)
-            if overlap >= 4:
-                score += overlap * 2
+            if overlap > constraints['max_per_column']:
+                penalty += (overlap - constraints['max_per_column']) * constraints['column_penalty_weight']
         
-        # Pares comuns
-        for pair in combinations(sorted(game), 2):
-            if pair in self.human_patterns['common_pairs']:
-                score += 0.5
-        
-        return score
+        return penalty
     
-    def _compute_coverage_metrics(self, pool):
+    def _compute_pair_redundancy(self, pool):
         """
-        Calcula métricas de cobertura específicas para Lotofácil
+        Calcula redundância de pares no pool
         
-        Foco em cobertura de 11, 12, 13, 14 pontos
+        Menor redundância = melhor distribuição
+        """
+        pair_counter = Counter()
+        
+        for game in pool:
+            for pair in combinations(sorted(game), 2):
+                pair_counter[pair] += 1
+        
+        if not pair_counter:
+            return 0, 0
+        
+        counts = list(pair_counter.values())
+        avg_redundancy = np.mean(counts)
+        max_redundancy = np.max(counts)
+        
+        # Penalizar pares muito repetidos
+        overused = sum(1 for c in counts if c > 3)
+        
+        return avg_redundancy, overused
+    
+    def _compute_overlap_matrix(self, pool):
+        """
+        Calcula matriz de sobreposição entre bilhetes
+        """
+        n = len(pool)
+        overlaps = []
+        
+        for i in range(n):
+            for j in range(i+1, n):
+                common = len(set(pool[i]) & set(pool[j]))
+                overlaps.append(common)
+        
+        if not overlaps:
+            return 0, 0, 0
+        
+        return np.mean(overlaps), np.max(overlaps), np.min(overlaps)
+    
+    def _simulate_prize_coverage(self, pool, n_simulations=5000):
+        """
+        Simula cobertura de premiação
+        """
+        results = {11: [], 12: [], 13: [], 14: [], 15: []}
+        
+        for _ in range(n_simulations):
+            drawn = set(np.random.choice(range(1, 26), 15, replace=False))
+            
+            counts = {11: 0, 12: 0, 13: 0, 14: 0, 15: 0}
+            
+            for game in pool:
+                hits = len(set(game) & drawn)
+                if hits >= 11:
+                    counts[hits] += 1
+            
+            for k in counts:
+                results[k].append(counts[k])
+        
+        return {k: np.mean(v) for k, v in results.items()}
+    
+    def _compute_pool_fitness(self, pool):
+        """
+        FITNESS GLOBAL DO POOL - VERSÃO CORRIGIDA
+        
+        Prioridades:
+        1. Minimizar penalidades estruturais
+        2. Minimizar redundância de pares
+        3. Minimizar sobreposição
+        4. Maximizar cobertura de premiação
+        5. Manter diversidade
         """
         n_games = len(pool)
         
-        # Cobertura de dezenas
-        all_dezenas = set()
+        # 1. PENALIDADES ESTRUTURAIS (25 pontos - invertido)
+        total_structural_penalty = 0
         for game in pool:
-            all_dezenas.update(game)
+            penalty = self._check_structural_violations(game)
+            total_structural_penalty += penalty
         
-        dezenas_cobertas = len(all_dezenas)
-        coverage_pct = dezenas_cobertas / self.TOTAL_NUMBERS
+        avg_structural_penalty = total_structural_penalty / n_games
+        structural_score = max(0, 25 - avg_structural_penalty * 2)
         
-        # Cobertura de pares
-        all_pairs = set()
-        for game in pool:
-            for pair in combinations(sorted(game), 2):
-                all_pairs.add(pair)
+        # 2. REDUNDÂNCIA DE PARES (25 pontos)
+        avg_redundancy, overused_pairs = self._compute_pair_redundancy(pool)
+        pair_redundancy_penalty = avg_redundancy * self.structural_constraints['pair_redundancy_weight']
+        pair_redundancy_penalty += overused_pairs * 2
+        redundancy_score = max(0, 25 - pair_redundancy_penalty)
         
-        total_pairs = self.TOTAL_NUMBERS * (self.TOTAL_NUMBERS - 1) // 2
-        pair_coverage = len(all_pairs) / total_pairs
+        # 3. SOBREPOSIÇÃO (20 pontos)
+        avg_overlap, max_overlap, min_overlap = self._compute_overlap_matrix(pool)
+        overlap_penalty = (avg_overlap - 8) * self.structural_constraints['overlap_penalty_weight']
+        overlap_score = max(0, 20 - overlap_penalty)
         
-        # Cobertura de trincas
-        all_triples = set()
-        for game in pool:
-            for triple in combinations(sorted(game), 3):
-                all_triples.add(triple)
+        # 4. COBERTURA DE PREMIAÇÃO (20 pontos)
+        prize_coverage = self._simulate_prize_coverage(pool, n_simulations=2000)
         
-        total_triples = self.TOTAL_NUMBERS * (self.TOTAL_NUMBERS - 1) * (self.TOTAL_NUMBERS - 2) // 6
-        triple_coverage = len(all_triples) / total_triples
-        
-        # Simulação de cobertura de premiação
-        # Gerar jogos de teste aleatórios e verificar quantos acertos parciais
-        prize_coverage = self._simulate_prize_coverage(pool, n_simulations=10000)
-        
-        return {
-            'dezenas_cobertas': dezenas_cobertas,
-            'coverage_pct': coverage_pct,
-            'pares_cobertos': len(all_pairs),
-            'pair_coverage': pair_coverage,
-            'trincas_cobertas': len(all_triples),
-            'triple_coverage': triple_coverage,
-            'avg_11_points': prize_coverage.get(11, 0),
-            'avg_12_points': prize_coverage.get(12, 0),
-            'avg_13_points': prize_coverage.get(13, 0),
-            'avg_14_points': prize_coverage.get(14, 0)
-        }
-    
-    def _simulate_prize_coverage(self, pool, n_simulations=1000):
-
-            results = {
-                11: [],
-                12: [],
-                13: [],
-                14: [],
-                15: []
-            }
-        
-            for _ in range(n_simulations):
-        
-                drawn = set(
-                    np.random.choice(range(1, 26), 15, replace=False)
-                )
-        
-                counts = {
-                    11: 0,
-                    12: 0,
-                    13: 0,
-                    14: 0,
-                    15: 0 }
-        
-                for game in pool:
-        
-                    hits = len(set(game) & drawn)
-        
-                    if hits >= 11:
-                        counts[hits] += 1
-        
-                for k in counts:
-                    results[k].append(counts[k])
-        
-            return {
-                k: np.mean(v)
-                for k, v in results.items()
-            }
-        
-    def _compute_overlap_penalty(self, pool):
-
-        overlaps = []
-    
-        for i in range(len(pool)):
-            for j in range(i + 1, len(pool)):
-    
-                common = len(set(pool[i]) & set(pool[j]))
-                overlaps.append(common)
-    
-        avg_overlap = np.mean(overlaps)
-    
-        return avg_overlap
-        
-    def _compute_pool_global_fitness(self, pool):
-        """
-        FITNESS GLOBAL DO POOL PARA LOTOFÁCIL
-        
-        Adaptado para 25 números, 15 por jogo
-        Maior peso em cobertura de premiação parcial
-        """
-        # Métricas de cobertura
-        coverage = self._compute_coverage_metrics(pool)
-        
-        # 1. COBERTURA DE DEZENAS (15 pontos)
-        dezenas_score = coverage['coverage_pct'] * 15
-        
-        # 2. COBERTURA COMBINATÓRIA (25 pontos)
-        pair_score = coverage['pair_coverage'] * 12
-        triple_score = coverage['triple_coverage'] * 13
-        combinatorial_score = pair_score + triple_score
-        
-        # 3. COBERTURA DE PREMIAÇÃO (25 pontos)
-        # Foco em 11-14 pontos
         prize_score = (
-            coverage['avg_11_points'] * 5 +
-            coverage['avg_12_points'] * 7 +
-            coverage['avg_13_points'] * 8 +
-            coverage['avg_14_points'] * 5
+            prize_coverage[11] * 5 +
+            prize_coverage[12] * 7 +
+            prize_coverage[13] * 5 +
+            prize_coverage[14] * 3
         )
-        prize_score = min(prize_score, 25)  # Cap
+        prize_score = min(prize_score, 20)
         
-        # 4. DIVERSIDADE MULTIVARIADA (20 pontos)
-        features_matrix = np.array([self._extract_features(g) for g in pool])
-        
-        distances = []
-        for i in range(len(pool)):
-            for j in range(i+1, len(pool)):
-                dist = np.linalg.norm(features_matrix[i] - features_matrix[j])
-                distances.append(dist)
-        
-        avg_distance = np.mean(distances) if distances else 0
-        max_dist = np.linalg.norm(self.feature_stds * 3)
-        diversity_score = (avg_distance / max_dist) * 20
-        
-        # 5. ANTI-HUMAN SCORE (10 pontos)
-        human_scores = [self._compute_human_score(g) for g in pool]
-        avg_human = np.mean(human_scores)
-        anti_human_score = max(0, 10 - avg_human * 0.3)
-        
-        # 6. ENTROPIA (5 pontos)
-        dezena_counts = np.bincount([d for game in pool for d in game], minlength=26)[1:]
+        # 5. DIVERSIDADE (10 pontos)
+        # Distribuição uniforme das dezenas
+        all_dezenas = [d for game in pool for d in game]
+        dezena_counts = np.bincount(all_dezenas, minlength=26)[1:]
         dezena_probs = dezena_counts / np.sum(dezena_counts)
         pool_entropy = entropy(dezena_probs + 1e-10)
-        entropy_score = (pool_entropy / np.log(self.TOTAL_NUMBERS)) * 5
+        entropy_score = (pool_entropy / np.log(25)) * 10
         
         # FITNESS TOTAL
-        overlap = self._compute_overlap_penalty(pool)
-        overlap_penalty = max(0, (overlap - 8) * 4) 
         total_fitness = (
-            dezenas_score +
-            combinatorial_score +
+            structural_score +
+            redundancy_score +
+            overlap_score +
             prize_score +
-            diversity_score +
-            anti_human_score +
-            entropy_score -
-            overlap_penalty
+            entropy_score
         )
         
         return total_fitness, {
-            'dezenas': dezenas_score,
-            'combinatorial': combinatorial_score,
-            'prize_coverage': prize_score,
-            'diversity': diversity_score,
-            'anti_human': anti_human_score,
-            'entropy': entropy_score,
-            **coverage
+            'structural_score': structural_score,
+            'redundancy_score': redundancy_score,
+            'overlap_score': overlap_score,
+            'prize_score': prize_score,
+            'entropy_score': entropy_score,
+            'avg_structural_penalty': avg_structural_penalty,
+            'avg_pair_redundancy': avg_redundancy,
+            'overused_pairs': overused_pairs,
+            'avg_overlap': avg_overlap,
+            'max_overlap': max_overlap,
+            'prize_11': prize_coverage[11],
+            'prize_12': prize_coverage[12],
+            'prize_13': prize_coverage[13],
+            'prize_14': prize_coverage[14]
         }
     
-    def _dpp_sampling(self, n_games, pool_size=1000):
+    def _generate_diverse_initial_pool(self, n_games, pool_size=1000):
         """
-        DPP (Determinantal Point Process) para diversidade máxima
-        
-        Adaptado para Lotofácil (espaço menor)
+        Gera pool inicial DIVERSO com restrições estruturais
         """
-        print("🎯 Aplicando DPP para diversidade máxima...")
+        print("🎯 Gerando pool inicial diverso...")
         
-        # Gerar pool inicial
-        initial_pool = []
+        candidates = []
         seen = set()
         
-        while len(initial_pool) < pool_size:
-            game = tuple(sorted(np.random.choice(range(1, 26), 15, replace=False)))
-            if game not in seen:
-                seen.add(game)
-                initial_pool.append(list(game))
+        # Gerar candidatos que respeitem restrições estruturais
+        attempts = 0
+        max_attempts = pool_size * 10
         
-        # Features
-        X = np.array([self._extract_features(g) for g in initial_pool])
-        X_scaled = self.scaler.transform(X)
-        
-        # Kernel RBF
-        def rbf_kernel(x1, x2, sigma=7.0):
-            def jaccard_distance(g1, g2):
+        while len(candidates) < pool_size and attempts < max_attempts:
+            game = sorted(np.random.choice(range(1, 26), 15, replace=False))
+            game_tuple = tuple(game)
             
-                s1 = set(g1)
-                s2 = set(g2)
+            if game_tuple not in seen:
+                # Verificar restrições estruturais
+                penalty = self._check_structural_violations(game)
+                
+                # Só aceitar jogos com penalidade baixa
+                if penalty < 10:  # Threshold de aceitação
+                    seen.add(game_tuple)
+                    candidates.append(game)
             
-                return 1 - len(s1 & s2) / len(s1 | s2)
+            attempts += 1
         
-        # Matriz de kernel
-        n = len(initial_pool)
-        K = np.zeros((n, n))
-        for i in range(n):
-            for j in range(n):
-                K[i, j] = rbf_kernel(X_scaled[i], X_scaled[j])
+        print(f"   ✅ {len(candidates)} candidatos válidos gerados")
         
-        # Seleção DPP
-        selected_indices = []
-        remaining = list(range(n))
+        # Selecionar subconjunto diverso
+        if len(candidates) <= n_games:
+            return candidates[:n_games]
         
-        for _ in range(n_games):
-            if not remaining:
+        # Usar seleção gananciosa para diversidade
+        selected = [candidates[0]]
+        candidates = candidates[1:]
+        
+        for _ in range(n_games - 1):
+            if not candidates:
                 break
             
-            volumes = []
-            for idx in remaining:
-                indices = selected_indices + [idx]
-                if len(indices) == 1:
-                    volumes.append(K[idx, idx])
-                else:
-                    sub_K = K[np.ix_(indices, indices)]
-                    try:
-                        vol = np.linalg.det(sub_K)
-                        volumes.append(max(0, vol))
-                    except:
-                        volumes.append(0)
+            # Selecionar candidato mais distante dos selecionados
+            best_candidate = None
+            best_min_distance = -1
             
-            if volumes and np.max(volumes) > 0:
-                best_idx = remaining[np.argmax(volumes)]
-                selected_indices.append(best_idx)
-                remaining.remove(best_idx)
-            else:
-                idx = np.random.choice(remaining)
-                selected_indices.append(idx)
-                remaining.remove(idx)
+            for candidate in candidates[:min(100, len(candidates))]:  # Amostra para eficiência
+                min_distance = float('inf')
+                for sel in selected:
+                    # Distância de Jaccard
+                    common = len(set(candidate) & set(sel))
+                    union = len(set(candidate) | set(sel))
+                    distance = 1 - common / union
+                    min_distance = min(min_distance, distance)
+                
+                if min_distance > best_min_distance:
+                    best_min_distance = min_distance
+                    best_candidate = candidate
+            
+            if best_candidate:
+                selected.append(best_candidate)
+                candidates.remove(best_candidate)
         
-        return [initial_pool[i] for i in selected_indices[:n_games]]
+        return selected[:n_games]
     
-    def _simulated_annealing(self, initial_pool, iterations=1000, temp_start=10, temp_end=0.1):
+    def _simulated_annealing_optimized(self, initial_pool, iterations=1000):
         """
-        Simulated Annealing para otimização global
+        Simulated Annealing com penalidades estruturais fortes
         """
         print(f"🔥 Simulated Annealing ({iterations} iterações)...")
         
         current_pool = [list(g) for g in initial_pool]
-        current_fitness, _ = self._compute_pool_global_fitness(current_pool)
+        current_fitness, current_metrics = self._compute_pool_fitness(current_pool)
         
         best_pool = current_pool.copy()
         best_fitness = current_fitness
         
         fitness_history = [current_fitness]
         
+        # Parâmetros de annealing
+        temp_start = 5.0
+        temp_end = 0.05
+        
         for iteration in tqdm(range(iterations), desc="Annealing"):
             temp = temp_start * (temp_end / temp_start) ** (iteration / iterations)
             
             # Modificar pool
             new_pool = current_pool.copy()
+            
+            # Escolher estratégia de modificação
+            strategy = np.random.choice(['swap', 'replace', 'shuffle'])
+            
             idx = np.random.randint(0, len(new_pool))
-            
-            # Trocar uma dezena
             game = new_pool[idx].copy()
-            old_value = game[np.random.randint(0, 15)]
             
-            available = [d for d in range(1, 26) if d not in game]
-            if available:
-                game[game.index(old_value)] = np.random.choice(available)
-                game.sort()
-                new_pool[idx] = game
+            if strategy == 'swap':
+                # Trocar uma dezena por outra não presente
+                old_value = game[np.random.randint(0, 15)]
+                available = [d for d in range(1, 26) if d not in game]
+                if available:
+                    game[game.index(old_value)] = np.random.choice(available)
+                    game.sort()
             
-            # Avaliar
-            new_fitness, new_metrics = self._compute_pool_global_fitness(new_pool)
+            elif strategy == 'replace':
+                # Substituir dezena problemática
+                # Identificar dezena que causa mais penalidade
+                best_replacement = None
+                best_penalty_reduction = 0
+                
+                current_penalty = self._check_structural_violations(game)
+                
+                for pos in range(15):
+                    old_value = game[pos]
+                    available = [d for d in range(1, 26) if d not in game]
+                    
+                    for new_value in np.random.choice(available, min(10, len(available)), replace=False):
+                        test_game = game.copy()
+                        test_game[pos] = new_value
+                        test_game.sort()
+                        
+                        new_penalty = self._check_structural_violations(test_game)
+                        reduction = current_penalty - new_penalty
+                        
+                        if reduction > best_penalty_reduction:
+                            best_penalty_reduction = reduction
+                            best_replacement = test_game.copy()
+                
+                if best_replacement:
+                    game = best_replacement
             
-            # Metropolis criterion
+            elif strategy == 'shuffle':
+                # Embaralhar parte do jogo
+                subset_size = np.random.randint(3, 8)
+                positions = np.random.choice(15, subset_size, replace=False)
+                
+                available_pool = [d for d in range(1, 26) if d not in game]
+                if len(available_pool) >= subset_size:
+                    new_values = np.random.choice(available_pool, subset_size, replace=False)
+                    for pos, new_val in zip(positions, new_values):
+                        game[pos] = new_val
+                    game.sort()
+            
+            new_pool[idx] = game
+            
+            # Avaliar novo pool
+            new_fitness, new_metrics = self._compute_pool_fitness(new_pool)
+            
+            # Critério de Metropolis
             delta = new_fitness - current_fitness
-            if delta > 0 or np.random.random() < np.exp(delta / temp):
+            
+            if delta > 0 or np.random.random() < np.exp(delta / (temp + 1e-10)):
                 current_pool = new_pool
                 current_fitness = new_fitness
+                current_metrics = new_metrics
                 
                 if current_fitness > best_fitness:
                     best_pool = current_pool.copy()
@@ -666,35 +533,40 @@ class LotofacilCoverageOptimizer:
         print(f"   ✅ Fitness final: {best_fitness:.2f}")
         return best_pool, fitness_history
     
-    def optimize_pool(self, n_games=50, dpp_pool_size=500, annealing_iterations=500):
+    def optimize_pool(self, n_games=50, pool_size=1000, annealing_iterations=1000):
         """
         Pipeline completo de otimização
         """
         print("\n" + "="*60)
-        print(f"🎯 OTIMIZANDO POOL DE {n_games} JOGOS PARA LOTOFÁCIL")
+        print(f"🎯 OTIMIZANDO POOL DE {n_games} JOGOS (v2.0)")
         print("="*60)
         
-        # 1. DPP para diversidade inicial
-        initial_pool = self._dpp_sampling(n_games, dpp_pool_size)
+        # 1. Pool inicial diverso e estruturalmente válido
+        initial_pool = self._generate_diverse_initial_pool(n_games, pool_size)
         
-        # 2. Simulated Annealing
-        optimized_pool, fitness_history = self._simulated_annealing(
+        # 2. Simulated Annealing otimizado
+        optimized_pool, fitness_history = self._simulated_annealing_optimized(
             initial_pool, 
             iterations=annealing_iterations
         )
         
         # 3. Avaliação final
-        final_fitness, final_metrics = self._compute_pool_global_fitness(optimized_pool)
+        final_fitness, final_metrics = self._compute_pool_fitness(optimized_pool)
         
         print(f"\n📊 MÉTRICAS FINAIS DO POOL:")
         print(f"   • Fitness Total: {final_fitness:.2f}/100")
-        print(f"   • Cobertura de Dezenas: {final_metrics['dezenas_cobertas']}/25")
-        print(f"   • Cobertura de Pares: {final_metrics['pares_cobertos']}/300")
-        print(f"   • Cobertura de Trincas: {final_metrics['trincas_cobertas']}/2300")
-        print(f"   • Média 11 pts: {final_metrics['avg_11_points']:.2f} bilhetes/sorteio")
-        print(f"   • Média 12 pts: {final_metrics['avg_12_points']:.2f} bilhetes/sorteio")
-        print(f"   • Média 13 pts: {final_metrics['avg_13_points']:.2f} bilhetes/sorteio")
-        print(f"   • Média 14 pts: {final_metrics['avg_14_points']:.2f} bilhetes/sorteio")
+        print(f"   • Score Estrutural: {final_metrics['structural_score']:.2f}/25")
+        print(f"   • Score Redundância: {final_metrics['redundancy_score']:.2f}/25")
+        print(f"   • Score Sobreposição: {final_metrics['overlap_score']:.2f}/20")
+        print(f"   • Score Premiação: {final_metrics['prize_score']:.2f}/20")
+        print(f"   • Score Entropia: {final_metrics['entropy_score']:.2f}/10")
+        print(f"\n📈 INDICADORES:")
+        print(f"   • Penalidade Estrutural Média: {final_metrics['avg_structural_penalty']:.2f}")
+        print(f"   • Redundância Média de Pares: {final_metrics['avg_pair_redundancy']:.2f}")
+        print(f"   • Pares Sobreusados: {final_metrics['overused_pairs']}")
+        print(f"   • Sobreposição Média: {final_metrics['avg_overlap']:.2f}")
+        print(f"   • Sobreposição Máxima: {final_metrics['max_overlap']:.2f}")
+        print(f"   • 11 pts: {final_metrics['prize_11']:.2f} | 12 pts: {final_metrics['prize_12']:.2f} | 13 pts: {final_metrics['prize_13']:.2f}")
         
         self.final_metrics = final_metrics
         self.fitness_history = fitness_history
@@ -702,8 +574,8 @@ class LotofacilCoverageOptimizer:
         
         return optimized_pool
     
-    def visualize_pool(self, output_dir='graficos_lotofacil'):
-        """Visualizações específicas para Lotofácil"""
+    def visualize_results(self, output_dir='graficos_lotofacil_v2'):
+        """Visualizações dos resultados"""
         print(f"\n🎨 GERANDO VISUALIZAÇÕES...")
         os.makedirs(output_dir, exist_ok=True)
         
@@ -711,19 +583,35 @@ class LotofacilCoverageOptimizer:
             print("   ⚠️  Execute optimize_pool primeiro")
             return
         
-        fig = plt.figure(figsize=(20, 14))
+        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
         
         # 1. Evolução do fitness
-        ax1 = plt.subplot(2, 3, 1)
-        ax1.plot(self.fitness_history, color='blue', alpha=0.7, linewidth=1)
-        ax1.set_xlabel('Iteração')
-        ax1.set_ylabel('Fitness Global')
-        ax1.set_title('Evolução do Fitness (Simulated Annealing)')
-        ax1.grid(True, alpha=0.3)
+        ax = axes[0, 0]
+        ax.plot(self.fitness_history, color='blue', alpha=0.7, linewidth=1)
+        ax.set_xlabel('Iteração')
+        ax.set_ylabel('Fitness')
+        ax.set_title('Evolução do Fitness')
+        ax.grid(True, alpha=0.3)
         
-        # 2. Cobertura de dezenas (heatmap 5x5)
-        ax2 = plt.subplot(2, 3, 2)
-        coverage_matrix = np.zeros((5, 5))
+        # 2. Distribuição de blocos consecutivos
+        ax = axes[0, 1]
+        max_blocks = []
+        for game in self.final_pool:
+            _, max_block, _ = self._count_consecutive_blocks(game)
+            max_blocks.append(max_block)
+        
+        block_counts = Counter(max_blocks)
+        ax.bar(block_counts.keys(), block_counts.values(), color='steelblue', edgecolor='black')
+        ax.axvline(x=4, color='red', linestyle='--', label='Máximo permitido (4)')
+        ax.set_xlabel('Tamanho do Maior Bloco Consecutivo')
+        ax.set_ylabel('Quantidade de Jogos')
+        ax.set_title('Distribuição de Blocos Consecutivos')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # 3. Heatmap de cobertura (5x5)
+        ax = axes[0, 2]
+        coverage = np.zeros((5, 5))
         all_dezenas = []
         for game in self.final_pool:
             all_dezenas.extend(game)
@@ -731,95 +619,65 @@ class LotofacilCoverageOptimizer:
         for d in all_dezenas:
             row = (d - 1) // 5
             col = (d - 1) % 5
-            coverage_matrix[row, col] += 1
+            coverage[row, col] += 1
         
-        sns.heatmap(coverage_matrix, annot=True, fmt='.0f', cmap='YlOrRd',
+        sns.heatmap(coverage, annot=True, fmt='.0f', cmap='YlOrRd',
                    xticklabels=[f'C{i+1}' for i in range(5)],
                    yticklabels=[f'L{i+1}' for i in range(5)],
-                   ax=ax2, cbar_kws={'label': 'Frequência'})
-        ax2.set_title('Cobertura no Volante 5x5')
-        ax2.set_xlabel('Coluna')
-        ax2.set_ylabel('Linha')
+                   ax=ax, cbar_kws={'label': 'Frequência'})
+        ax.set_title('Cobertura no Volante 5x5')
         
-        # 3. Frequência individual das dezenas
-        ax3 = plt.subplot(2, 3, 3)
+        # 4. Distribuição de sobreposição
+        ax = axes[1, 0]
+        overlaps = []
+        for i in range(len(self.final_pool)):
+            for j in range(i+1, len(self.final_pool)):
+                common = len(set(self.final_pool[i]) & set(self.final_pool[j]))
+                overlaps.append(common)
+        
+        ax.hist(overlaps, bins=20, alpha=0.7, color='green', edgecolor='black')
+        ax.axvline(x=np.mean(overlaps), color='red', linestyle='--', 
+                  label=f'Média: {np.mean(overlaps):.1f}')
+        ax.set_xlabel('Sobreposição (dezenas em comum)')
+        ax.set_ylabel('Frequência')
+        ax.set_title('Distribuição de Sobreposição entre Bilhetes')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # 5. Frequência individual
+        ax = axes[1, 1]
         freq = np.bincount(all_dezenas, minlength=26)[1:]
-        colors = ['green' if f > np.mean(freq) else 'red' if f < np.mean(freq) else 'yellow' 
-                 for f in freq]
-        ax3.bar(range(1, 26), freq, color=colors, edgecolor='black')
-        ax3.axhline(y=np.mean(freq), color='blue', linestyle='--', 
-                   label=f'Média: {np.mean(freq):.1f}')
-        ax3.set_xlabel('Dezena')
-        ax3.set_ylabel('Frequência')
-        ax3.set_title('Frequência das Dezenas no Pool')
-        ax3.legend()
-        ax3.grid(True, alpha=0.3)
+        ax.bar(range(1, 26), freq, color='steelblue', edgecolor='black')
+        ax.axhline(y=np.mean(freq), color='red', linestyle='--', 
+                  label=f'Média: {np.mean(freq):.1f}')
+        ax.set_xlabel('Dezena')
+        ax.set_ylabel('Frequência')
+        ax.set_title('Frequência das Dezenas no Pool')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
         
-        # 4. Distribuição de Pares vs Ímpares
-        ax4 = plt.subplot(2, 3, 4)
-        pool_pares = [np.sum(np.array(g) % 2 == 0) for g in self.final_pool]
-        hist_pares = np.sum(self.dezenas_historicas % 2 == 0, axis=1)
-        
-        ax4.hist(hist_pares, bins=range(17), alpha=0.5, label='Histórico', 
-                color='blue', density=True)
-        ax4.hist(pool_pares, bins=range(17), alpha=0.7, label='Pool', 
-                color='green', density=True)
-        ax4.set_xlabel('Quantidade de Pares')
-        ax4.set_ylabel('Densidade')
-        ax4.set_title('Distribuição de Pares')
-        ax4.legend()
-        ax4.grid(True, alpha=0.3)
-        
-        # 5. Radar de métricas
-        ax5 = plt.subplot(2, 3, 5, projection='polar')
+        # 6. Métricas do pool
+        ax = axes[1, 2]
         metrics = self.final_metrics
-        categories = ['Dezenas', 'Pares', 'Trincas', '11 pts', '12 pts', '13 pts', '14 pts']
+        categories = ['Estrutural', 'Redundância', 'Sobreposição', 'Premiação', 'Entropia']
         values = [
-            metrics['coverage_pct'] * 100,
-            metrics['pair_coverage'] * 100,
-            metrics['triple_coverage'] * 100,
-            min(metrics['avg_11_points'] * 10, 100),
-            min(metrics['avg_12_points'] * 20, 100),
-            min(metrics['avg_13_points'] * 30, 100),
-            min(metrics['avg_14_points'] * 50, 100)
+            metrics['structural_score'] / 25 * 100,
+            metrics['redundancy_score'] / 25 * 100,
+            metrics['overlap_score'] / 20 * 100,
+            metrics['prize_score'] / 20 * 100,
+            metrics['entropy_score'] / 10 * 100
         ]
         
-        angles = np.linspace(0, 2*np.pi, len(categories), endpoint=False).tolist()
-        values += values[:1]
-        angles += angles[:1]
+        ax.barh(categories, values, color=['green', 'blue', 'orange', 'red', 'purple'])
+        ax.set_xlim(0, 100)
+        ax.set_xlabel('Score (%)')
+        ax.set_title('Métricas do Pool')
+        for i, v in enumerate(values):
+            ax.text(v + 1, i, f'{v:.1f}%', va='center')
         
-        ax5.plot(angles, values, 'o-', linewidth=2, color='green')
-        ax5.fill(angles, values, alpha=0.25, color='green')
-        ax5.set_xticks(angles[:-1])
-        ax5.set_xticklabels(categories, fontsize=9)
-        ax5.set_ylim(0, 100)
-        ax5.set_title('Métricas de Cobertura (%)')
-        ax5.grid(True)
-        
-        # 6. Comparação Mahalanobis
-        ax6 = plt.subplot(2, 3, 6)
-        pool_mahal = [self.mahalanobis_distance(g) for g in self.final_pool]
-        random_mahal = [self.mahalanobis_distance(
-            sorted(np.random.choice(range(1, 26), 15, replace=False))
-        ) for _ in range(1000)]
-        
-        ax6.hist(random_mahal, bins=30, alpha=0.7, label='Aleatório', 
-                color='orange', density=True)
-        ax6.hist(pool_mahal, bins=15, alpha=0.7, label='Pool', 
-                color='green', density=True)
-        ax6.axvline(np.mean(random_mahal), color='orange', linestyle='--', 
-                   label=f'Média Aleatória: {np.mean(random_mahal):.1f}')
-        ax6.axvline(np.mean(pool_mahal), color='green', linestyle='--', 
-                   label=f'Média Pool: {np.mean(pool_mahal):.1f}')
-        ax6.set_xlabel('Distância de Mahalanobis')
-        ax6.set_ylabel('Densidade')
-        ax6.set_title('Distribuição Multivariada')
-        ax6.legend()
-        ax6.grid(True, alpha=0.3)
-        
-        plt.suptitle('Análise do Pool Otimizado - Lotofácil', fontsize=16, fontweight='bold')
+        plt.suptitle('Análise do Pool Otimizado - Lotofácil v2.0', fontsize=16, fontweight='bold')
         plt.tight_layout()
-        plt.savefig(f'{output_dir}/analise_pool_lotofacil.png', bbox_inches='tight', dpi=150)
+        plt.savefig(f'{output_dir}/analise_pool_v2.png', bbox_inches='tight', dpi=150)
         plt.close()
         
         print(f"✅ Gráficos salvos em {output_dir}/")
@@ -828,113 +686,79 @@ class LotofacilCoverageOptimizer:
         """Exporta pool otimizado"""
         if filename is None:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = f'lotofacil_otimizado_{timestamp}.csv'
+            filename = f'lotofacil_otimizado_v2_{timestamp}.csv'
         
-        df_games = pd.DataFrame(games, columns=[f'D_{i+1:02d}' for i in range(15)])
-        df_games.index = [f'Jogo_{i+1}' for i in range(len(games))]
+        # Converter para tipos Python nativos
+        clean_games = []
+        for game in games:
+            clean_game = [int(x) for x in game]
+            clean_games.append(clean_game)
         
-        # Métricas por jogo
-        df_games['Soma'] = [sum(g) for g in games]
-        df_games['Pares'] = [np.sum(np.array(g) % 2 == 0) for g in games]
-        df_games['Mahalanobis'] = [self.mahalanobis_distance(g) for g in games]
-        df_games['Human_Score'] = [self._compute_human_score(g) for g in games]
+        df_games = pd.DataFrame(clean_games, columns=[f'D_{i+1:02d}' for i in range(15)])
+        df_games.index = [f'Jogo_{i+1}' for i in range(len(clean_games))]
+        
+        # Métricas
+        df_games['Soma'] = [sum(g) for g in clean_games]
+        df_games['Pares'] = [sum(1 for n in g if n % 2 == 0) for g in clean_games]
+        df_games['Max_Consecutivos'] = [
+            self._count_consecutive_blocks(g)[1] for g in clean_games
+        ]
+        df_games['Penalidade_Estrutural'] = [
+            self._check_structural_violations(g) for g in clean_games
+        ]
         
         df_games.to_csv(filename)
         print(f"\n💾 Pool exportado: {filename}")
         
         return filename
-    
-    def generate_report(self, games, output_dir='relatorio_lotofacil'):
-        """Gera relatório completo"""
-        os.makedirs(output_dir, exist_ok=True)
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        
-        # Métricas
-        _, metrics = self._compute_pool_global_fitness(games)
-        
-        # Cobertura de dezenas específicas
-        all_dezenas = []
-        for game in games:
-            all_dezenas.extend(game)
-        
-        freq = np.bincount(all_dezenas, minlength=26)[1:]
-        top_dezenas = np.argsort(freq)[-5:] + 1
-        bottom_dezenas = np.argsort(freq)[:5] + 1
-        
-        report = {
-            'timestamp': datetime.now().isoformat(),
-            'n_games': len(games),
-            'metrics': {k: float(v) if isinstance(v, (np.floating, np.integer)) else v 
-                       for k, v in metrics.items()},
-            'top_dezenas': [int(x) for x in top_dezenas],
-            'bottom_dezenas': [int(x) for x in bottom_dezenas],
-            'games': [[int(x) for x in sorted(g)] for g in games]
-        }
-        
-        json_path = f'{output_dir}/relatorio_{timestamp}.json'
-        with open(json_path, 'w', encoding='utf-8') as f:
-            json.dump(report, f, indent=2, ensure_ascii=False)
-        
-        print(f"📄 Relatório: {json_path}")
-        return json_path
 
 
 def main():
     """EXECUÇÃO PRINCIPAL"""
     print("="*70)
-    print("🎯 SISTEMA AVANÇADO DE OTIMIZAÇÃO - LOTOFÁCIL")
-    print("   25 números | 15 por jogo | Foco em 11-14 pontos")
+    print("🎯 SISTEMA AVANÇADO DE OTIMIZAÇÃO - LOTOFÁCIL v2.0")
+    print("   Anti-redundância | Penalidades Estruturais | Cobertura Útil")
     print("="*70)
     
     # Inicializar
-    optimizer = LotofacilCoverageOptimizer()
+    optimizer = LotofacilOptimizerV2()
     
     # Otimizar
     n_games = 50
     optimized_pool = optimizer.optimize_pool(
         n_games=n_games,
-        dpp_pool_size=500,
-        annealing_iterations=500
+        pool_size=1000,
+        annealing_iterations=1000
     )
     
     # Visualizar
-    optimizer.visualize_pool()
+    optimizer.visualize_results()
     
     # Exportar
     optimizer.export_pool(optimized_pool)
     
-    # Relatório
-    optimizer.generate_report(optimized_pool)
-    
-    # Mostrar jogos
-    print(f"\n🎯 POOL OTIMIZADO ({n_games} jogos):")
+    # Mostrar primeiros jogos
+    print(f"\n🎯 PRIMEIROS 10 JOGOS DO POOL OTIMIZADO:")
     print("="*70)
-    for i, game in enumerate(optimized_pool, 1):
-        sorted_game = sorted(game)
-        soma = sum(game)
-        pares = sum(1 for n in game if n % 2 == 0)
-        print(f"Jogo {i:2d}: {sorted_game}")
-        print(f"        Soma={soma:3d} | Pares={pares:2d} | Ímpares={15-pares:2d}")
+    for i, game in enumerate(optimized_pool[:10], 1):
+        clean_game = sorted([int(x) for x in game])
+        _, max_block, _ = optimizer._count_consecutive_blocks(clean_game)
+        penalty = optimizer._check_structural_violations(clean_game)
+        
+        # Destacar blocos consecutivos
+        game_str = str(clean_game)
+        if max_block >= 3:
+            game_str += f" ⚠️ Bloco:{max_block}"
+        
+        print(f"Jogo {i:2d}: {game_str}")
+        print(f"        Penalidade={penalty:.1f} | Soma={sum(clean_game)}")
     
     print("\n" + "="*70)
     print("✅ OTIMIZAÇÃO CONCLUÍDA!")
     print("📁 Resultados salvos em:")
-    print("   • graficos_lotofacil/ - Visualizações")
-    print("   • relatorio_lotofacil/ - Relatório JSON")
-    print("   • lotofacil_otimizado_*.csv - Jogos exportados")
+    print("   • graficos_lotofacil_v2/ - Visualizações")
+    print("   • lotofacil_otimizado_v2_*.csv - Jogos exportados")
     print("="*70)
-    
-    print("\n💡 CARACTERÍSTICAS DO OTIMIZADOR LOTOFÁCIL:")
-    print("   1. Cobertura otimizada para 11-14 pontos")
-    print("   2. Máxima diversidade entre bilhetes")
-    print("   3. Estatísticas historicamente consistentes")
-    print("   4. Anti-padrões humanos (EV Optimizer)")
-    print("   5. DPP + Simulated Annealing")
-    
-    print("\n⚠️  DISCLAIMER:")
-    print("   Este sistema NÃO prevê resultados futuros.")
-    print("   Otimiza cobertura combinatória dentro de")
-    print("   restrições estatísticas observadas.")
 
 
 if __name__ == "__main__":
