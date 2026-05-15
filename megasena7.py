@@ -248,10 +248,9 @@ class AleatoriedadeValidator:
         print(f"\n📊 RESULTADOS FFT COM BASELINE:")
         for feature, results in self.fft_baseline.items():
             print(f"   • {feature}:")
-            print(f"     - Magnitude máxima: z={results['z_score_max']:.2f} (p={results['p_value_max']:.4f})")
-            print(f"     - Picos: {results['observed_peaks']} vs {results['baseline_peaks_mean']:.1f}±{results['baseline_peaks_std']:.1f}")
+            print(f"     - Magnitude máxima: z={results['z_score_max']:.2f}")
             print(f"     - Anômalo: {'⚠️ SIM' if results['is_anomalous'] else '✅ NÃO'}")
-        
+            
         return self.fft_baseline
     
     def permutation_entropy_analysis(self, order=3, delay=1):
