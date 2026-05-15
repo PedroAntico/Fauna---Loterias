@@ -19,6 +19,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+import math
 from scipy import stats
 from scipy.stats import pearsonr, entropy, chi2_contingency, norm
 from scipy.spatial.distance import euclidean, hamming, cosine
@@ -220,7 +221,7 @@ class AleatoriedadeValidator:
                 fft_max_magnitudes.append(np.max(fft_random))
                 
                 # Contar picos (threshold = média + 2*std)
-                threshold = np.mean(fft_random) + 2 * np.std(fft_random)
+                threshold = np.percentile(fft_random, 99)
                 fft_peak_counts.append(np.sum(fft_random > threshold))
             
             # Estatísticas do baseline
@@ -231,7 +232,7 @@ class AleatoriedadeValidator:
             
             # Valores observados
             observed_max = np.max(fft_real)
-            threshold_obs = np.mean(fft_real) + 2 * np.std(fft_real)
+            threshold_obs = np.percentile(fft_real, 99)
             observed_peaks = np.sum(fft_real > threshold_obs)
             
             # Z-scores
@@ -291,7 +292,7 @@ class AleatoriedadeValidator:
             
             probs = np.array([count / total_patterns for count in permutations_count.values()])
             pe = entropy(probs)
-            pe_normalized = pe / np.log(np.math.factorial(order))  # Normalizar
+            pe_normalized = pe / np.log(math.factorial(order))  # Normalizar
             
             return pe, pe_normalized
         
@@ -554,14 +555,52 @@ class AleatoriedadeValidator:
             original_size = len(data)
             compressed_size = len(compressed)
             compression_ratio = compressed_size / original_size
+            # Baseline RNG equivalente
+            baseline_ratios = []
+            
+            for _ in range(100):
+                random_games = np.zeros_like(self.dezenas)
+            
+                for i in range(len(random_games)):
+                    random_games[i] = sorted(
+                        np.random.choice(range(1, 61), 6, replace=False)
+                    )
+            
+                if name == 'dezenas_raw':
+                    baseline_data = random_games.tobytes()
+            
+                elif name == 'binary_60bits':
+                    baseline_binary = np.zeros((len(random_games), 60))
+                    for i, g in enumerate(random_games):
+                        baseline_binary[i, g-1] = 1
+                    baseline_data = baseline_binary.tobytes()
+            
+                elif name == 'soma_sequence':
+                    baseline_data = random_games.sum(axis=1).tobytes()
+            
+                elif name == 'pares_sequence':
+                    baseline_data = np.sum(random_games % 2 == 0, axis=1).tobytes()
+            
+                baseline_compressed = zlib.compress(baseline_data, level=9)
+            
+                baseline_ratios.append(len(baseline_compressed) / len(baseline_data))
+            
+            baseline_mean = np.mean(baseline_ratios)
+            baseline_std = np.std(baseline_ratios)
+            
+            z_score = ((compression_ratio - baseline_mean) / baseline_std
+                if baseline_std > 0 else 0)
             
             self.compressibility[name] = {
                 'original_bytes': original_size,
                 'compressed_bytes': compressed_size,
                 'ratio': float(compression_ratio),
                 'entropy_estimate': float(compression_ratio * 8),  # bits por byte
-                'is_compressible': compression_ratio < 0.95
-            }
+                'baseline_mean': float(baseline_mean),
+                'baseline_std': float(baseline_std),
+                'z_score': float(z_score),
+                'is_anomalous': abs(z_score) > 2
+                            }
         
         print(f"\n📊 COMPRESSIBILIDADE:")
         for name, results in self.compressibility.items():
@@ -646,6 +685,7 @@ class AleatoriedadeValidator:
         # 5. Compressibilidade
         print("\n" + "="*60)
         results['compressibility'] = self.analyze_compressibility()
+        self.apply_global_multiple_testing_correction(results)
         
         # 6. Comparação internacional
         print("\n" + "="*60)
@@ -655,6 +695,45 @@ class AleatoriedadeValidator:
         self._generate_validation_summary(results)
         
         return results
+
+    def apply_global_multiple_testing_correction(self, results):
+        """
+        Correção global de múltiplos testes
+        """
+        
+        all_pvalues = []
+    
+        # FFT
+        for feature, res in results['fft'].items():
+            all_pvalues.append(res['p_value_max'])
+            all_pvalues.append(res['p_value_peaks'])
+    
+        # Permutation Entropy
+        for feature, res in results['permutation_entropy'].items():
+            z = abs(res['z_score'])
+            p = 2 * (1 - norm.cdf(z))
+            all_pvalues.append(p)
+    
+        # NIST
+        for test, res in results['nist'].items():
+            all_pvalues.append(res['p_value'])
+    
+        n_tests = len(all_pvalues)
+    
+        # Bonferroni
+        bonf_threshold = 0.05 / n_tests
+    
+        significant = sum(p < bonf_threshold for p in all_pvalues)
+    
+        print("\n🔬 CORREÇÃO GLOBAL DE MÚLTIPLOS TESTES")
+        print(f"   • Total de testes: {n_tests}")
+        print(f"   • Threshold Bonferroni: {bonf_threshold:.6f}")
+        print(f"   • Significativos após correção: {significant}")
+    
+        self.global_multiple_testing = {
+            'n_tests': n_tests,
+            'threshold': bonf_threshold,
+            'significant_after_correction': significant}
     
     def _generate_validation_summary(self, results):
         """Gera sumário executivo da validação"""
@@ -726,7 +805,15 @@ class AleatoriedadeValidator:
         else:
             print("   FORAM ENCONTRADAS POSSÍVEIS ANOMALIAS")
             print("   Recomenda-se auditoria independente dos sorteios")
+        if hasattr(self, 'global_multiple_testing'):
+            corrected_sig = self.global_multiple_testing['significant_after_correction']
         
+            print(f"\n🛡️ APÓS CORREÇÃO GLOBAL:")
+            print(f"   • Testes significativos restantes: {corrected_sig}")
+        
+            if corrected_sig == 0:
+                print("   ✅ Nenhuma evidência robusta de não-aleatoriedade")
+                
         return sig_rate
     
     def export_validation_report(self, output_dir='relatorio_validacao'):
