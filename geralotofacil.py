@@ -420,43 +420,43 @@ class LotofacilCoverageOptimizer:
             'avg_14_points': prize_coverage.get(14, 0)
         }
     
-    def _simulate_prize_coverage(self, pool, n_simulations=100):
-        """
-        Simula cobertura de premiação
+    def _simulate_prize_coverage(self, pool, n_simulations=1000):
+
+            results = {
+                11: [],
+                12: [],
+                13: [],
+                14: [],
+                15: []
+            }
         
-        Gera jogos aleatórios e verifica quantos bilhetes do pool
-        acertariam 11, 12, 13, 14 pontos
-        """
-        prize_counts = defaultdict(list)
-        success = defaultdict(int)
+            for _ in range(n_simulations):
         
-        for _ in range(n_simulations):
-            # Gerar jogo "sorteado" aleatório
-            drawn = set(sorted(np.random.choice(range(1, 26), 15, replace=False)))
-            found = {11:False,12:False,13:False,14:False}
-            
-            # Verificar acertos de cada bilhete do pool
-            for game in pool:
-                hits = len(set(game) & drawn)
-                
-                if hits >= 11:
-                    found[hits] = True
+                drawn = set(
+                    np.random.choice(range(1, 26), 15, replace=False)
+                )
         
-            for k,v in found.items():
-                if v:
-                    success[k] += 1
+                counts = {
+                    11: 0,
+                    12: 0,
+                    13: 0,
+                    14: 0,
+                    15: 0 }
         
-        return {k: success[k]/n_simulations}
+                for game in pool:
         
-        # Média de bilhetes premiados por simulação
-        avg_prizes = {}
-        for hits in [11, 12, 13, 14]:
-            if prize_counts[hits]:
-                avg_prizes[hits] = np.mean(prize_counts[hits])
-            else:
-                avg_prizes[hits] = 0
+                    hits = len(set(game) & drawn)
         
-        return avg_prizes
+                    if hits >= 11:
+                        counts[hits] += 1
+        
+                for k in counts:
+                    results[k].append(counts[k])
+        
+            return {
+                k: np.mean(v)
+                for k, v in results.items()
+            }
         
     def _compute_overlap_penalty(self, pool):
 
@@ -571,8 +571,12 @@ class LotofacilCoverageOptimizer:
         
         # Kernel RBF
         def rbf_kernel(x1, x2, sigma=7.0):
-            dist = np.linalg.norm(x1 - x2)
-            return np.exp(-dist**2 / (2 * sigma**2))
+            def jaccard_distance(g1, g2):
+            
+                s1 = set(g1)
+                s2 = set(g2)
+            
+                return 1 - len(s1 & s2) / len(s1 | s2)
         
         # Matriz de kernel
         n = len(initial_pool)
