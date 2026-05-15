@@ -457,7 +457,21 @@ class LotofacilCoverageOptimizer:
                 avg_prizes[hits] = 0
         
         return avg_prizes
+        
+    def _compute_overlap_penalty(self, pool):
+
+        overlaps = []
     
+        for i in range(len(pool)):
+            for j in range(i + 1, len(pool)):
+    
+                common = len(set(pool[i]) & set(pool[j]))
+                overlaps.append(common)
+    
+        avg_overlap = np.mean(overlaps)
+    
+        return avg_overlap
+        
     def _compute_pool_global_fitness(self, pool):
         """
         FITNESS GLOBAL DO POOL PARA LOTOFÁCIL
@@ -511,13 +525,16 @@ class LotofacilCoverageOptimizer:
         entropy_score = (pool_entropy / np.log(self.TOTAL_NUMBERS)) * 5
         
         # FITNESS TOTAL
+        overlap = self._compute_overlap_penalty(pool)
+        overlap_penalty = max(0, (overlap - 8) * 4) 
         total_fitness = (
             dezenas_score +
             combinatorial_score +
             prize_score +
             diversity_score +
             anti_human_score +
-            entropy_score
+            entropy_score -
+            overlap_penalty
         )
         
         return total_fitness, {
@@ -553,7 +570,7 @@ class LotofacilCoverageOptimizer:
         X_scaled = self.scaler.transform(X)
         
         # Kernel RBF
-        def rbf_kernel(x1, x2, sigma=2.0):
+        def rbf_kernel(x1, x2, sigma=7.0):
             dist = np.linalg.norm(x1 - x2)
             return np.exp(-dist**2 / (2 * sigma**2))
         
