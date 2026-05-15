@@ -305,11 +305,9 @@ class AleatoriedadeValidator:
             pe_baseline = []
             
             for _ in range(n_baseline):
-                sample = np.random.choice(self.rng_baseline[feature], 
-                                         size=len(signal_real), 
-                                         replace=True)
-                pe, _ = calc_permutation_entropy(sample, order, delay)
-                pe_baseline.append(pe)
+                sample = np.random.choice(self.rng_baseline[feature],  size=len(signal_real),  replace=True)
+                _, pe_norm = calc_permutation_entropy(sample, order, delay)
+                pe_baseline.append(pe_norm)
             
             pe_mean = np.mean(pe_baseline)
             pe_std = np.std(pe_baseline)
