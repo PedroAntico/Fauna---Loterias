@@ -157,35 +157,31 @@ class LotofacilOptimizerV3:
     # MÉTODOS PÚBLICOS PRINCIPAIS
     # ============================================================
     
-    def get_last_draw(self):
-        """
-        Retorna o último concurso como lista de inteiros
-        
-        Returns:
-            list: 15 dezenas do último concurso
-        """
-        if self.dezenas_historicas is not None and len(self.dezenas_historicas) > 0:
-            return [int(x) for x in self.dezenas_historicas[-1]]
+    def get_last_draws(self, n=10):
+    """
+    Retorna os últimos n concursos reais
+    """
+    
+    if self.df is None or len(self.df) == 0:
         return None
     
-    def get_last_draw(self):
-        """
-        Retorna o último concurso REAL
-        independente da ordem do CSV
-        """
-        
-        if self.df is None or len(self.df) == 0:
-            return None
-        
-        # Ordenar por concurso decrescente
-        latest = self.df.sort_values('concurso', ascending=False).iloc[0]
-        
-        dezenas = [
-            int(latest[f'b{i}'])
+    latest_draws = (
+        self.df
+        .sort_values('concurso', ascending=False)
+        .head(n)
+    )
+    
+    results = []
+    
+    for _, row in latest_draws.iterrows():
+        game = [
+            int(row[f'b{i}'])
             for i in range(1, 16)
         ]
         
-        return sorted(dezenas)
+        results.append(sorted(game))
+    
+    return results
     
     def get_historical_frequency(self):
         """
