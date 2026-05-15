@@ -504,16 +504,30 @@ class LotofacilOptimizerV21:
         d = sorted(game)
         for i in range(len(d) - 1):
             if d[i+1] - d[i] == 1:
-                # Encontrou par consecutivo, tentar quebrar
-                test_game = game.copy()
-                old_val = d[i]
-                available = [x for x in range(1, 26) if x not in test_game]
-                
-                for new_val in np.random.choice(available, min(5, len(available)), replace=False):
-                    test_game[test_game.index(old_val)] = new_val
-                    test_game.sort()
+        
+                original_idx = game.index(d[i])
+        
+                available = [x for x in range(1, 26) if x not in game]
+        
+                sample_size = min(5, len(available))
+        
+                if sample_size == 0:
+                    continue
+        
+                for new_val in np.random.choice(
+                    available,
+                    sample_size,
+                    replace=False
+                ):
+        
+                    test_game = game.copy()
+        
+                    test_game[original_idx] = int(new_val)
+        
+                    test_game = sorted(test_game)
+        
                     new_penalty = self._calculate_structural_penalty(test_game)
-                    
+        
                     if new_penalty < best_penalty:
                         best_penalty = new_penalty
                         best_game = test_game.copy()
