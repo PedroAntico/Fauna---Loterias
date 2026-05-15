@@ -10,7 +10,7 @@ Este módulo importa o motor e fornece interface interativa
 para filtragem, ranking e exibição de jogos.
 """
 
-from geralotofacil import (
+from lotofacil_core import (
     LotofacilOptimizerV3,
     contar_pares,
     contar_impares,
