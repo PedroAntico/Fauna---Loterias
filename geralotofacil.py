@@ -428,17 +428,25 @@ class LotofacilCoverageOptimizer:
         acertariam 11, 12, 13, 14 pontos
         """
         prize_counts = defaultdict(list)
+        success = defaultdict(int)
         
         for _ in range(n_simulations):
             # Gerar jogo "sorteado" aleatório
             drawn = set(sorted(np.random.choice(range(1, 26), 15, replace=False)))
+            found = {11:False,12:False,13:False,14:False}
             
             # Verificar acertos de cada bilhete do pool
             for game in pool:
                 hits = len(set(game) & drawn)
                 
-                if hits >= self.MIN_PRIZE:
-                    prize_counts[hits].append(1)
+                 if hits >= 11:
+                    found[hits] = True
+        
+            for k,v in found.items():
+                if v:
+                    success[k] += 1
+        
+        return {k: success[k]/n_simulations}
         
         # Média de bilhetes premiados por simulação
         avg_prizes = {}
@@ -837,9 +845,9 @@ class LotofacilCoverageOptimizer:
             'n_games': len(games),
             'metrics': {k: float(v) if isinstance(v, (np.floating, np.integer)) else v 
                        for k, v in metrics.items()},
-            'top_dezenas': top_dezenas.tolist(),
-            'bottom_dezenas': bottom_dezenas.tolist(),
-            'games': [sorted(g) for g in games]
+            'top_dezenas': [int(x) for x in top_dezenas],
+            'bottom_dezenas': [int(x) for x in bottom_dezenas],
+            'games': [[int(x) for x in sorted(g)] for g in games]
         }
         
         json_path = f'{output_dir}/relatorio_{timestamp}.json'
