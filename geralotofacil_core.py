@@ -168,19 +168,24 @@ class LotofacilOptimizerV3:
             return [int(x) for x in self.dezenas_historicas[-1]]
         return None
     
-    def get_last_draws(self, n=10):
+    def get_last_draw(self):
         """
-        Retorna os últimos n concursos
+        Retorna o último concurso REAL
+        independente da ordem do CSV
+        """
         
-        Args:
-            n: Número de concursos
-            
-        Returns:
-            list: Lista dos últimos n concursos
-        """
-        if self.dezenas_historicas is not None and len(self.dezenas_historicas) >= n:
-            return [[int(x) for x in draw] for draw in self.dezenas_historicas[-n:]]
-        return None
+        if self.df is None or len(self.df) == 0:
+            return None
+        
+        # Ordenar por concurso decrescente
+        latest = self.df.sort_values('concurso', ascending=False).iloc[0]
+        
+        dezenas = [
+            int(latest[f'b{i}'])
+            for i in range(1, 16)
+        ]
+        
+        return sorted(dezenas)
     
     def get_historical_frequency(self):
         """
