@@ -260,7 +260,9 @@ class AdvancedCoverageOptimizer:
         
         # Distância de Mahalanobis
         md = mahalanobis(features, self.feature_means, self.inv_cov_matrix)
-        
+            if human_score > 20:
+            return -999
+                
         return md
     
     def _compute_human_score(self, game):
@@ -342,7 +344,7 @@ class AdvancedCoverageOptimizer:
                 all_triples.add(triple)
         
         total_possible_triples = 60 * 59 * 58 // 6  # C(60,3) = 34220
-        triple_coverage = len(all_triples) / min(total_possible_triples, n_games * 20)
+        triple_coverage = len(all_triples) / total_possible_triples
         triple_coverage = min(triple_coverage, 1.0)  # Cap at 100%
         triple_score = triple_coverage * 15
         
@@ -371,8 +373,10 @@ class AdvancedCoverageOptimizer:
         avg_human_score = np.mean(human_scores)
         
         # Penalizar jogos "humanos" (inverter escala)
-        anti_human_score = max(0, 15 - avg_human_score * 0.5)
-        
+        anti_human_score = 15 * np.exp(-avg_human_score / 10)
+        if human_score > 20:
+            return -999
+            
         # 5. ENTROPIA DO CONJUNTO (10 pontos)
         # Mede uniformidade da distribuição de dezenas
         dezena_counts = np.bincount(
