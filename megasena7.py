@@ -753,8 +753,8 @@ class AleatoriedadeValidator:
         
         # Compressibilidade
         total_tests += len(results['compressibility'])
-        significant_tests += sum(1 for r in results['compressibility'].values() 
-                               if r['is_compressible'])
+        significant_tests += sum(  1 for r in results['compressibility'].values()
+            if r['is_anomalous'])
         
         print(f"\n📊 TOTAL DE TESTES: {total_tests}")
         print(f"⚠️  TESTES SIGNIFICATIVOS: {significant_tests}")
