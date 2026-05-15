@@ -852,7 +852,8 @@ class AleatoriedadeValidator:
             f.write(f"Análise Espectral: {'OK' if fft_ok else 'ANOMALIAS DETECTADAS'}\n")
             
             # Permutation Entropy
-            pe_ok = all(not r['is_different'] for r in self.permutation_entropy.values())
+            pe_ok = all(abs(r.get('z_score', 0)) <= 3 
+            for r in self.permutation_entropy.values())
             f.write(f"Permutation Entropy: {'OK' if pe_ok else 'DIFERENÇAS DETECTADAS'}\n")
             
             f.write("\nCONCLUSÃO:\n")
