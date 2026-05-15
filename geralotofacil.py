@@ -110,10 +110,10 @@ class LotofacilOptimizerV2:
             ],
             
             # Máximo de números em uma única linha
-            'max_per_line': 4,
+            'max_per_line': 5,
             
             # Máximo de números em uma única coluna
-            'max_per_column': 4,
+            'max_per_column': 5,
             
             # Penalidades
             'consecutive_penalty_weight': 5.0,
@@ -321,7 +321,7 @@ class LotofacilOptimizerV2:
         
         # 3. SOBREPOSIÇÃO (20 pontos)
         avg_overlap, max_overlap, min_overlap = self._compute_overlap_matrix(pool)
-        overlap_penalty = (avg_overlap - 8) * self.structural_constraints['overlap_penalty_weight']
+        overlap_penalty = max( 0, (avg_overlap - 8) * self.structural_constraints['overlap_penalty_weight'])
         overlap_score = max(0, 20 - overlap_penalty)
         
         # 4. COBERTURA DE PREMIAÇÃO (20 pontos)
@@ -391,7 +391,7 @@ class LotofacilOptimizerV2:
                 penalty = self._check_structural_violations(game)
                 
                 # Só aceitar jogos com penalidade baixa
-                if penalty < 10:  # Threshold de aceitação
+                if penalty < 35:  # Threshold de aceitação
                     seen.add(game_tuple)
                     candidates.append(game)
             
