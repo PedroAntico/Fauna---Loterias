@@ -251,18 +251,19 @@ class AdvancedCoverageOptimizer:
     def mahalanobis_distance(self, game):
         """
         Calcula distância de Mahalanobis multivariada
-        
-        Mede quão "típico" é o jogo considerando TODAS as correlações
-        entre features simultaneamente.
+    
+        Mede quão "típico" é o jogo considerando
+        todas as correlações simultaneamente.
         """
+    
         features = self._extract_features(game)
-        diff = features - self.feature_means
-        
-        # Distância de Mahalanobis
-        md = mahalanobis(features, self.feature_means, self.inv_cov_matrix)
-            if human_score > 20:
-            return -999
-                
+    
+        md = mahalanobis(
+            features,
+            self.feature_means,
+            self.inv_cov_matrix
+        )
+    
         return md
     
     def _compute_human_score(self, game):
@@ -323,8 +324,11 @@ class AdvancedCoverageOptimizer:
         for game in pool:
             all_dezenas.update(game)
         
-        coverage_pct = len(all_dezenas) / 60
-        coverage_score = coverage_pct * 20
+        dezena_counts = np.bincount([d for g in pool for d in g], minlength=61 )[1:]
+        
+        std_freq = np.std(dezena_counts)
+        
+        coverage_score = 20 * np.exp(-std_freq / 5)
         
         # 2. COBERTURA COMBINATÓRIA (30 pontos)
         # Pares cobertos
@@ -346,7 +350,11 @@ class AdvancedCoverageOptimizer:
         total_possible_triples = 60 * 59 * 58 // 6  # C(60,3) = 34220
         triple_coverage = len(all_triples) / total_possible_triples
         triple_coverage = min(triple_coverage, 1.0)  # Cap at 100%
-        triple_score = triple_coverage * 15
+        expected_max_triples = len(pool) * 20
+
+        normalized_triple_coverage = (len(all_triples) / expected_max_triples)
+        
+        triple_score = min(15, normalized_triple_coverage * 15)
         
         combinatorial_score = pair_score + triple_score
         
@@ -365,7 +373,7 @@ class AdvancedCoverageOptimizer:
         avg_distance = np.mean(distances) if distances else 0
         # Normalizar pela distância máxima possível
         max_possible_dist = np.linalg.norm(self.feature_stds * 3)
-        diversity_score = (avg_distance / max_possible_dist) * 25
+        diversity_score = min(25, (avg_distance / np.percentile(distances, 95)) * 25)
         
         # 4. ANTI-HUMAN SCORE - EV OPTIMIZER (15 pontos)
         # Quanto menor o human_score, melhor (menos chance de dividir prêmio)
@@ -374,8 +382,10 @@ class AdvancedCoverageOptimizer:
         
         # Penalizar jogos "humanos" (inverter escala)
         anti_human_score = 15 * np.exp(-avg_human_score / 10)
-        if human_score > 20:
-            return -999
+        
+        # Penalidade extrema para pools muito humanos
+        if avg_human_score > 20:
+            anti_human_score *= 0.2
             
         # 5. ENTROPIA DO CONJUNTO (10 pontos)
         # Mede uniformidade da distribuição de dezenas
