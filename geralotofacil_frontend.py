@@ -226,7 +226,7 @@ class LotofacilFrontend:
         print("="*50)
         
         # Gerar candidatos
-        n_generate = 10000
+        n_generate = 500000
         print(f"\n🎲 Gerando {n_generate} candidatos...")
         self.candidates = self.optimizer.generate_candidates(n_generate)
         print(f"   ✅ {len(self.candidates)} candidatos gerados")
