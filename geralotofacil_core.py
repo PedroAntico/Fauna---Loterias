@@ -63,7 +63,7 @@ QUADRANTES = {
 }
 
 
-class LotofacilOptimizerV31:
+class LotofacilOptimizerV3:
     """
     Motor de Otimização Lotofácil v3.1 - Com Mahalanobis
     
