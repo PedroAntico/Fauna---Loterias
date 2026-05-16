@@ -699,8 +699,21 @@ def calcular_amplitude(game):
     return max(game) - min(game)
 
 def contar_consecutivos(game):
+
     d = sorted(game)
-    return sum(1 for i in range(len(d)-1) if d[i+1] - d[i] == 1)
+
+    max_block = 1
+    current = 1
+
+    for i in range(len(d)-1):
+
+        if d[i+1] - d[i] == 1:
+            current += 1
+            max_block = max(max_block, current)
+        else:
+            current = 1
+
+    return max_block
 
 
 # ============================================================
