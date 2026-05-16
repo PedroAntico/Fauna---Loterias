@@ -156,32 +156,36 @@ class LotofacilOptimizerV3:
     # ============================================================
     # MÉTODOS PÚBLICOS PRINCIPAIS
     # ============================================================
+    def get_last_draw(self):
+        """
+        Retorna o último concurso real
+        """
     
-    def get_last_draws(self, n=10):
-    """
-    Retorna os últimos n concursos reais
-    """
+        draws = self.get_last_draws(1)
     
-    if self.df is None or len(self.df) == 0:
+        if draws:
+            return draws[0]
+    
         return None
     
-    latest_draws = (
-        self.df
-        .sort_values('concurso', ascending=False)
-        .head(n)
-    )
+    def get_last_draws(self, n=10):
+        """
+        Retorna os últimos n concursos reais
+        """
     
-    results = []
+        if self.df is None or len(self.df) == 0:
+            return None
     
-    for _, row in latest_draws.iterrows():
-        game = [
-            int(row[f'b{i}'])
-            for i in range(1, 16)
-        ]
-        
-        results.append(sorted(game))
+        latest_draws = ( self.df .sort_values('concurso', ascending=False) .head(n) )
     
-    return results
+        results = []
+    
+        for _, row in latest_draws.iterrows():
+            game = [ int(row[f'b{i}']) for i in range(1, 16)]
+    
+            results.append(sorted(game))
+    
+        return results
     
     def get_historical_frequency(self):
         """
