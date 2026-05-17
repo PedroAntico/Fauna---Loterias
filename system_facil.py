@@ -2,24 +2,23 @@
 # -*- coding: utf-8 -*-
 
 """
-SISTEMA DE NAVEGAÇÃO NO ESPAÇO COMBINATÓRIO
-============================================
-Versão 8.0 - Embedding Estrutural + Scores Normalizados
+MOTOR DE OTIMIZAÇÃO - SYSTEM_FACIL.PY
+======================================
+Versão 1.0 - Gera e Exporta Fronteira de Pareto
 
-MELHORIAS:
-✅ Scores NORMALIZADOS (z-score por métrica)
-✅ Entropia POSICIONAL (não global)
-✅ UMAP embedding para visualização 2D/3D
-✅ Clusters estruturais reais
-✅ Perfis balanceados (anti-viés)
-✅ Distância global (heapq, não últimos 10)
+FUNCIONALIDADES:
+✅ NSGA-II completo com Johnson Space
+✅ Distâncias bitwise otimizadas
+✅ Entropia posicional + Mutual Information
+✅ Exporta pareto_frontier.json
+✅ Salva métricas e embeddings
+✅ Prepara dados para o frontend
 """
 
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from scipy.stats import entropy, zscore
-from scipy.spatial.distance import pdist, squareform
+from scipy.sparse import csr_matrix, diags, eye
+from scipy.sparse.linalg import eigsh
+from scipy.stats import entropy
 from collections import Counter, defaultdict
 from itertools import combinations
 from datetime import datetime
@@ -30,34 +29,13 @@ import struct
 import zlib
 import heapq
 from math import comb
-from functools import lru_cache
+import hashlib
+from tqdm import tqdm
 
 warnings.filterwarnings('ignore')
 
-plt.style.use('seaborn-v0_8-darkgrid')
-sns.set_palette("husl")
-plt.rcParams['figure.figsize'] = (16, 10)
-plt.rcParams['figure.dpi'] = 120
-
-# Tentar importar UMAP (opcional)
-try:
-    import umap
-    UMAP_AVAILABLE = True
-except ImportError:
-    UMAP_AVAILABLE = False
-    print("⚠️  UMAP não instalado. Use: pip install umap-learn")
-
-# Tentar importar sklearn para PCA
-try:
-    from sklearn.decomposition import PCA
-    from sklearn.preprocessing import StandardScaler
-    SKLEARN_AVAILABLE = True
-except ImportError:
-    SKLEARN_AVAILABLE = False
-
-
 # ============================================================
-# JOHNSON SPACE (mantido)
+# JOHNSON SPACE J(25,15)
 # ============================================================
 
 class JohnsonSpace:
@@ -66,15 +44,26 @@ class JohnsonSpace:
     def __init__(self, n=25, k=15):
         self.n = n
         self.k = k
-        self.max_distance = k - max(0, 2*k - n)
+        self.total_codes = comb(n, k)
+        self.min_intersection = max(0, 2*k - n)
+        self.max_distance = k - self.min_intersection
         self._dist_cache = {}
         self._cover_samples = None
+        self._cache_hits = 0
+        self._cache_misses = 0
     
     def game_to_bits(self, game):
         bits = 0
         for d in game:
             bits |= (1 << (d - 1))
         return bits
+    
+    def bits_to_game(self, bits):
+        game = []
+        for i in range(self.n):
+            if bits & (1 << i):
+                game.append(i + 1)
+        return sorted(game)
     
     def johnson_distance(self, game1, game2):
         if isinstance(game1, list): bits1 = self.game_to_bits(game1)
@@ -84,10 +73,15 @@ class JohnsonSpace:
         
         key = (bits1, bits2) if bits1 < bits2 else (bits2, bits1)
         if key in self._dist_cache:
+            self._cache_hits += 1
             return self._dist_cache[key]
         
+        self._cache_misses += 1
         d = self.k - (bits1 & bits2).bit_count()
-        self._dist_cache[key] = d
+        
+        if len(self._dist_cache) < 15000:
+            self._dist_cache[key] = d
+        
         return d
     
     def min_johnson_distance(self, pool):
@@ -101,7 +95,18 @@ class JohnsonSpace:
                 if min_d == 0: return 0
         return min_d
     
+    def avg_johnson_distance(self, pool):
+        if len(pool) < 2: return 0
+        bits_list = [self.game_to_bits(g) for g in pool]
+        distances = []
+        for i in range(len(bits_list)):
+            for j in range(i+1, len(bits_list)):
+                distances.append(self.johnson_distance(bits_list[i], bits_list[j]))
+        return np.mean(distances)
+    
     def pre_generate_cover_samples(self, n_samples=2000):
+        if self._cover_samples is not None:
+            return self._cover_samples
         samples = set()
         while len(samples) < n_samples:
             game = tuple(sorted(np.random.choice(range(1, self.n+1), self.k, replace=False)))
@@ -123,53 +128,67 @@ class JohnsonSpace:
                 if min_dist == 0: break
             max_min_dist = max(max_min_dist, min_dist)
         return max_min_dist / self.max_distance
+    
+    def sphere_packing_bound(self, pool):
+        d = self.min_johnson_distance(pool)
+        if d == 0: return 0
+        radius = (d - 1) // 2
+        if radius < 0: radius = 0
+        sphere_vol = 0
+        for i in range(min(radius, self.k) + 1):
+            if i <= self.n - self.k:
+                sphere_vol += comb(self.k, i) * comb(self.n - self.k, i)
+        if sphere_vol == 0: return 1.0
+        max_codes = self.total_codes / sphere_vol
+        return min(1.0, len(pool) / max_codes)
+    
+    def distance_matrix_sparse(self, pool, k_neighbors=5):
+        n = len(pool)
+        bits_list = [self.game_to_bits(g) for g in pool]
+        row_indices, col_indices, data = [], [], []
+        for i in range(n):
+            distances = []
+            for j in range(n):
+                if i != j:
+                    d = self.johnson_distance(bits_list[i], bits_list[j])
+                    distances.append((d, j))
+            distances.sort(key=lambda x: x[0])
+            for d, j in distances[:k_neighbors]:
+                row_indices.append(i)
+                col_indices.append(j)
+                data.append(d)
+        return csr_matrix((data, (row_indices, col_indices)), shape=(n, n))
 
 
 # ============================================================
-# GARANTIA DE UNICIDADE (COM HEAPQ GLOBAL)
+# GARANTIA DE UNICIDADE
 # ============================================================
 
 def ensure_unique_pool(pool, n_games, johnson=None):
-    """
-    Garante unicidade com distância GLOBAL (heapq)
-    Não apenas últimos 10 - considera geometria completa
-    """
     if johnson is None:
         johnson = JohnsonSpace()
-    
     unique = []
     seen = set()
-    
     for game in pool:
         key = tuple(sorted(game))
         if key not in seen:
             seen.add(key)
             unique.append(sorted(game))
-    
     while len(unique) < n_games:
-        # Gerar candidatos
         candidates = []
         for _ in range(100):
             candidate = sorted(np.random.choice(range(1, 26), 15, replace=False))
-            if tuple(candidate) in seen:
-                continue
-            
-            # Calcular distância MÍNIMA para TODOS os existentes
+            if tuple(candidate) in seen: continue
             bits_c = johnson.game_to_bits(candidate)
             min_dist = johnson.max_distance
-            
             for existing in unique:
                 bits_e = johnson.game_to_bits(existing)
                 d = johnson.johnson_distance(bits_c, bits_e)
                 min_dist = min(min_dist, d)
-            
-            # Usar heapq para manter os melhores
             if len(candidates) < 10:
                 heapq.heappush(candidates, (-min_dist, tuple(candidate)))
             else:
                 heapq.heappushpop(candidates, (-min_dist, tuple(candidate)))
-        
-        # Selecionar o mais distante
         if candidates:
             best = max(candidates, key=lambda x: -x[0])
             game = list(best[1])
@@ -180,72 +199,39 @@ def ensure_unique_pool(pool, n_games, johnson=None):
             if tuple(game) not in seen:
                 seen.add(tuple(game))
                 unique.append(game)
-    
     return unique[:n_games]
 
 
 # ============================================================
-# ENTROPIA POSICIONAL (NÃO GLOBAL)
+# ENTROPIA POSICIONAL + MUTUAL INFORMATION
 # ============================================================
 
 def positional_entropy(pool):
-    """
-    Entropia por POSIÇÃO (mais discriminativa que global)
-    
-    Mede variabilidade em cada uma das 15 posições ordenadas
-    """
-    if not pool:
-        return 0.0
-    
+    if not pool: return 0.0
     n_games = len(pool)
     pos_entropies = []
-    
-    # Para cada posição (1ª a 15ª dezena ordenada)
     for pos in range(15):
-        # Extrair dezenas nesta posição
         pos_values = [sorted(g)[pos] for g in pool]
-        
-        # Frequência
         freq = np.bincount(pos_values, minlength=26)[1:]
         probs = freq / n_games
         probs = np.where(probs > 0, probs, 1e-10)
-        
-        # Entropia da posição
-        pos_ent = entropy(probs)
-        pos_entropies.append(pos_ent)
-    
-    # Média das entropias posicionais (normalizada)
+        pos_entropies.append(entropy(probs))
     max_entropy = np.log(25)
-    avg_pos_entropy = np.mean(pos_entropies) / max_entropy
-    
-    return float(avg_pos_entropy)
+    return float(np.mean(pos_entropies) / max_entropy)
 
 
 def mutual_information_positions(pool):
-    """
-    Informação mútua entre posições adjacentes
-    
-    Mede dependência estrutural
-    """
-    if len(pool) < 2:
-        return 0.0
-    
+    if len(pool) < 2: return 0.0
     mi_values = []
-    
-    for pos in range(14):  # Pares de posições adjacentes
+    for pos in range(14):
         pos1_vals = [sorted(g)[pos] for g in pool]
         pos2_vals = [sorted(g)[pos+1] for g in pool]
-        
-        # Tabela de contingência
         contingency = np.zeros((25, 25))
         for v1, v2 in zip(pos1_vals, pos2_vals):
             contingency[v1-1, v2-1] += 1
-        
-        # Informação mútua
         joint = contingency / len(pool)
         marginal1 = joint.sum(axis=1)
         marginal2 = joint.sum(axis=0)
-        
         mi = 0.0
         for i in range(25):
             for j in range(25):
@@ -253,572 +239,455 @@ def mutual_information_positions(pool):
                     expected = marginal1[i] * marginal2[j]
                     if expected > 0:
                         mi += joint[i, j] * np.log(joint[i, j] / expected)
-        
         mi_values.append(mi)
-    
     return float(np.mean(mi_values))
 
 
 # ============================================================
-# ANALISADOR DE SINAIS (COM SCORES NORMALIZADOS)
+# SERIALIZAÇÃO BINÁRIA
 # ============================================================
 
-class SignalAnalyzer:
-    """
-    Extrai sinais estruturais com métricas BALANCEADAS
+class BinarySerializer:
+    @staticmethod
+    def pool_to_bytes(pool):
+        data = bytearray()
+        for game in pool:
+            bits = 0
+            for d in game:
+                bits |= (1 << (d - 1))
+            data.extend(struct.pack('>I', bits))
+        return bytes(data)
     
-    Correções:
-    - Entropia posicional (não global)
-    - Scores normalizados (z-score)
-    - Pesos calibrados para não enviesar
-    """
+    @staticmethod
+    def pool_hash(pool):
+        return hashlib.md5(BinarySerializer.pool_to_bytes(pool)).hexdigest()
     
-    def __init__(self):
+    @staticmethod
+    def compressibility(pool):
+        raw = BinarySerializer.pool_to_bytes(pool)
+        compressed = zlib.compress(raw, level=9)
+        return len(compressed) / len(raw)
+
+
+# ============================================================
+# LAPLACIAN SPECTRUM
+# ============================================================
+
+class LaplacianSpectrumSparse:
+    def __init__(self, johnson_space):
+        self.js = johnson_space
+        self._spectral_cache = {}
+    
+    def similarity_sparse(self, pool, k_neighbors=5):
+        n = len(pool)
+        D_sparse = self.js.distance_matrix_sparse(pool, k_neighbors)
+        sigma = 3.0
+        S = D_sparse.copy()
+        S.data = np.exp(-S.data**2 / (2 * sigma**2))
+        S = S + eye(n, format='csr')
+        return S
+    
+    def laplacian_sparse(self, pool, k_neighbors=5):
+        S = self.similarity_sparse(pool, k_neighbors)
+        n = len(pool)
+        degrees = np.array(S.sum(axis=1)).flatten()
+        d_inv_sqrt = 1.0 / np.sqrt(degrees + 1e-10)
+        D_inv_sqrt = diags(d_inv_sqrt, format='csr')
+        I = eye(n, format='csr')
+        L = I - D_inv_sqrt @ S @ D_inv_sqrt
+        return L
+    
+    def connectivity_score(self, pool):
+        pool_hash = BinarySerializer.pool_hash(pool)
+        if pool_hash in self._spectral_cache:
+            return self._spectral_cache[pool_hash]
+        
+        n = len(pool)
+        try:
+            L = self.laplacian_sparse(pool, k_neighbors=5)
+            eigenvalues, _ = eigsh(L, k=min(3, n-1), which='SM')
+            eigenvalues = np.sort(eigenvalues)
+            score = min(1.0, float(eigenvalues[1]) / 2.0) if len(eigenvalues) > 1 else 0.0
+        except:
+            score = 0.5
+        
+        if len(self._spectral_cache) < 100:
+            self._spectral_cache[pool_hash] = score
+        
+        return score
+
+
+# ============================================================
+# OBJETIVOS CONFLITANTES
+# ============================================================
+
+class ConflictingObjectives:
+    def __init__(self, historical_data=None):
         self.johnson = JohnsonSpace()
         self.johnson.pre_generate_cover_samples(2000)
-    
-    def analyze_pool(self, pool):
-        """Análise completa com métricas discriminativas"""
-        pool = ensure_unique_pool(pool, len(pool), self.johnson)
+        self.laplacian = LaplacianSpectrumSparse(self.johnson)
+        self.historical_data = historical_data or []
         
-        # Cobertura de pares
+        self.n_objectives = 6
+        self.objective_names = [
+            'Cobertura Pares',
+            'Dist Johnson Mín',
+            'Covering Radius',
+            'Compressibilidade',
+            'Indep Histórica',
+            'Conectividade Alg'
+        ]
+        self.directions = ['max', 'max', 'min', 'min', 'min', 'max']
+        self._eval_cache = {}
+    
+    def evaluate(self, pool, generation=0, max_gen=50, is_elite=False):
+        pool_hash = BinarySerializer.pool_hash(pool)
+        if pool_hash in self._eval_cache:
+            return self._eval_cache[pool_hash].copy()
+        
+        objectives = np.zeros(6)
+        
+        # 1. Cobertura de pares
         covered = set()
         for game in pool:
             for pair in combinations(sorted(game), 2):
                 covered.add(pair)
-        pair_coverage = len(covered) / comb(25, 2)
+        objectives[0] = len(covered) / comb(25, 2)
         
-        # Distância Johnson
-        min_dist = self.johnson.min_johnson_distance(pool)
-        max_dist = self.johnson.max_distance
+        # 2. Distância Johnson mínima
+        objectives[1] = self.johnson.min_johnson_distance(pool) / self.johnson.max_distance
         
-        # Covering radius
-        covering = self.johnson.covering_radius_fast(pool)
+        # 3. Covering radius
+        objectives[2] = self.johnson.covering_radius_fast(pool)
         
-        # Distância média
-        bits_list = [self.johnson.game_to_bits(g) for g in pool]
-        distances = []
-        for i in range(len(bits_list)):
-            for j in range(i+1, len(bits_list)):
-                distances.append(self.johnson.johnson_distance(bits_list[i], bits_list[j]))
-        avg_dist = np.mean(distances) if distances else 0
+        # 4. Compressibilidade
+        objectives[3] = BinarySerializer.compressibility(pool)
         
-        # ENTROPIA POSICIONAL (não global)
-        pos_entropy = positional_entropy(pool)
-        
-        # Informação mútua (dependência estrutural)
-        mi = mutual_information_positions(pool)
-        
-        # Compressibilidade
-        raw = bytearray()
-        for g in pool:
-            bits = 0
-            for d in g:
-                bits |= (1 << (d-1))
-            raw.extend(struct.pack('>I', bits))
-        compressed = zlib.compress(bytes(raw), level=9)
-        compressibility = len(compressed) / len(raw)
-        
-        # Variância da distância (nova métrica)
-        std_dist = np.std(distances) if distances else 0
-        
-        return {
-            'pair_coverage': float(pair_coverage),
-            'johnson_min': float(min_dist / max_dist),
-            'covering_radius': float(covering),
-            'avg_distance': float(avg_dist / max_dist),
-            'std_distance': float(std_dist / max_dist),
-            'pos_entropy': float(pos_entropy),
-            'mutual_info': float(mi),
-            'compressibility': float(compressibility),
-            'n_unique': len(pool)
-        }
-    
-    def classify_profile(self, signals, all_signals_list=None):
-        """
-        Classificação BALANCEADA com normalização
-        
-        Se all_signals_list fornecida, usa z-score para normalizar
-        """
-        scores = {}
-        
-        # Se temos lista de todos os sinais, normalizar
-        if all_signals_list and len(all_signals_list) > 1:
-            normalized = self._normalize_signals(signals, all_signals_list)
+        # 5. Independência histórica
+        if self.historical_data:
+            recent = self.historical_data[-50:]
+            total_sim = 0
+            for game in pool:
+                max_sim = max(len(set(game) & set(h)) / 15 for h in recent)
+                total_sim += max_sim
+            objectives[4] = total_sim / len(pool)
         else:
-            normalized = signals
+            objectives[4] = 0.5
         
-        # Pesos CALIBRADOS (todos ~mesma magnitude)
-        scores['conservador'] = (
-            (1 - normalized['pos_entropy']) * 1.5 +
-            normalized['compressibility'] * 1.5 +
-            (1 - normalized['std_distance']) * 1.0
-        )
+        # 6. Conectividade algébrica (apenas elite)
+        if is_elite:
+            objectives[5] = self.laplacian.connectivity_score(pool)
+        else:
+            objectives[5] = 0.5
         
-        scores['caotico'] = (
-            normalized['johnson_min'] * 1.5 +
-            normalized['avg_distance'] * 1.5 +
-            normalized['pos_entropy'] * 1.0
-        )
+        if len(self._eval_cache) < 300:
+            self._eval_cache[pool_hash] = objectives.copy()
         
-        scores['cobertura'] = (
-            normalized['pair_coverage'] * 1.5 +
-            (1 - normalized['covering_radius']) * 1.5 +
-            normalized['avg_distance'] * 1.0
-        )
-        
-        scores['balanceado'] = (
-            normalized['pair_coverage'] * 1.0 +
-            normalized['johnson_min'] * 1.0 +
-            (1 - normalized['covering_radius']) * 1.0 +
-            normalized['pos_entropy'] * 1.0
-        )
-        
-        best_profile = max(scores, key=scores.get)
-        return best_profile, scores
+        return objectives
+
+
+# ============================================================
+# NSGA-II
+# ============================================================
+
+class FastNSGA2:
+    def __init__(self, n_games=30, pop_size=80, n_generations=30, historical_data=None):
+        self.n_games = n_games
+        self.pop_size = pop_size
+        self.n_generations = n_generations
+        self.objectives = ConflictingObjectives(historical_data)
+        self.johnson = JohnsonSpace()
+        self.n_obj = 6
+        self.directions = self.objectives.directions
     
-    def _normalize_signals(self, signals, all_signals):
-        """
-        Normaliza sinais usando estatísticas da população
-        
-        Converte para escala 0-1 relativa
-        """
-        normalized = {}
-        
-        for key in signals:
-            values = [s[key] for s in all_signals]
-            vmin = np.min(values)
-            vmax = np.max(values)
-            
-            if vmax - vmin > 1e-10:
-                normalized[key] = (signals[key] - vmin) / (vmax - vmin)
+    def _dominates(self, obj1, obj2):
+        better_in_any = False
+        for i, direction in enumerate(self.directions):
+            if direction == 'max':
+                if obj1[i] < obj2[i]: return False
+                if obj1[i] > obj2[i]: better_in_any = True
             else:
-                normalized[key] = 0.5
+                if obj1[i] > obj2[i]: return False
+                if obj1[i] < obj2[i]: better_in_any = True
+        return better_in_any
+    
+    def _initialize_population(self):
+        population = []
+        for _ in range(self.pop_size):
+            pool = []
+            seen = set()
+            for _ in range(self.n_games):
+                game = tuple(sorted(np.random.choice(range(1, 26), 15, replace=False)))
+                if game not in seen:
+                    seen.add(game)
+                    pool.append(list(game))
+            population.append(pool)
+        return population
+    
+    def run(self):
+        print(f"\n{'='*60}")
+        print(f"🧬 NSGA-II - GERANDO FRONTEIRA DE PARETO")
+        print(f"{'='*60}")
+        print(f"   Pop: {self.pop_size} | Gen: {self.n_generations} | Jogos: {self.n_games}")
         
-        return normalized
+        population = self._initialize_population()
+        population_obj = [self.objectives.evaluate(p, 0, self.n_generations) for p in population]
+        
+        for gen in tqdm(range(self.n_generations), desc="NSGA-II"):
+            offspring = []
+            while len(offspring) < self.pop_size:
+                i1, i2 = np.random.choice(self.pop_size, 2, replace=False)
+                p1 = population[i1] if self._dominates(population_obj[i1], population_obj[i2]) else population[i2]
+                i3, i4 = np.random.choice(self.pop_size, 2, replace=False)
+                p2 = population[i3] if self._dominates(population_obj[i3], population_obj[i4]) else population[i4]
+                child = self._crossover(p1, p2)
+                child = self._mutate(child)
+                child = ensure_unique_pool(child, self.n_games, self.johnson)
+                offspring.append(child)
+            
+            offspring_obj = [self.objectives.evaluate(o, gen, self.n_generations) for o in offspring]
+            combined = population + offspring
+            combined_obj = population_obj + offspring_obj
+            fronts = self._fast_non_dominated_sort(combined_obj)
+            
+            new_pop, new_obj = [], []
+            for front in fronts:
+                if len(new_pop) + len(front) <= self.pop_size:
+                    for idx in front:
+                        new_pop.append(combined[idx])
+                        new_obj.append(combined_obj[idx])
+                else:
+                    remaining = self.pop_size - len(new_pop)
+                    distances = self._crowding_distance(front, combined_obj)
+                    sorted_f = sorted(zip(front, distances), key=lambda x: x[1], reverse=True)
+                    for idx, _ in sorted_f[:remaining]:
+                        new_pop.append(combined[idx])
+                        new_obj.append(combined_obj[idx])
+                    break
+            
+            population = new_pop
+            population_obj = new_obj
+            
+            # Avaliação espectral na elite a cada 3 gerações
+            if gen % 3 == 0:
+                fronts = self._fast_non_dominated_sort(population_obj)
+                elite_indices = []
+                for front in fronts:
+                    elite_indices.extend(front)
+                    if len(elite_indices) >= int(self.pop_size * 0.3):
+                        break
+                for idx in elite_indices:
+                    population_obj[idx] = self.objectives.evaluate(population[idx], gen, self.n_generations, is_elite=True)
+        
+        # Resultado final
+        final_fronts = self._fast_non_dominated_sort(population_obj)
+        pareto_idx = final_fronts[0]
+        
+        for idx in pareto_idx:
+            population_obj[idx] = self.objectives.evaluate(population[idx], self.n_generations, self.n_generations, is_elite=True)
+        
+        pareto_pools = [ensure_unique_pool(population[i], self.n_games, self.johnson) for i in pareto_idx]
+        pareto_obj = [population_obj[i] for i in pareto_idx]
+        
+        print(f"\n   ✅ Fronteira: {len(pareto_pools)} soluções")
+        return pareto_pools, pareto_obj
+    
+    def _crossover(self, p1, p2):
+        mid = self.n_games // 2
+        if np.random.random() < 0.5:
+            return p1[:mid] + p2[mid:]
+        child = []
+        for i in range(self.n_games):
+            g1, g2 = p1[i], p2[i]
+            common = list(set(g1) & set(g2))
+            only1 = list(set(g1) - set(g2))
+            only2 = list(set(g2) - set(g1))
+            cg = common + only1[:len(only1)//2] + only2[:len(only2)//2]
+            while len(cg) < 15:
+                avail = [d for d in range(1, 26) if d not in cg]
+                cg.append(np.random.choice(avail))
+            child.append(sorted(cg[:15]))
+        return child
+    
+    def _mutate(self, pool, rate=0.1):
+        mutated = [g.copy() for g in pool]
+        n_mut = max(1, int(self.n_games * rate))
+        indices = np.random.choice(self.n_games, n_mut, replace=False)
+        for idx in indices:
+            game = mutated[idx]
+            pos = np.random.randint(0, 15)
+            avail = [d for d in range(1, 26) if d not in game]
+            if avail:
+                game[pos] = np.random.choice(avail)
+            mutated[idx] = sorted(game)
+        return mutated
+    
+    def _fast_non_dominated_sort(self, pop_obj):
+        n = len(pop_obj)
+        dom_count = np.zeros(n, dtype=int)
+        dom_sol = [[] for _ in range(n)]
+        fronts = [[]]
+        for i in range(n):
+            for j in range(n):
+                if i == j: continue
+                if self._dominates(pop_obj[i], pop_obj[j]):
+                    dom_sol[i].append(j)
+                elif self._dominates(pop_obj[j], pop_obj[i]):
+                    dom_count[i] += 1
+            if dom_count[i] == 0:
+                fronts[0].append(i)
+        i = 0
+        while fronts[i]:
+            next_f = []
+            for idx in fronts[i]:
+                for didx in dom_sol[idx]:
+                    dom_count[didx] -= 1
+                    if dom_count[didx] == 0:
+                        next_f.append(didx)
+            i += 1
+            fronts.append(next_f)
+        return fronts[:-1]
+    
+    def _crowding_distance(self, front_idx, pop_obj):
+        n = len(front_idx)
+        if n <= 2: return [float('inf')] * n
+        distances = np.zeros(n)
+        for obj_i in range(self.n_obj):
+            sorted_i = sorted(front_idx, key=lambda i: pop_obj[i][obj_i])
+            obj_range = pop_obj[sorted_i[-1]][obj_i] - pop_obj[sorted_i[0]][obj_i]
+            if obj_range > 0:
+                distances[0] = float('inf')
+                distances[-1] = float('inf')
+                for i in range(1, n-1):
+                    distances[i] += (pop_obj[sorted_i[i+1]][obj_i] - pop_obj[sorted_i[i-1]][obj_i]) / obj_range
+        return distances.tolist()
 
 
 # ============================================================
-# EMBEDDING ESTRUTURAL (UMAP/PCA)
+# ANÁLISE DE SINAIS
 # ============================================================
 
-class StructuralEmbedding:
-    """
-    Embedding 2D/3D do espaço de soluções
+def compute_all_signals(pareto_pools):
+    """Calcula todos os sinais estruturais"""
+    johnson = JohnsonSpace()
+    johnson.pre_generate_cover_samples(2000)
     
-    Revela clusters, outliers, e geometria dos perfis
-    """
+    signals_list = []
     
-    def __init__(self, signals_list):
-        """
-        Args:
-            signals_list: Lista de dicionários de sinais
-        """
-        self.signals_list = signals_list
-        self.feature_names = [
-            'pair_coverage', 'johnson_min', 'covering_radius',
-            'avg_distance', 'std_distance', 'pos_entropy',
-            'mutual_info', 'compressibility'
-        ]
+    for pool in tqdm(pareto_pools, desc="Analisando sinais"):
+        pool = ensure_unique_pool(pool, len(pool), johnson)
         
-        # Matriz de features
-        self.X = self._build_feature_matrix()
+        covered = set()
+        for game in pool:
+            for pair in combinations(sorted(game), 2):
+                covered.add(pair)
         
-        # Embeddings
-        self.embedding_2d = None
-        self.embedding_3d = None
+        signals = {
+            'pair_coverage': float(len(covered) / comb(25, 2)),
+            'johnson_min': float(johnson.min_johnson_distance(pool) / johnson.max_distance),
+            'johnson_avg': float(johnson.avg_johnson_distance(pool) / johnson.max_distance),
+            'covering_radius': float(johnson.covering_radius_fast(pool)),
+            'sphere_packing': float(johnson.sphere_packing_bound(pool)),
+            'pos_entropy': float(positional_entropy(pool)),
+            'mutual_info': float(mutual_information_positions(pool)),
+            'compressibility': float(BinarySerializer.compressibility(pool)),
+        }
         
-    def _build_feature_matrix(self):
-        """Constrói matriz de features"""
-        X = np.zeros((len(self.signals_list), len(self.feature_names)))
-        
-        for i, signals in enumerate(self.signals_list):
-            for j, name in enumerate(self.feature_names):
-                X[i, j] = signals.get(name, 0.0)
-        
-        return X
+        signals_list.append(signals)
     
-    def compute_umap(self, n_components=2, random_state=42):
-        """Computa UMAP embedding"""
-        if not UMAP_AVAILABLE:
-            print("⚠️  UMAP não disponível. Usando PCA.")
-            return self.compute_pca(n_components)
-        
-        # Normalizar
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(self.X)
-        
-        # UMAP
-        reducer = umap.UMAP(
-            n_components=n_components,
-            random_state=random_state,
-            n_neighbors=min(15, len(self.X) - 1),
-            min_dist=0.1,
-            metric='euclidean'
-        )
-        
-        embedding = reducer.fit_transform(X_scaled)
-        
-        if n_components == 2:
-            self.embedding_2d = embedding
-        else:
-            self.embedding_3d = embedding
-        
-        return embedding
-    
-    def compute_pca(self, n_components=2):
-        """Computa PCA embedding (fallback)"""
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(self.X)
-        
-        pca = PCA(n_components=n_components)
-        embedding = pca.fit_transform(X_scaled)
-        
-        if n_components == 2:
-            self.embedding_2d = embedding
-        else:
-            self.embedding_3d = embedding
-        
-        # Variância explicada
-        print(f"   PCA: {pca.explained_variance_ratio_.sum()*100:.1f}% variância")
-        
-        return embedding
-    
-    def visualize(self, profiles=None, output_dir='graficos_embedding'):
-        """Visualiza embedding 2D com perfis"""
-        os.makedirs(output_dir, exist_ok=True)
-        
-        if self.embedding_2d is None:
-            self.compute_umap(2)
-        
-        fig, axes = plt.subplots(1, 2, figsize=(18, 8))
-        
-        # 1. Embedding colorido por perfil
-        ax = axes[0]
-        
-        if profiles:
-            profile_colors = {
-                'conservador': 'blue',
-                'caotico': 'red',
-                'cobertura': 'green',
-                'balanceado': 'purple'
-            }
-            
-            for profile_name, color in profile_colors.items():
-                mask = [p == profile_name for p in profiles]
-                if any(mask):
-                    ax.scatter(
-                        self.embedding_2d[mask, 0],
-                        self.embedding_2d[mask, 1],
-                        c=color, label=profile_name,
-                        s=100, alpha=0.7, edgecolors='black', linewidth=0.5
-                    )
-            
-            ax.legend()
-        else:
-            ax.scatter(
-                self.embedding_2d[:, 0],
-                self.embedding_2d[:, 1],
-                c='blue', s=100, alpha=0.7
-            )
-        
-        ax.set_xlabel('Componente 1')
-        ax.set_ylabel('Componente 2')
-        ax.set_title('Embedding Estrutural - Espaço de Soluções')
-        ax.grid(True, alpha=0.3)
-        
-        # 2. Heatmap das features
-        ax = axes[1]
-        
-        # Ordenar por perfil para visualização
-        if profiles:
-            profile_order = {'conservador': 0, 'balanceado': 1, 'cobertura': 2, 'caotico': 3}
-            order = sorted(range(len(profiles)), key=lambda i: profile_order.get(profiles[i], 99))
-            X_ordered = self.X[order]
-        else:
-            X_ordered = self.X
-        
-        im = ax.imshow(X_ordered.T, aspect='auto', cmap='RdYlGn')
-        ax.set_xlabel('Solução')
-        ax.set_yticks(range(len(self.feature_names)))
-        ax.set_yticklabels([n[:15] for n in self.feature_names])
-        ax.set_title('Matriz de Sinais Estruturais')
-        plt.colorbar(im, ax=ax)
-        
-        plt.suptitle('Navegação no Espaço Combinatório', fontsize=16, fontweight='bold')
-        plt.tight_layout()
-        plt.savefig(f'{output_dir}/embedding_estrutural.png', bbox_inches='tight', dpi=150)
-        plt.close()
-        
-        print(f"✅ Gráficos salvos em {output_dir}/")
-        return fig
+    return signals_list
 
 
 # ============================================================
-# FRONTEND DE NAVEGAÇÃO
+# EXPORTAÇÃO
 # ============================================================
 
-class StructuralNavigator:
-    """
-    Navegador interativo no espaço combinatório
-    
-    Usa embedding + perfis para exploração
-    """
-    
-    def __init__(self, pareto_pools=None):
-        self.analyzer = SignalAnalyzer()
-        self.pareto_pools = pareto_pools or []
-        
-        # Analisar todos
-        self.all_signals = []
-        self.all_profiles = []
-        
-        if self.pareto_pools:
-            self._analyze_all()
-    
-    def _analyze_all(self):
-        """Analisa todos os pools com normalização populacional"""
-        print(f"\n📊 ANALISANDO {len(self.pareto_pools)} SOLUÇÕES...")
-        
-        # Primeiro passo: extrair sinais brutos
-        raw_signals = []
-        for pool in self.pareto_pools:
-            signals = self.analyzer.analyze_pool(pool)
-            raw_signals.append(signals)
-        
-        # Segundo passo: classificar COM normalização
-        for i, signals in enumerate(raw_signals):
-            profile, scores = self.analyzer.classify_profile(signals, raw_signals)
-            
-            self.all_signals.append(signals)
-            self.all_profiles.append({
-                'index': i,
-                'profile': profile,
-                'scores': scores,
-                'signals': signals
-            })
-        
-        # Estatísticas
-        profile_counts = Counter(p['profile'] for p in self.all_profiles)
-        print(f"   ✅ Perfis: {dict(profile_counts)}")
-    
-    def get_pools_by_profile(self, profile_name, top_n=5):
-        """Retorna melhores pools para um perfil"""
-        matching = [p for p in self.all_profiles if p['profile'] == profile_name]
-        
-        if not matching:
-            return []
-        
-        matching.sort(key=lambda x: x['scores'][profile_name], reverse=True)
-        
-        results = []
-        for p in matching[:top_n]:
-            pool = self.pareto_pools[p['index']]
-            results.append((pool, p['signals'], p['scores'][profile_name]))
-        
-        return results
-    
-    def create_embedding(self):
-        """Cria embedding estrutural"""
-        embedding = StructuralEmbedding(self.all_signals)
-        profiles = [p['profile'] for p in self.all_profiles]
-        embedding.compute_umap(2)
-        embedding.visualize(profiles)
-        return embedding
-    
-    def display_dashboard(self):
-        """Dashboard completo"""
-        print(f"\n{'='*70}")
-        print(f"🎯 DASHBOARD DE NAVEGAÇÃO ESTRUTURAL")
-        print(f"{'='*70}")
-        print(f"\n📊 {len(self.pareto_pools)} soluções analisadas")
-        
-        # Distribuição de perfis
-        profile_counts = Counter(p['profile'] for p in self.all_profiles)
-        print(f"\n📊 DISTRIBUIÇÃO DE PERFIS:")
-        for profile, count in profile_counts.most_common():
-            bar = '█' * (count * 40 // len(self.all_profiles))
-            print(f"   {profile:<15} {bar} {count}")
-        
-        # Estatísticas por perfil
-        print(f"\n📊 MÉTRICAS POR PERFIL:")
-        
-        by_profile = defaultdict(list)
-        for p in self.all_profiles:
-            by_profile[p['profile']].append(p)
-        
-        for profile_name in ['conservador', 'caotico', 'cobertura', 'balanceado']:
-            if profile_name not in by_profile:
-                continue
-            
-            pools = by_profile[profile_name]
-            n = len(pools)
-            
-            avg = {}
-            for key in pools[0]['signals']:
-                avg[key] = np.mean([p['signals'][key] for p in pools])
-            
-            print(f"\n   {profile_name.upper()} ({n} pools):")
-            print(f"      Cobertura: {avg['pair_coverage']:.3f}")
-            print(f"      Dist mín:  {avg['johnson_min']:.3f}")
-            print(f"      Cov radius:{avg['covering_radius']:.3f}")
-            print(f"      Entropia:  {avg['pos_entropy']:.3f}")
-            print(f"      MI:        {avg['mutual_info']:.4f}")
-    
-    def display_top_pools(self, profile_name='balanceado', top_n=3):
-        """Exibe top pools para perfil"""
-        results = self.get_pools_by_profile(profile_name, top_n)
-        
-        if not results:
-            print(f"   ⚠️  Nenhum pool com perfil '{profile_name}'")
-            return
-        
-        print(f"\n{'='*70}")
-        print(f"🏆 TOP {top_n} - {profile_name.upper()}")
-        print(f"{'='*70}")
-        
-        for i, (pool, signals, score) in enumerate(results, 1):
-            print(f"\n📋 #{i} (Score: {score:.3f})")
-            print(f"   Cob: {signals['pair_coverage']:.3f} | "
-                  f"Dist: {signals['johnson_min']:.3f} | "
-                  f"Ent: {signals['pos_entropy']:.3f} | "
-                  f"MI: {signals['mutual_info']:.4f}")
-            
-            for j, game in enumerate(pool[:5]):
-                print(f"      {j+1}. {sorted(game)}")
-            if len(pool) > 5:
-                print(f"      ... +{len(pool)-5}")
+def convert_for_json(obj):
+    """Converte tipos numpy para JSON"""
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, list):
+        return [convert_for_json(x) for x in obj]
+    return obj
 
 
-def demo():
-    """Demonstração completa"""
-    print("="*70)
-    print("🧭 NAVEGADOR NO ESPAÇO COMBINATÓRIO")
-    print("="*70)
+def export_pareto_frontier(pareto_pools, pareto_obj, signals_list, filename='pareto_frontier.json'):
+    """Exporta fronteira de Pareto completa"""
+    print(f"\n💾 Exportando fronteira para {filename}...")
     
-    # Gerar pools simulados com diversidade REAL
-    print("\n📊 Gerando soluções diversas...")
+    export_data = {
+        'metadata': {
+            'timestamp': datetime.now().isoformat(),
+            'n_solutions': len(pareto_pools),
+            'n_games_per_pool': len(pareto_pools[0]) if pareto_pools else 0,
+            'objective_names': [
+                'Cobertura Pares',
+                'Dist Johnson Mín',
+                'Covering Radius',
+                'Compressibilidade',
+                'Indep Histórica',
+                'Conectividade Alg'
+            ],
+            'signal_names': list(signals_list[0].keys()) if signals_list else []
+        },
+        'pareto_pools': [[sorted(g) for g in pool] for pool in pareto_pools],
+        'pareto_objectives': [obj.tolist() for obj in pareto_obj],
+        'signals': signals_list
+    }
     
-    js = JohnsonSpace()
-    pareto_pools = []
+    with open(filename, 'w', encoding='utf-8') as f:
+        json.dump(export_data, f, indent=2, ensure_ascii=False, default=convert_for_json)
     
-    # Estratégias DIFERENTES
-    strategies = [
-        ('spread', 50),      # Máxima diversidade
-        ('spread', 50),
-        ('clustered', 50),   # Baixa diversidade
-        ('clustered', 50),
-        ('balanced', 50),    # Balanceado
-        ('balanced', 50),
-        ('random', 50),      # Aleatório
-        ('random', 50),
-    ]
+    file_size = os.path.getsize(filename)
+    print(f"   ✅ Exportado: {file_size:,} bytes")
+    return filename
+
+
+def main():
+    print("="*60)
+    print("🧬 MOTOR DE OTIMIZAÇÃO - SYSTEM_FACIL.PY")
+    print("="*60)
     
-    for strategy, n_games in strategies:
-        pool = []
-        seen = set()
-        
-        if strategy == 'spread':
-            # Maximizar distância
-            base = sorted(np.random.choice(range(1, 26), 15, replace=False))
-            pool.append(base)
-            seen.add(tuple(base))
-            
-            for _ in range(n_games - 1):
-                best = None
-                best_min = 15
-                for _ in range(200):
-                    c = sorted(np.random.choice(range(1, 26), 15, replace=False))
-                    if tuple(c) in seen: continue
-                    m = min(len(set(c) & set(g)) for g in pool)
-                    if m < best_min:
-                        best_min = m
-                        best = c
-                if best:
-                    seen.add(tuple(best))
-                    pool.append(best)
-        
-        elif strategy == 'clustered':
-            # Jogos similares
-            base = sorted(np.random.choice(range(1, 26), 15, replace=False))
-            for _ in range(n_games):
-                game = base.copy()
-                n_swap = np.random.randint(1, 4)
-                for _ in range(n_swap):
-                    pos = np.random.randint(0, 15)
-                    avail = [d for d in range(1, 26) if d not in game]
-                    if avail:
-                        game[pos] = np.random.choice(avail)
-                game = sorted(game)
-                if tuple(game) not in seen:
-                    seen.add(tuple(game))
-                    pool.append(game)
-        
-        elif strategy == 'balanced':
-            # Metade spread, metade clustered
-            half = n_games // 2
-            base = sorted(np.random.choice(range(1, 26), 15, replace=False))
-            pool.append(base)
-            seen.add(tuple(base))
-            
-            for _ in range(half - 1):
-                best = None
-                best_min = 15
-                for _ in range(100):
-                    c = sorted(np.random.choice(range(1, 26), 15, replace=False))
-                    if tuple(c) in seen: continue
-                    m = min(len(set(c) & set(g)) for g in pool)
-                    if m < best_min:
-                        best_min = m
-                        best = c
-                if best:
-                    seen.add(tuple(best))
-                    pool.append(best)
-            
-            cbase = sorted(np.random.choice(range(1, 26), 15, replace=False))
-            for _ in range(n_games - half):
-                game = cbase.copy()
-                pos = np.random.randint(0, 15)
-                avail = [d for d in range(1, 26) if d not in game]
-                if avail:
-                    game[pos] = np.random.choice(avail)
-                game = sorted(game)
-                if tuple(game) not in seen:
-                    seen.add(tuple(game))
-                    pool.append(game)
-        
-        else:  # random
-            for _ in range(n_games):
-                game = sorted(np.random.choice(range(1, 26), 15, replace=False))
-                if tuple(game) not in seen:
-                    seen.add(tuple(game))
-                    pool.append(game)
-        
-        pool = ensure_unique_pool(pool, n_games, js)
-        pareto_pools.append(pool)
+    # Dados históricos simulados
+    historical = [sorted(np.random.choice(range(1, 26), 15, replace=False)) for _ in range(100)]
     
-    # Criar navegador
-    nav = StructuralNavigator(pareto_pools)
+    # Executar NSGA-II
+    nsga2 = FastNSGA2(
+        n_games=30,
+        pop_size=80,
+        n_generations=30,
+        historical_data=historical
+    )
     
-    # Dashboard
-    nav.display_dashboard()
+    pareto_pools, pareto_obj = nsga2.run()
     
-    # Top pools por perfil
-    for profile in ['conservador', 'caotico', 'cobertura', 'balanceado']:
-        nav.display_top_pools(profile, top_n=2)
+    # Calcular sinais
+    signals_list = compute_all_signals(pareto_pools)
     
-    # Embedding
-    print(f"\n📐 CRIANDO EMBEDDING ESTRUTURAL...")
-    try:
-        nav.create_embedding()
-    except Exception as e:
-        print(f"   ⚠️  Embedding falhou: {e}")
-        print(f"   💡 Isso é apenas visualização, não afeta o motor.")
+    # Exportar
+    export_pareto_frontier(pareto_pools, pareto_obj, signals_list)
     
-    print(f"\n{'='*70}")
-    print(f"✅ NAVEGAÇÃO CONCLUÍDA!")
-    print(f"{'='*70}")
+    # Estatísticas
+    obj_array = np.array(pareto_obj)
+    print(f"\n📊 ESTATÍSTICAS DA FRONTEIRA:")
+    print(f"   Soluções: {len(pareto_pools)}")
+    
+    # Correlações
+    print(f"\n📊 CORRELAÇÕES (negativo = CONFLITO):")
+    names = ['Cob Pares', 'Dist Min', 'Cov Radius', 'Compress', 'Indep Hist', 'Conectiv']
+    for i in range(6):
+        for j in range(i+1, 6):
+            corr = np.corrcoef(obj_array[:, i], obj_array[:, j])[0, 1]
+            s = "🔴" if corr < -0.3 else "🟡" if abs(corr) < 0.3 else "🟢"
+            print(f"   {names[i]:<12} vs {names[j]:<12}: r={corr:+.3f} {s}")
+    
+    print(f"\n✅ PRONTO PARA O FRONTEND!")
+    print(f"📁 Arquivo: pareto_frontier.json")
 
 
 if __name__ == "__main__":
-    demo()
+    main()
