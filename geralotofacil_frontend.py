@@ -2,444 +2,662 @@
 # -*- coding: utf-8 -*-
 
 """
-FRONT-END INTERATIVO - LOTOFÁCIL
-=================================
-Versão 1.0 - Interface Estratégica para o Motor de Otimização
+FRONTEND HÍBRIDO - PREFERÊNCIAS HUMANAS + OTIMIZAÇÃO ESTRUTURAL
+================================================================
+Versão 2.0 - Filtros Flexíveis com Scoring Contínuo
 
-Este módulo importa o motor e fornece interface interativa
-para filtragem, ranking e exibição de jogos.
+PRINCÍPIO:
+✅ NÃO gera jogos com regras (destrói otimização)
+✅ FILTRA e RANKEIA jogos já otimizados da fronteira
+✅ Constraints viram SCORES (não eliminações)
+✅ Preserva geometria do espaço combinatório
+✅ Sistema híbrido: estrutural (70%) + humano (30%)
 """
 
-from geralotofacil_core import (
-    LotofacilOptimizerV3,
-    contar_pares,
-    contar_impares,
-    contar_primos,
-    contar_moldura,
-    contar_centro,
-    contar_repetidos,
-    calcular_soma,
-    calcular_amplitude,
-    contar_consecutivos,
-    TOTAL_NUMBERS,
-    NUMBERS_PER_GAME,
-    PRIMES,
-    MOLDURA,
-    CENTRO,
-    QUADRANTES
-)
 import numpy as np
-from datetime import datetime
+import json
 import os
+from collections import Counter, defaultdict
+from datetime import datetime
+from itertools import combinations
+from math import comb
+
+# ============================================================
+# CONJUNTOS MATEMÁTICOS DA LOTOFÁCIL
+# ============================================================
+
+PRIMES = {2, 3, 5, 7, 11, 13, 17, 19, 23}
+
+MOLDURA = {
+    1, 2, 3, 4, 5,      # linha 1 completa
+    6, 10,               # linha 2 bordas
+    11, 15,              # linha 3 bordas
+    16, 20,              # linha 4 bordas
+    21, 22, 23, 24, 25   # linha 5 completa
+}
+
+CENTRO = {7, 8, 9, 12, 13, 14, 17, 18, 19}
+
+QUADRANTES = {
+    'Q1': {1, 2, 3, 4, 5},
+    'Q2': {6, 7, 8, 9, 10},
+    'Q3': {11, 12, 13, 14, 15},
+    'Q4': {16, 17, 18, 19, 20},
+    'Q5': {21, 22, 23, 24, 25}
+}
+
+# Distribuições típicas históricas (referência)
+TYPICAL_RANGES = {
+    'pares': (6, 9),
+    'impares': (6, 9),
+    'primos': (3, 6),
+    'moldura': (7, 10),
+    'centro': (5, 8),
+    'soma': (170, 220),
+    'repetidas': (7, 10),
+    'consecutivos': (3, 7)
+}
 
 
-class LotofacilFrontend:
+# ============================================================
+# CARREGAMENTO DA FRONTEIRA
+# ============================================================
+
+def load_pareto_frontier(filename='pareto_frontier.json'):
+    """Carrega fronteira de Pareto exportada pelo motor"""
+    if not os.path.exists(filename):
+        print(f"❌ Arquivo {filename} não encontrado!")
+        print(f"   Execute primeiro: python system_facil.py")
+        return None
+    
+    print(f"📂 Carregando {filename}...")
+    with open(filename, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    
+    print(f"   ✅ {data['metadata']['n_solutions']} soluções | "
+          f"{data['metadata']['n_games_per_pool']} jogos/pool")
+    
+    return data
+
+
+# ============================================================
+# CLASSIFICAÇÃO DE PERFIS ESTRUTURAIS
+# ============================================================
+
+def classify_profiles(signals_list):
+    """Classifica pools em perfis com normalização populacional"""
+    if not signals_list:
+        return []
+    
+    keys = signals_list[0].keys()
+    ranges = {}
+    for key in keys:
+        values = [s[key] for s in signals_list]
+        ranges[key] = (np.min(values), np.max(values))
+    
+    profiles = []
+    for signals in signals_list:
+        norm = {}
+        for key in keys:
+            vmin, vmax = ranges[key]
+            norm[key] = (signals[key] - vmin) / (vmax - vmin) if vmax > vmin else 0.5
+        
+        scores = {
+            'conservador': (
+                (1 - norm.get('pos_entropy', 0.5)) * 1.5 +
+                norm.get('compressibility', 0.5) * 1.5 +
+                (1 - norm.get('johnson_avg', 0.5)) * 1.0
+            ),
+            'caotico': (
+                norm.get('johnson_min', 0.5) * 1.5 +
+                norm.get('johnson_avg', 0.5) * 1.5 +
+                norm.get('pos_entropy', 0.5) * 1.0
+            ),
+            'cobertura': (
+                norm.get('pair_coverage', 0.5) * 1.5 +
+                (1 - norm.get('covering_radius', 0.5)) * 1.5 +
+                norm.get('sphere_packing', 0.5) * 1.0
+            ),
+            'balanceado': (
+                norm.get('pair_coverage', 0.5) * 1.0 +
+                norm.get('johnson_min', 0.5) * 1.0 +
+                (1 - norm.get('covering_radius', 0.5)) * 1.0 +
+                norm.get('pos_entropy', 0.5) * 1.0
+            )
+        }
+        
+        profiles.append({
+            'profile': max(scores, key=scores.get),
+            'scores': scores,
+            'signals': signals
+        })
+    
+    return profiles
+
+
+# ============================================================
+# SCORING DE JOGOS (ESTRUTURAL)
+# ============================================================
+
+def structural_game_score(game, pool, signals):
     """
-    Front-end interativo para o motor de otimização
+    Score estrutural de um jogo dentro do pool
     
-    Funcionalidades:
-    - Coleta de preferências do usuário
-    - Filtragem de candidatos
-    - Ranking por fitness
-    - Exibição formatada
-    - Exportação de resultados
+    Considera:
+    - Diversidade (distância para outros jogos)
+    - Balanceamento par/ímpar
+    - Distribuição alto/baixo
+    - Representatividade do perfil
     """
+    score = 0.0
     
-    def __init__(self):
-        """Inicializa o front-end com o motor de otimização"""
-        print("\n" + "="*70)
-        print("🎯 GERADOR ESTRATÉGICO - LOTOFÁCIL")
-        print("   Front-end Interativo v1.0")
-        print("="*70)
-        
-        # Inicializar motor
-        print("\n📂 Inicializando motor de otimização...")
-        self.optimizer = LotofacilOptimizerV3()
-        
-        # Dados do último concurso
-        self.ultimo_concurso = self.optimizer.get_last_draw()
-        self.ultimos_concursos = self.optimizer.get_last_draws(5)
-        
-        if self.ultimo_concurso:
-            print(f"📅 Último concurso carregado: {sorted(self.ultimo_concurso)}")
-        
-        # Preferências do usuário
-        self.preferences = {}
-        
-        # Resultados
-        self.candidates = []
-        self.filtered = []
-        self.ranked = []
+    # 1. Distância média para outros jogos (DIVERSIDADE)
+    distances = []
+    for other in pool:
+        if game != other:
+            common = len(set(game) & set(other))
+            distances.append(15 - common)
     
-    def show_historical_info(self):
-        """Mostra informações históricas relevantes"""
-        print("\n" + "-"*50)
-        print("📊 INFORMAÇÕES HISTÓRICAS")
-        print("-"*50)
-        
-        # Frequência
-        freq = self.optimizer.get_historical_frequency()
-        if freq:
-            top5 = sorted(freq.items(), key=lambda x: x[1], reverse=True)[:5]
-            bottom5 = sorted(freq.items(), key=lambda x: x[1])[:5]
-            
-            print(f"\n🔥 Mais frequentes: {[x[0] for x in top5]}")
-            print(f"❄️  Menos frequentes: {[x[0] for x in bottom5]}")
-        
-        # Últimos concursos
-        if self.ultimos_concursos:
-            print(f"\n📅 Últimos 5 concursos:")
-            for i, draw in enumerate(self.ultimos_concursos, 1):
-                print(f"   {i}. {sorted(draw)}")
+    if distances:
+        avg_dist = np.mean(distances)
+        score += (avg_dist / 10) * 0.35  # Normalizado
     
-    def collect_preferences(self):
-        """
-        Coleta preferências do usuário de forma interativa
+    # 2. Balanceamento par/ímpar (7-8 é ideal)
+    pares = sum(1 for d in game if d % 2 == 0)
+    balance = 1.0 - abs(pares - 7.5) / 7.5
+    score += balance * 0.25
+    
+    # 3. Distribuição alto/baixo
+    baixas = sum(1 for d in game if d <= 12)
+    spread = 1.0 - abs(baixas - 7.5) / 7.5
+    score += spread * 0.20
+    
+    # 4. Entropia local (variedade de dezenas)
+    unique_quadrants = len(set((d-1)//5 for d in game))
+    score += (unique_quadrants / 5) * 0.20
+    
+    return score
+
+
+# ============================================================
+# SCORING DE PREFERÊNCIAS HUMANAS (FLEXÍVEL)
+# ============================================================
+
+def human_constraint_score(game, preferences, ultimo_concurso=None):
+    """
+    Score contínuo baseado em preferências humanas
+    
+    NÃO elimina jogos - apenas ajusta o score
+    Quanto mais próximo das preferências, maior o score
+    
+    Args:
+        game: Lista de 15 dezenas
+        preferences: Dict com preferências do usuário
+        ultimo_concurso: Lista do último concurso (para repetidas)
+    
+    Returns:
+        float: Score 0-1 (1 = perfeito match)
+    """
+    scores = []
+    weights = []
+    
+    # 1. Pares (com tolerância)
+    if 'pares' in preferences:
+        target = preferences['pares']
+        tolerance = preferences.get('pares_tolerance', 1)
+        actual = sum(1 for d in game if d % 2 == 0)
+        dist = abs(actual - target)
         
-        Opções:
-        - Faixas de pares/ímpares
-        - Faixas de primos
-        - Moldura/centro
-        - Repetidos do último concurso
-        - Dezenas fixas
-        - Dezenas excluídas
-        - Número de jogos a gerar
-        """
-        print("\n" + "="*50)
-        print("🎯 CONFIGURAÇÃO DE PREFERÊNCIAS")
-        print("="*50)
-        print("\n💡 Dica: Pressione ENTER para usar valores padrão (sem restrição)")
-        
-        # 1. Pares
-        print("\n📊 PARES/ÍMPARES")
-        print("   (Distribuição típica: 6-9 pares)")
-        pares_min = self._input_int("   Pares mínimos [6]: ", 0, 15, 6)
-        pares_max = self._input_int("   Pares máximos [9]: ", pares_min, 15, 9)
-        self.preferences['pares_range'] = (pares_min, pares_max)
-        
-        # 2. Primos
-        print("\n🔢 PRIMOS")
-        print(f"   (Primos disponíveis: {sorted(PRIMES)})")
-        print("   (Distribuição típica: 3-6 primos)")
-        primos_min = self._input_int("   Primos mínimos [3]: ", 0, 15, 3)
-        primos_max = self._input_int("   Primos máximos [6]: ", primos_min, 15, 6)
-        self.preferences['primos_range'] = (primos_min, primos_max)
-        
-        # 3. Moldura/Centro
-        print("\n🖼️  MOLDURA/CENTRO")
-        print(f"   Moldura: {sorted(MOLDURA)}")
-        print(f"   Centro: {sorted(CENTRO)}")
-        print("   (Distribuição típica: 7-10 moldura)")
-        moldura_min = self._input_int("   Moldura mínima [7]: ", 0, 15, 7)
-        moldura_max = self._input_int("   Moldura máxima [10]: ", moldura_min, 15, 10)
-        self.preferences['moldura_range'] = (moldura_min, moldura_max)
-        
-        # 4. Repetidos
-        if self.ultimo_concurso:
-            print(f"\n🔄 REPETIDOS DO ÚLTIMO CONCURSO")
-            print(f"   Último: {sorted(self.ultimo_concurso)}")
-            print("   (Distribuição típica: 8-10 repetidos)")
-            rep_min = self._input_int("   Repetidos mínimos [8]: ", 0, 15, 8)
-            rep_max = self._input_int("   Repetidos máximos [10]: ", rep_min, 15, 10)
-            self.preferences['repetidos_range'] = (rep_min, rep_max)
-        
-        # 5. Dezenas fixas
-        print("\n📌 DEZENAS FIXAS")
-        print("   Digite as dezenas separadas por espaço (ou ENTER para nenhuma)")
-        fixas_input = input("   Dezenas fixas: ").strip()
-        
-        if fixas_input:
-            try:
-                fixas = sorted(set(int(x) for x in fixas_input.split() if 1 <= int(x) <= 25))
-                self.preferences['fixas'] = fixas[:15]  # Máximo 15
-                print(f"   ✅ Fixas: {fixas}")
-            except ValueError:
-                print("   ⚠️  Entrada inválida. Nenhuma dezena fixa.")
-                self.preferences['fixas'] = []
+        if dist <= tolerance:
+            scores.append(1.0)
         else:
-            self.preferences['fixas'] = []
+            scores.append(max(0, 1.0 - (dist - tolerance) / 7))
+        weights.append(1.5)
+    
+    # 2. Primos (com tolerância)
+    if 'primos' in preferences:
+        target = preferences['primos']
+        tolerance = preferences.get('primos_tolerance', 1)
+        actual = sum(1 for d in game if d in PRIMES)
+        dist = abs(actual - target)
         
-        # 6. Dezenas excluídas
-        print("\n🚫 DEZENAS EXCLUÍDAS")
-        print("   Digite as dezenas a EXCLUIR (ou ENTER para nenhuma)")
-        excluir_input = input("   Dezenas excluídas: ").strip()
+        if dist <= tolerance:
+            scores.append(1.0)
+        else:
+            scores.append(max(0, 1.0 - (dist - tolerance) / 5))
+        weights.append(1.2)
+    
+    # 3. Moldura (com tolerância)
+    if 'moldura' in preferences:
+        target = preferences['moldura']
+        tolerance = preferences.get('moldura_tolerance', 1)
+        actual = sum(1 for d in game if d in MOLDURA)
+        dist = abs(actual - target)
         
-        if excluir_input:
+        if dist <= tolerance:
+            scores.append(1.0)
+        else:
+            scores.append(max(0, 1.0 - (dist - tolerance) / 7))
+        weights.append(1.0)
+    
+    # 4. Centro (com tolerância)
+    if 'centro' in preferences:
+        target = preferences['centro']
+        tolerance = preferences.get('centro_tolerance', 1)
+        actual = sum(1 for d in game if d in CENTRO)
+        dist = abs(actual - target)
+        
+        if dist <= tolerance:
+            scores.append(1.0)
+        else:
+            scores.append(max(0, 1.0 - (dist - tolerance) / 5))
+        weights.append(0.8)
+    
+    # 5. Repetidas do último concurso
+    if 'repetidas' in preferences and ultimo_concurso:
+        target = preferences['repetidas']
+        tolerance = preferences.get('repetidas_tolerance', 1)
+        actual = len(set(game) & set(ultimo_concurso))
+        dist = abs(actual - target)
+        
+        if dist <= tolerance:
+            scores.append(1.0)
+        else:
+            scores.append(max(0, 1.0 - (dist - tolerance) / 7))
+        weights.append(1.3)
+    
+    # 6. Soma (com faixa)
+    if 'soma_min' in preferences or 'soma_max' in preferences:
+        soma = sum(game)
+        soma_min = preferences.get('soma_min', 170)
+        soma_max = preferences.get('soma_max', 220)
+        
+        if soma_min <= soma <= soma_max:
+            scores.append(1.0)
+        else:
+            dist = min(abs(soma - soma_min), abs(soma - soma_max))
+            scores.append(max(0, 1.0 - dist / 50))
+        weights.append(0.7)
+    
+    # 7. Consecutivos (com máximo)
+    if 'max_consecutivos' in preferences:
+        max_cons = preferences['max_consecutivos']
+        d = sorted(game)
+        cons = sum(1 for i in range(len(d)-1) if d[i+1]-d[i] == 1)
+        
+        if cons <= max_cons:
+            scores.append(1.0)
+        else:
+            scores.append(max(0, 1.0 - (cons - max_cons) / 5))
+        weights.append(0.9)
+    
+    # 8. Dezenas fixas (obrigatório - score 0 se não tiver)
+    if 'fixas' in preferences and preferences['fixas']:
+        fixas = set(preferences['fixas'])
+        if not fixas.issubset(set(game)):
+            return 0.0  # Jogo não atende requisito obrigatório
+        # Bônus por ter as fixas
+        scores.append(1.0)
+        weights.append(2.0)
+    
+    # 9. Dezenas excluídas (obrigatório - score 0 se tiver)
+    if 'excluidas' in preferences and preferences['excluidas']:
+        excluidas = set(preferences['excluidas'])
+        if excluidas & set(game):
+            return 0.0  # Jogo contém dezena proibida
+    
+    # Média ponderada
+    if not scores:
+        return 1.0  # Sem preferências = score máximo
+    
+    total_weight = sum(weights)
+    weighted_score = sum(s * w for s, w in zip(scores, weights)) / total_weight
+    
+    return weighted_score
+
+
+# ============================================================
+# RANKEAMENTO HÍBRIDO
+# ============================================================
+
+def hybrid_ranking(pool, signals, preferences, ultimo_concurso=None, 
+                   structural_weight=0.7, human_weight=0.3):
+    """
+    Ranking HÍBRIDO: estrutural + preferências humanas
+    
+    Args:
+        pool: Lista de jogos
+        signals: Sinais estruturais do pool
+        preferences: Preferências do usuário
+        ultimo_concurso: Último concurso (para repetidas)
+        structural_weight: Peso do score estrutural
+        human_weight: Peso das preferências humanas
+    
+    Returns:
+        list: (score_final, game, structural_score, human_score)
+    """
+    ranked = []
+    
+    for game in pool:
+        # Score estrutural
+        struct_score = structural_game_score(game, pool, signals)
+        
+        # Score humano
+        human_score = human_constraint_score(game, preferences, ultimo_concurso)
+        
+        # Score final híbrido
+        final_score = struct_score * structural_weight + human_score * human_weight
+        
+        ranked.append((final_score, sorted(game), struct_score, human_score))
+    
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    return ranked
+
+
+# ============================================================
+# COLETA DE PREFERÊNCIAS
+# ============================================================
+
+def collect_user_preferences(ultimo_concurso=None):
+    """
+    Interface interativa para coletar preferências
+    
+    Todas as preferências são OPCIONAIS (ENTER = sem restrição)
+    """
+    print(f"\n{'='*60}")
+    print(f"🎯 CONFIGURAÇÃO DE PREFERÊNCIAS")
+    print(f"{'='*60}")
+    print(f"\n💡 Pressione ENTER para ignorar qualquer preferência")
+    print(f"   (O sistema usará apenas otimização estrutural)")
+    
+    prefs = {}
+    
+    # 1. Pares
+    print(f"\n📊 PARES (típico: 6-9)")
+    print(f"   Quantos números PARES você prefere?")
+    pares_input = input(f"   Pares [ENTER=pular]: ").strip()
+    if pares_input:
+        try:
+            prefs['pares'] = int(pares_input)
+            tol = input(f"   Tolerância (±) [1]: ").strip()
+            prefs['pares_tolerance'] = int(tol) if tol else 1
+        except ValueError:
+            print(f"   ⚠️  Valor inválido, ignorando")
+    
+    # 2. Primos
+    print(f"\n🔢 PRIMOS (típico: 3-6)")
+    print(f"   Primos na Lotofácil: {sorted(PRIMES)}")
+    primos_input = input(f"   Quantos PRIMOS? [ENTER=pular]: ").strip()
+    if primos_input:
+        try:
+            prefs['primos'] = int(primos_input)
+            tol = input(f"   Tolerância (±) [1]: ").strip()
+            prefs['primos_tolerance'] = int(tol) if tol else 1
+        except ValueError:
+            print(f"   ⚠️  Valor inválido, ignorando")
+    
+    # 3. Moldura
+    print(f"\n🖼️  MOLDURA (típico: 7-10)")
+    print(f"   Moldura: {sorted(MOLDURA)}")
+    moldura_input = input(f"   Quantos na MOLDURA? [ENTER=pular]: ").strip()
+    if moldura_input:
+        try:
+            prefs['moldura'] = int(moldura_input)
+            tol = input(f"   Tolerância (±) [1]: ").strip()
+            prefs['moldura_tolerance'] = int(tol) if tol else 1
+        except ValueError:
+            print(f"   ⚠️  Valor inválido, ignorando")
+    
+    # 4. Centro
+    print(f"\n🎯 CENTRO (típico: 5-8)")
+    print(f"   Centro: {sorted(CENTRO)}")
+    centro_input = input(f"   Quantos no CENTRO? [ENTER=pular]: ").strip()
+    if centro_input:
+        try:
+            prefs['centro'] = int(centro_input)
+            tol = input(f"   Tolerância (±) [1]: ").strip()
+            prefs['centro_tolerance'] = int(tol) if tol else 1
+        except ValueError:
+            print(f"   ⚠️  Valor inválido, ignorando")
+    
+    # 5. Repetidas
+    if ultimo_concurso:
+        print(f"\n🔄 REPETIDAS DO ÚLTIMO CONCURSO")
+        print(f"   Último concurso: {sorted(ultimo_concurso)}")
+        print(f"   (típico: 7-10 repetidas)")
+        rep_input = input(f"   Quantas REPETIDAS? [ENTER=pular]: ").strip()
+        if rep_input:
             try:
-                excluidas = set(int(x) for x in excluir_input.split() if 1 <= int(x) <= 25)
+                prefs['repetidas'] = int(rep_input)
+                tol = input(f"   Tolerância (±) [1]: ").strip()
+                prefs['repetidas_tolerance'] = int(tol) if tol else 1
+            except ValueError:
+                print(f"   ⚠️  Valor inválido, ignorando")
+    
+    # 6. Soma
+    print(f"\n📐 SOMA DAS DEZENAS (típico: 170-220)")
+    soma_min = input(f"   Soma MÍNIMA [ENTER=pular]: ").strip()
+    if soma_min:
+        try:
+            prefs['soma_min'] = int(soma_min)
+        except ValueError:
+            pass
+    soma_max = input(f"   Soma MÁXIMA [ENTER=pular]: ").strip()
+    if soma_max:
+        try:
+            prefs['soma_max'] = int(soma_max)
+        except ValueError:
+            pass
+    
+    # 7. Consecutivos
+    print(f"\n📏 CONSECUTIVOS (típico: 3-7)")
+    cons_input = input(f"   Máximo de consecutivos [ENTER=pular]: ").strip()
+    if cons_input:
+        try:
+            prefs['max_consecutivos'] = int(cons_input)
+        except ValueError:
+            pass
+    
+    # 8. Dezenas fixas
+    print(f"\n📌 DEZENAS FIXAS (OBRIGATÓRIAS)")
+    print(f"   Digite as dezenas separadas por espaço")
+    fixas_input = input(f"   Fixas [ENTER=pular]: ").strip()
+    if fixas_input:
+        try:
+            fixas = [int(x) for x in fixas_input.split() if 1 <= int(x) <= 25]
+            if fixas:
+                prefs['fixas'] = sorted(set(fixas))[:15]
+                print(f"   ✅ Fixas: {prefs['fixas']}")
+        except ValueError:
+            print(f"   ⚠️  Valor inválido, ignorando")
+    
+    # 9. Dezenas excluídas
+    print(f"\n🚫 DEZENAS EXCLUÍDAS (PROIBIDAS)")
+    excl_input = input(f"   Excluídas [ENTER=pular]: ").strip()
+    if excl_input:
+        try:
+            excl = [int(x) for x in excl_input.split() if 1 <= int(x) <= 25]
+            if excl:
                 # Não pode excluir as fixas
-                excluidas -= set(self.preferences.get('fixas', []))
-                self.preferences['excluidas'] = excluidas
-                print(f"   ✅ Excluídas: {sorted(excluidas)}")
-            except ValueError:
-                print("   ⚠️  Entrada inválida. Nenhuma dezena excluída.")
-                self.preferences['excluidas'] = set()
-        else:
-            self.preferences['excluidas'] = set()
-        
-        # 7. Número de jogos
-        print("\n🎯 GERAÇÃO")
-        n_jogos = self._input_int("   Número de jogos a gerar [10]: ", 1, 100, 10)
-        self.preferences['n_jogos'] = n_jogos
-        
-        print("\n✅ Preferências configuradas!")
+                if 'fixas' in prefs:
+                    excl = [x for x in excl if x not in prefs['fixas']]
+                prefs['excluidas'] = sorted(set(excl))
+                print(f"   ✅ Excluídas: {prefs['excluidas']}")
+        except ValueError:
+            print(f"   ⚠️  Valor inválido, ignorando")
     
-    def _input_int(self, prompt, min_val, max_val, default):
-        """
-        Input seguro de inteiro
-        
-        Args:
-            prompt: Mensagem
-            min_val: Valor mínimo
-            max_val: Valor máximo
-            default: Valor padrão
-            
-        Returns:
-            int: Valor inserido
-        """
-        while True:
-            user_input = input(prompt).strip()
-            
-            if not user_input:
-                return default
-            
-            try:
-                value = int(user_input)
-                if min_val <= value <= max_val:
-                    return value
-                else:
-                    print(f"   ⚠️  Valor deve estar entre {min_val} e {max_val}")
-            except ValueError:
-                print("   ⚠️  Digite um número inteiro válido")
+    # Mostrar resumo
+    if prefs:
+        print(f"\n📋 PREFERÊNCIAS CONFIGURADAS:")
+        for key, value in prefs.items():
+            if not key.endswith('_tolerance'):
+                print(f"   {key}: {value}")
+    else:
+        print(f"\n📋 NENHUMA preferência → otimização puramente estrutural")
     
-    def generate_and_filter(self):
-        """
-        Gera candidatos e aplica filtros
-        
-        Pipeline:
-        1. Gera milhares de candidatos
-        2. Filtra por preferências
-        3. Armazena filtrados
-        """
-        print("\n" + "="*50)
-        print("🔍 GERANDO E FILTRANDO CANDIDATOS...")
-        print("="*50)
-        
-        # Gerar candidatos
-        n_generate = 500000
-        print(f"\n🎲 Gerando {n_generate} candidatos...")
-        self.candidates = self.optimizer.generate_candidates(n_generate)
-        print(f"   ✅ {len(self.candidates)} candidatos gerados")
-        
-        # Aplicar filtros
-        print("\n🔍 Aplicando filtros...")
-        self.filtered = []
-        
-        pref = self.preferences
-        
-        for game in self.candidates:
-            # Verificar dezenas fixas
-            if pref.get('fixas'):
-                if not all(d in game for d in pref['fixas']):
-                    continue
-            
-            # Verificar dezenas excluídas
-            if pref.get('excluidas'):
-                if any(d in game for d in pref['excluidas']):
-                    continue
-            
-            # Verificar pares
-            if 'pares_range' in pref:
-                pares = contar_pares(game)
-                if not (pref['pares_range'][0] <= pares <= pref['pares_range'][1]):
-                    continue
-            
-            # Verificar primos
-            if 'primos_range' in pref:
-                primos = contar_primos(game)
-                if not (pref['primos_range'][0] <= primos <= pref['primos_range'][1]):
-                    continue
-            
-            # Verificar moldura
-            if 'moldura_range' in pref:
-                moldura = contar_moldura(game)
-                if not (pref['moldura_range'][0] <= moldura <= pref['moldura_range'][1]):
-                    continue
-            
-            # Verificar repetidos
-            if 'repetidos_range' in pref and self.ultimo_concurso:
-                rep = contar_repetidos(game, self.ultimo_concurso)
-                if not (pref['repetidos_range'][0] <= rep <= pref['repetidos_range'][1]):
-                    continue
-            
-            # Passou por todos os filtros
-            self.filtered.append(game)
-        
-        print(f"   ✅ {len(self.filtered)} jogos após filtros")
-        
-        if len(self.filtered) == 0:
-            print("\n⚠️  NENHUM jogo passou nos filtros!")
-            print("   Tente relaxar as restrições.")
-            return False
-        
-        return True
+    return prefs
+
+
+# ============================================================
+# INTERFACE PRINCIPAL
+# ============================================================
+
+def display_dashboard(data, profiles):
+    """Exibe dashboard de navegação"""
+    print(f"\n{'='*60}")
+    print(f"🎯 DASHBOARD DE NAVEGAÇÃO ESTRUTURAL")
+    print(f"{'='*60}")
     
-    def rank_and_display(self):
-        """
-        Rankeia jogos filtrados e exibe os melhores
-        """
-        if not self.filtered:
-            print("\n⚠️  Nenhum jogo para rankear.")
-            return
+    profile_counts = Counter(p['profile'] for p in profiles)
+    print(f"\n📊 DISTRIBUIÇÃO DE PERFIS:")
+    for profile, count in profile_counts.most_common():
+        bar = '█' * (count * 40 // len(profiles))
+        print(f"   {profile:<15} {bar} {count}")
+    
+    print(f"\n💡 PERFIS DISPONÍVEIS:")
+    print(f"   conservador - Estrutura organizada, baixa variância")
+    print(f"   caotico     - Máxima diversidade, alta independência")
+    print(f"   cobertura   - Máxima cobertura de pares/trincas")
+    print(f"   balanceado  - Equilíbrio entre todos os fatores")
+
+
+def get_top_games_hybrid(data, profiles, profile_name='balanceado', 
+                         preferences=None, ultimo_concurso=None,
+                         top_pools=3, top_games=5):
+    """
+    Obtém os melhores jogos combinando:
+    - Perfil estrutural (fronteira de Pareto)
+    - Preferências humanas (score flexível)
+    """
+    # Filtrar pools pelo perfil
+    matching = [(i, p) for i, p in enumerate(profiles) if p['profile'] == profile_name]
+    
+    if not matching:
+        print(f"   ⚠️  Nenhum pool com perfil '{profile_name}'")
+        return []
+    
+    matching.sort(key=lambda x: x[1]['scores'][profile_name], reverse=True)
+    
+    all_ranked = []
+    
+    for pool_idx, (i, p) in enumerate(matching[:top_pools]):
+        pool = data['pareto_pools'][i]
+        signals = p['signals']
         
-        print("\n" + "="*50)
-        print("🏆 RANKEANDO JOGOS...")
-        print("="*50)
-        
-        # Rankear
-        self.ranked = self.optimizer.rank_games(
-            self.filtered, 
-            top_n=self.preferences.get('n_jogos', 10)
+        # Ranking híbrido
+        ranked = hybrid_ranking(
+            pool, signals, preferences or {}, ultimo_concurso,
+            structural_weight=0.7, human_weight=0.3
         )
         
-        # Exibir
-        self._display_ranked()
+        # Adicionar identificação do pool
+        for score, game, struct_s, human_s in ranked:
+            all_ranked.append((score, game, struct_s, human_s, pool_idx, signals))
     
-    def _display_ranked(self):
-        """Exibe os jogos rankeados formatados"""
-        if not self.ranked:
-            return
-        
-        n = len(self.ranked)
-        
-        print(f"\n{'='*70}")
-        print(f"🎯 TOP {n} JOGOS RECOMENDADOS")
-        print(f"{'='*70}")
-        
-        for i, (fitness, game, metrics) in enumerate(self.ranked, 1):
-            sorted_game = sorted(game)
-            
-            pares = contar_pares(game)
-            impares = contar_impares(game)
-            primos = contar_primos(game)
-            moldura = contar_moldura(game)
-            centro = contar_centro(game)
-            soma = calcular_soma(game)
-            amplitude = calcular_amplitude(game)
-            consecutivos = contar_consecutivos(game)
-            
-            if self.ultimo_concurso:
-                repetidos = contar_repetidos(game, self.ultimo_concurso)
-            else:
-                repetidos = 0
-            
-            print(f"\n{'─'*50}")
-            print(f"JOGO {i:02d} | Fitness: {fitness:.2f}")
-            print(f"{'─'*50}")
-            print(f"  Dezenas: {sorted_game}")
-            print(f"  ─────────────────────────────────")
-            print(f"  Pares: {pares} | Ímpares: {impares} | Primos: {primos}")
-            print(f"  Moldura: {moldura} | Centro: {centro}")
-            print(f"  Soma: {soma} | Amplitude: {amplitude}")
-            print(f"  Consecutivos: {consecutivos} | Repetidos: {repetidos}")
-            print(f"  Penalidade estrutural: {metrics['penalty']:.1f}")
-        
-        # Resumo estatístico
-        print(f"\n{'='*70}")
-        print(f"📊 RESUMO ESTATÍSTICO DOS {n} JOGOS")
-        print(f"{'='*70}")
-        
-        all_pares = [contar_pares(g) for _, g, _ in self.ranked]
-        all_primos = [contar_primos(g) for _, g, _ in self.ranked]
-        all_moldura = [contar_moldura(g) for _, g, _ in self.ranked]
-        all_somas = [calcular_soma(g) for _, g, _ in self.ranked]
-        
-        print(f"  Pares: {min(all_pares)}-{max(all_pares)} (média: {np.mean(all_pares):.1f})")
-        print(f"  Primos: {min(all_primos)}-{max(all_primos)} (média: {np.mean(all_primos):.1f})")
-        print(f"  Moldura: {min(all_moldura)}-{max(all_moldura)} (média: {np.mean(all_moldura):.1f})")
-        print(f"  Soma: {min(all_somas)}-{max(all_somas)} (média: {np.mean(all_somas):.1f})")
+    # Reordenar globalmente
+    all_ranked.sort(key=lambda x: x[0], reverse=True)
     
-    def export_results(self):
-        """Exporta resultados para arquivo"""
-        if not self.ranked:
-            print("\n⚠️  Nenhum resultado para exportar.")
-            return
-        
-        print("\n💾 Exportando resultados...")
-        
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = f'jogos_recomendados_{timestamp}.txt'
-        
-        with open(filename, 'w', encoding='utf-8') as f:
-            f.write("JOGOS RECOMENDADOS - LOTOFÁCIL\n")
-            f.write(f"Gerado em: {datetime.now().strftime('%d/%m/%Y %H:%M')}\n")
-            f.write("="*50 + "\n\n")
-            
-            if self.ultimo_concurso:
-                f.write(f"Último concurso: {sorted(self.ultimo_concurso)}\n\n")
-            
-            f.write("PREFERÊNCIAS:\n")
-            for key, value in self.preferences.items():
-                f.write(f"  {key}: {value}\n")
-            f.write("\n")
-            
-            for i, (fitness, game, metrics) in enumerate(self.ranked, 1):
-                sorted_game = sorted(game)
-                f.write(f"Jogo {i:02d}: {sorted_game}\n")
-                f.write(f"  Fitness: {fitness:.2f}\n")
-                f.write(f"  Pares: {contar_pares(game)}\n")
-                f.write(f"  Primos: {contar_primos(game)}\n")
-                f.write(f"  Soma: {calcular_soma(game)}\n")
-                f.write("\n")
-        
-        print(f"✅ Resultados exportados para: {filename}")
+    return all_ranked[:top_games]
+
+
+def display_top_games_hybrid(ranked_games, profile_name, preferences):
+    """Exibe os melhores jogos com detalhes"""
+    if not ranked_games:
+        return
     
-    def run(self):
-        """
-        Executa o fluxo completo do front-end
+    print(f"\n{'='*60}")
+    print(f"🏆 MELHORES JOGOS - PERFIL: {profile_name.upper()}")
+    print(f"{'='*60}")
+    
+    if preferences:
+        print(f"📋 Preferências ativas:")
+        for key, value in preferences.items():
+            if not key.endswith('_tolerance'):
+                print(f"   {key}: {value}")
+    
+    for i, (final_score, game, struct_s, human_s, pool_idx, signals) in enumerate(ranked_games, 1):
+        pares = sum(1 for d in game if d % 2 == 0)
+        primos = sum(1 for d in game if d in PRIMES)
+        moldura = sum(1 for d in game if d in MOLDURA)
+        soma = sum(game)
+        cons = sum(1 for i in range(len(game)-1) if game[i+1]-game[i] == 1)
         
-        Pipeline:
-        1. Mostrar informações históricas
-        2. Coletar preferências
-        3. Gerar e filtrar candidatos
-        4. Rankear e exibir
-        5. Exportar resultados
-        """
-        # 1. Informações históricas
-        self.show_historical_info()
-        
-        # 2. Coletar preferências
-        self.collect_preferences()
-        
-        # 3. Gerar e filtrar
-        success = self.generate_and_filter()
-        
-        if not success:
-            print("\n❌ Processo interrompido. Ajuste os filtros e tente novamente.")
-            return
-        
-        # 4. Rankear e exibir
-        self.rank_and_display()
-        
-        # 5. Exportar
-        export = input("\n💾 Deseja exportar os resultados? (S/n): ").strip().lower()
-        if export != 'n':
-            self.export_results()
-        
-        print("\n" + "="*70)
-        print("✅ PROCESSO CONCLUÍDO!")
-        print("="*70)
-        print("\n💡 LEMBRE-SE:")
-        print("   • Este sistema NÃO prevê resultados futuros")
-        print("   • Otimiza cobertura e diversidade estrutural")
-        print("   • Jogue com responsabilidade!")
-        print("="*70)
+        print(f"\n{'─'*50}")
+        print(f"JOGO {i:02d} | Score: {final_score:.3f}")
+        print(f"{'─'*50}")
+        print(f"  Dezenas: {game}")
+        print(f"  Estrutural: {struct_s:.3f} | Humano: {human_s:.3f}")
+        print(f"  Pares: {pares} | Primos: {primos} | Moldura: {moldura}")
+        print(f"  Soma: {soma} | Consecutivos: {cons}")
+        print(f"  Pool: {pool_idx+1} | Perfil: {profile_name}")
 
 
 def main():
-    """Função principal"""
-    frontend = LotofacilFrontend()
-    frontend.run()
+    print("="*60)
+    print("🧭 SISTEMA HÍBRIDO - ESTRUTURAL + PREFERÊNCIAS")
+    print("="*60)
+    
+    # Carregar fronteira
+    data = load_pareto_frontier()
+    if data is None:
+        return
+    
+    # Classificar perfis
+    profiles = classify_profiles(data['signals'])
+    
+    # Extrair último concurso (simulado se não disponível)
+    ultimo_concurso = data['pareto_pools'][0][0] if data['pareto_pools'] else None
+    
+    # Dashboard
+    display_dashboard(data, profiles)
+    
+    # Loop interativo
+    while True:
+        print(f"\n{'='*60}")
+        print(f"▶️  OPÇÕES:")
+        print(f"   1. Escolher perfil estrutural")
+        print(f"   2. Configurar preferências humanas")
+        print(f"   3. Gerar jogos (combinando perfil + preferências)")
+        print(f"   4. Sair")
+        
+        choice = input(f"\n   Opção: ").strip()
+        
+        if choice == '4':
+            break
+        
+        elif choice == '1':
+            print(f"\n   Perfis: conservador | caotico | cobertura | balanceado")
+            profile = input(f"   Escolha: ").strip().lower()
+            
+            if profile in ['conservador', 'caotico', 'cobertura', 'balanceado']:
+                current_profile = profile
+                print(f"   ✅ Perfil: {profile}")
+            else:
+                print(f"   ⚠️  Perfil inválido")
+        
+        elif choice == '2':
+            preferences = collect_user_preferences(ultimo_concurso)
+            print(f"   ✅ {len(preferences)} preferências configuradas")
+        
+        elif choice == '3':
+            if 'current_profile' not in dir():
+                current_profile = 'balanceado'
+                print(f"   ℹ️  Usando perfil padrão: balanceado")
+            
+            if 'preferences' not in dir():
+                preferences = {}
+            
+            ranked = get_top_games_hybrid(
+                data, profiles, current_profile,
+                preferences, ultimo_concurso,
+                top_pools=3, top_games=10
+            )
+            
+            display_top_games_hybrid(ranked, current_profile, preferences)
+    
+    print(f"\n✅ ATÉ LOGO!")
+    print(f"💡 Lembre-se: otimização estrutural + preferências humanas")
+    print(f"   NÃO é previsão. É navegação inteligente no espaço combinatório.")
 
 
 if __name__ == "__main__":
