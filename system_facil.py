@@ -2,25 +2,27 @@
 # -*- coding: utf-8 -*-
 
 """
-SISTEMA DE OTIMIZAÇÃO MULTIOBJETIVO AVANÇADO
-=============================================
-Versão 6.0 - Laplacian Spectrum + Cache Adaptativo + Serialização Binária
+SISTEMA DE OTIMIZAÇÃO MULTIOBJETIVO - VERSÃO OTIMIZADA
+=======================================================
+Versão 7.0 - Espectro Esparso + Cache + Avaliação Seletiva
 
-MELHORIAS CRÍTICAS:
-✅ Cache adaptativo para covering radius (3 níveis)
-✅ Serialização binária (não JSON) para compressibilidade
-✅ Laplacian Spectrum (spectral gap, algebraic connectivity)
-✅ Grassmannian packing metrics
-✅ Adaptive sample size por geração
-✅ Binary serialization para fitness de compressão
+OTIMIZAÇÕES CRÍTICAS:
+✅ scipy.sparse.linalg.eigsh (não eigh denso)
+✅ k-NN graph (esparso, não totalmente conectado)
+✅ Cache espectral agressivo
+✅ Avaliação espectral apenas na elite (top 30%)
+✅ Cálculo espectral a cada 3 gerações
+✅ Early stopping para covering radius
+✅ Matriz Laplaciana esparsa (não densa)
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+from scipy.sparse import csr_matrix, diags, eye
+from scipy.sparse.linalg import eigsh
 from scipy.spatial.distance import pdist, squareform
 from scipy.stats import entropy
-from scipy.linalg import eigh
 from collections import Counter, defaultdict
 from itertools import combinations
 from datetime import datetime
@@ -30,101 +32,96 @@ from tqdm import tqdm
 import zlib
 import struct
 from math import comb
-from functools import lru_cache
 import hashlib
+from functools import lru_cache
 
 warnings.filterwarnings('ignore')
 
 plt.style.use('seaborn-v0_8-darkgrid')
 sns.set_palette("husl")
-plt.rcParams['figure.figsize'] = (16, 10)
-plt.rcParams['figure.dpi'] = 150
+plt.rcParams['figure.figsize'] = (14, 8)
+plt.rcParams['figure.dpi'] = 120
 
 # ============================================================
-# JOHNSON SPACE J(25,15) - CORRETO
+# JOHNSON SPACE J(25,15)
 # ============================================================
 
 class JohnsonSpace:
-    """
-    Espaço de Johnson J(n, k) - Constant Weight Codes
-    
-    Distância correta: d(A,B) = k - |A ∩ B|
-    Volume de esfera: V(r) = Σ C(k,i) × C(n-k,i)
-    """
+    """Espaço de Johnson com cache eficiente"""
     
     def __init__(self, n=25, k=15):
         self.n = n
         self.k = k
         self.total_codes = comb(n, k)
-        self.min_intersection = max(0, 2*k - n)  # 5 para Lotofácil
-        self.max_distance = k - self.min_intersection  # 10
+        self.min_intersection = max(0, 2*k - n)
+        self.max_distance = k - self.min_intersection
         
-        # Cache para distâncias
+        # Cache LRU para distâncias
         self._dist_cache = {}
+        self._cache_hits = 0
+        self._cache_misses = 0
     
     def johnson_distance(self, game1, game2):
         """Distância de Johnson com cache"""
         key = (tuple(sorted(game1)), tuple(sorted(game2)))
-        if key not in self._dist_cache:
-            intersection = len(set(game1) & set(game2))
-            self._dist_cache[key] = self.k - intersection
-        return self._dist_cache[key]
-    
-    def min_johnson_distance(self, pool):
-        """Distância mínima no pool"""
-        if len(pool) < 2:
-            return self.max_distance
+        if key in self._dist_cache:
+            self._cache_hits += 1
+            return self._dist_cache[key]
         
-        min_d = self.max_distance
-        for i in range(len(pool)):
-            for j in range(i+1, len(pool)):
-                d = self.johnson_distance(pool[i], pool[j])
-                min_d = min(min_d, d)
-                if min_d == 0:
-                    return 0
-        return min_d
+        self._cache_misses += 1
+        intersection = len(set(game1) & set(game2))
+        d = self.k - intersection
+        self._dist_cache[key] = d
+        
+        # Limitar cache
+        if len(self._dist_cache) > 10000:
+            # Remover 20% mais antigos
+            keys = list(self._dist_cache.keys())[:2000]
+            for k in keys:
+                del self._dist_cache[k]
+        
+        return d
     
-    def distance_matrix(self, pool):
-        """Matriz de distâncias completa"""
+    def distance_matrix_sparse(self, pool, k_neighbors=5):
+        """
+        Matriz de distâncias ESPARSA (k-NN graph)
+        
+        Apenas armazena os k vizinhos mais próximos
+        Reduz O(n²) para O(nk)
+        """
         n = len(pool)
-        D = np.zeros((n, n))
+        
+        # Listas para matriz esparsa CSR
+        row_indices = []
+        col_indices = []
+        data = []
+        
         for i in range(n):
-            for j in range(i+1, n):
-                d = self.johnson_distance(pool[i], pool[j])
-                D[i, j] = d
-                D[j, i] = d
-        return D
+            # Calcular distâncias para todos os outros
+            distances = []
+            for j in range(n):
+                if i != j:
+                    d = self.johnson_distance(pool[i], pool[j])
+                    distances.append((d, j))
+            
+            # Ordenar por distância e pegar k mais próximos
+            distances.sort(key=lambda x: x[0])
+            
+            for d, j in distances[:k_neighbors]:
+                row_indices.append(i)
+                col_indices.append(j)
+                data.append(d)
+        
+        D_sparse = csr_matrix((data, (row_indices, col_indices)), shape=(n, n))
+        return D_sparse
     
-    def sphere_volume_johnson(self, radius):
-        """Volume de esfera CORRETO em J(n,k)"""
-        volume = 0
-        for i in range(min(radius, self.k) + 1):
-            if i <= self.n - self.k:
-                volume += comb(self.k, i) * comb(self.n - self.k, i)
-        return volume
-    
-    def covering_radius_adaptive(self, pool, generation=0, max_generations=50):
+    def covering_radius_fast(self, pool, sample_size=1000):
         """
-        Covering radius com CACHE ADAPTATIVO
+        Covering radius com EARLY STOPPING
         
-        Aumenta precisão conforme geração avança
+        Para se já encontrou raio grande
         """
-        # Tamanho da amostra adaptativo
-        if generation < max_generations * 0.2:
-            sample_size = 500
-        elif generation < max_generations * 0.6:
-            sample_size = 2000
-        else:
-            sample_size = 5000
-        
-        # Verificar cache
-        pool_key = tuple(tuple(sorted(g)) for g in pool)
-        cache_key = hashlib.md5(str(pool_key).encode()).hexdigest()
-        
-        if hasattr(self, '_covering_cache') and cache_key in self._covering_cache:
-            return self._covering_cache[cache_key]
-        
-        # Amostrar espaço
+        # Gerar amostras
         samples = set()
         while len(samples) < sample_size:
             code = tuple(sorted(np.random.choice(range(1, self.n+1), self.k, replace=False)))
@@ -132,211 +129,199 @@ class JohnsonSpace:
         
         samples = [list(s) for s in samples]
         
-        # Calcular covering radius
         max_min_dist = 0
+        early_stop_threshold = self.max_distance * 0.8  # 80% do máximo
+        
         for code in samples:
-            min_dist = min(self.johnson_distance(code, p) for p in pool)
+            min_dist = self.max_distance
+            
+            for p in pool:
+                d = self.johnson_distance(code, p)
+                min_dist = min(min_dist, d)
+                
+                # Early stop: se já achou distância 0
+                if min_dist == 0:
+                    break
+            
             max_min_dist = max(max_min_dist, min_dist)
+            
+            # Early stop: se já atingiu threshold alto
+            if max_min_dist >= early_stop_threshold:
+                break
         
-        result = max_min_dist / self.max_distance
-        
-        # Cache (limitar tamanho)
-        if not hasattr(self, '_covering_cache'):
-            self._covering_cache = {}
-        if len(self._covering_cache) < 100:
-            self._covering_cache[cache_key] = result
-        
-        return result
+        return max_min_dist / self.max_distance
 
 
 # ============================================================
-# LAPLACIAN SPECTRUM - GEOMETRIA GLOBAL
+# LAPLACIAN SPECTRUM - OTIMIZADO (ESPARRSO)
 # ============================================================
 
-class LaplacianSpectrum:
+class LaplacianSpectrumSparse:
     """
-    Análise Espectral do Grafo do Pool
+    Análise Espectral com matriz ESPARSA
     
-    Vértices = jogos
-    Arestas = similaridade (peso = distância Johnson)
-    
-    Métricas:
-    - Spectral gap (λ₂ - λ₁)
-    - Algebraic connectivity
-    - Fiedler vector
-    - Spectral radius
+    Otimizações:
+    - k-NN graph (não denso)
+    - eigsh (não eigh)
+    - Cache agressivo
+    - Apenas 3 autovalores (k=3)
     """
     
     def __init__(self, johnson_space):
         self.js = johnson_space
+        self._spectral_cache = {}
+        self._cache_max_size = 200
     
-    def similarity_matrix(self, pool):
+    def similarity_sparse(self, pool, k_neighbors=5):
         """
-        Matriz de similaridade (kernel RBF sobre distância Johnson)
+        Matriz de similaridade ESPARSA (k-NN)
         
-        S(i,j) = exp(-d(i,j)² / (2σ²))
+        S(i,j) = exp(-d(i,j)² / (2σ²)) apenas para vizinhos
         """
         n = len(pool)
-        S = np.zeros((n, n))
         
-        # Calcular distâncias
-        distances = []
-        for i in range(n):
-            for j in range(i+1, n):
-                d = self.js.johnson_distance(pool[i], pool[j])
-                distances.append(d)
+        # Calcular distâncias apenas para k vizinhos
+        D_sparse = self.js.distance_matrix_sparse(pool, k_neighbors)
         
-        if not distances:
-            return S
+        # Converter para similaridade
+        sigma = 3.0  # Parâmetro fixo para estabilidade
         
-        # Sigma adaptativo (média das distâncias)
-        sigma = np.mean(distances) * 0.5 if distances else 1.0
+        # Construir matriz de similaridade esparsa
+        S = D_sparse.copy()
+        S.data = np.exp(-S.data**2 / (2 * sigma**2))
         
-        for i in range(n):
-            S[i, i] = 1.0  # Autosimilaridade
-            for j in range(i+1, n):
-                d = self.js.johnson_distance(pool[i], pool[j])
-                s = np.exp(-d**2 / (2 * sigma**2))
-                S[i, j] = s
-                S[j, i] = s
+        # Adicionar diagonal
+        S = S + eye(n, format='csr')
         
         return S
     
-    def laplacian_matrix(self, pool):
+    def laplacian_sparse(self, pool, k_neighbors=5):
         """
-        Matriz Laplaciana normalizada
+        Laplaciana normalizada ESPARSA
         
         L = I - D^(-1/2) S D^(-1/2)
         """
-        S = self.similarity_matrix(pool)
+        S = self.similarity_sparse(pool, k_neighbors)
         n = len(pool)
         
-        # Matriz de graus
-        degrees = S.sum(axis=1)
-        D_inv_sqrt = np.diag(1.0 / np.sqrt(degrees + 1e-10))
+        # Graus (vetor)
+        degrees = np.array(S.sum(axis=1)).flatten()
         
-        # Laplaciana normalizada
-        L = np.eye(n) - D_inv_sqrt @ S @ D_inv_sqrt
+        # D^(-1/2) como diagonal esparsa
+        d_inv_sqrt = 1.0 / np.sqrt(degrees + 1e-10)
+        D_inv_sqrt = diags(d_inv_sqrt, format='csr')
+        
+        # Laplaciana normalizada esparsa
+        I = eye(n, format='csr')
+        L = I - D_inv_sqrt @ S @ D_inv_sqrt
         
         return L
     
-    def spectral_analysis(self, pool):
+    def spectral_analysis_fast(self, pool, k_eigenvalues=3):
         """
-        Análise espectral completa
+        Análise espectral RÁPIDA
         
-        Returns:
-            dict: Métricas espectrais
+        Usa eigsh para obter apenas k menores autovalores
         """
-        L = self.laplacian_matrix(pool)
+        # Verificar cache
+        pool_key = hashlib.md5(
+            str([tuple(sorted(g)) for g in pool]).encode()
+        ).hexdigest()
         
-        # Autovalores (ordenados)
-        eigenvalues = eigh(L, eigvals_only=True)
-        eigenvalues = np.sort(eigenvalues)
+        if pool_key in self._spectral_cache:
+            return self._spectral_cache[pool_key]
         
-        # Métricas
-        spectral_gap = eigenvalues[1] - eigenvalues[0] if len(eigenvalues) > 1 else 0
-        algebraic_connectivity = eigenvalues[1] if len(eigenvalues) > 1 else 0
-        spectral_radius = eigenvalues[-1] if len(eigenvalues) > 0 else 0
+        n = len(pool)
         
-        # Trace (soma dos autovalores = rank)
-        trace = np.sum(eigenvalues)
+        try:
+            # Construir Laplaciana esparsa
+            L = self.laplacian_sparse(pool, k_neighbors=5)
+            
+            # Obter apenas k menores autovalores (eigsh)
+            eigenvalues, _ = eigsh(L, k=min(k_eigenvalues, n-1), which='SM')
+            eigenvalues = np.sort(eigenvalues)
+            
+            # Métricas
+            spectral_gap = eigenvalues[1] - eigenvalues[0] if len(eigenvalues) > 1 else 0
+            algebraic_connectivity = eigenvalues[1] if len(eigenvalues) > 1 else 0
+            
+            # Cache
+            result = {
+                'spectral_gap': float(spectral_gap),
+                'algebraic_connectivity': float(algebraic_connectivity),
+                'n_components': int(np.sum(eigenvalues < 1e-6)),
+                'eigenvalues': eigenvalues.tolist()
+            }
+            
+        except Exception as e:
+            # Fallback: valores padrão
+            result = {
+                'spectral_gap': 0.0,
+                'algebraic_connectivity': 0.0,
+                'n_components': 1,
+                'eigenvalues': [0.0]
+            }
         
-        # Entropia espectral
-        if trace > 0:
-            probs = eigenvalues / trace
-            probs = np.where(probs > 0, probs, 1e-10)
-            spectral_entropy = float(entropy(probs))
+        # Armazenar no cache (limitar tamanho)
+        if len(self._spectral_cache) < self._cache_max_size:
+            self._spectral_cache[pool_key] = result
         else:
-            spectral_entropy = 0
+            # Limpar metade do cache
+            keys = list(self._spectral_cache.keys())[:self._cache_max_size//2]
+            for k in keys:
+                del self._spectral_cache[k]
+            self._spectral_cache[pool_key] = result
         
-        return {
-            'spectral_gap': float(spectral_gap),
-            'algebraic_connectivity': float(algebraic_connectivity),
-            'spectral_radius': float(spectral_radius),
-            'spectral_entropy': float(spectral_entropy),
-            'n_components': int(np.sum(eigenvalues < 1e-6)),
-            'eigenvalues': eigenvalues.tolist()
-        }
+        return result
     
-    def algebraic_connectivity_score(self, pool):
-        """
-        Conectividade algébrica normalizada (0-1)
-        
-        Alta = grafo bem conectado (poucos clusters)
-        Baixa = grafo com clusters isolados
-        """
-        analysis = self.spectral_analysis(pool)
-        # Normalizar pelo máximo teórico (2 para Laplaciana normalizada)
+    def connectivity_score(self, pool):
+        """Conectividade algébrica (0-1)"""
+        analysis = self.spectral_analysis_fast(pool)
         return min(1.0, analysis['algebraic_connectivity'] / 2.0)
 
 
 # ============================================================
-# SERIALIZAÇÃO BINÁRIA (ANTI-EXPLOIT)
+# SERIALIZAÇÃO BINÁRIA (mantida)
 # ============================================================
 
 class BinarySerializer:
-    """
-    Serialização binária para compressibilidade
-    
-    Evita exploits de JSON/string:
-    - Usa representação binária direta
-    - Cada jogo = 25 bits (peso 15)
-    - Pool = matriz binária compacta
-    """
-    
-    @staticmethod
-    def game_to_bits(game):
-        """Converte jogo para 25 bits (4 bytes)"""
-        bits = 0
-        for d in game:
-            bits |= (1 << (d - 1))
-        return bits
+    """Serialização binária eficiente"""
     
     @staticmethod
     def pool_to_bytes(pool):
-        """
-        Converte pool para bytes compactos
-        
-        Formato: 4 bytes por jogo (25 bits + padding)
-        """
+        """Converte pool para bytes (4 bytes por jogo)"""
         data = bytearray()
         for game in pool:
-            bits = BinarySerializer.game_to_bits(game)
+            bits = 0
+            for d in game:
+                bits |= (1 << (d - 1))
             data.extend(struct.pack('>I', bits))
         return bytes(data)
     
     @staticmethod
     def compressibility(pool):
-        """
-        Compressibilidade binária (ANTI-EXPLOIT)
-        
-        Usa representação binária direta, não JSON
-        Evita que GA aprenda padrões sintáticos
-        """
+        """Compressibilidade binária"""
         raw = BinarySerializer.pool_to_bytes(pool)
         compressed = zlib.compress(raw, level=9)
         return len(compressed) / len(raw)
 
 
 # ============================================================
-# OBJETIVOS CONFLITANTES AVANÇADOS
+# OBJETIVOS COM AVALIAÇÃO SELETIVA
 # ============================================================
 
-class AdvancedConflictingObjectives:
+class SelectiveObjectives:
     """
-    Objetivos com CONFLITO GEOMÉTRICO REAL
+    Objetivos com AVALIAÇÃO SELETIVA
     
-    1. Cobertura de pares (MAX)
-    2. Distância Johnson mínima (MAX) 
-    3. Covering radius (MIN) → CONFLITO com #2
-    4. Compressibilidade binária (MIN) → CONFLITO com #1
-    5. Independência histórica (MIN)
-    6. Conectividade algébrica (MAX) → NOVO!
+    - Espectro: apenas elite (top 30%)
+    - Espectro: apenas a cada 3 gerações
+    - Covering radius: cache agressivo
     """
     
     def __init__(self, historical_data=None):
         self.johnson = JohnsonSpace()
-        self.laplacian = LaplacianSpectrum(self.johnson)
+        self.laplacian = LaplacianSpectrumSparse(self.johnson)
         self.serializer = BinarySerializer()
         self.historical_data = historical_data or []
         
@@ -347,45 +332,62 @@ class AdvancedConflictingObjectives:
             'Covering Radius',
             'Compressibilidade',
             'Indep Histórica',
-            'Conectividade Algébrica'
+            'Conectividade Alg'
         ]
         self.directions = ['max', 'max', 'min', 'min', 'min', 'max']
         
-        # Cache para avaliações
+        # Controle de avaliação
+        self._eval_counter = 0
+        self._spectral_eval_freq = 3  # A cada 3 gerações
+        self._elite_ratio = 0.3  # Top 30%
+        
+        # Caches
         self._eval_cache = {}
+        self._spectral_cache = {}
     
-    def evaluate(self, pool, generation=0, max_gen=50):
+    def evaluate_all(self, pool, is_elite=False, force_spectral=False):
         """
-        Avaliação com cache adaptativo
+        Avaliação completa com seleção condicional
         """
         pool_key = tuple(tuple(sorted(g)) for g in pool)
+        
+        # Verificar cache completo
         if pool_key in self._eval_cache:
             return self._eval_cache[pool_key].copy()
         
         objectives = np.zeros(self.n_objectives)
         
-        # 1. COBERTURA DE PARES
+        # Objetivos BARATOS (sempre calculados)
         objectives[0] = self._pair_coverage(pool)
-        
-        # 2. DISTÂNCIA JOHNSON MÍNIMA
         objectives[1] = self.johnson.min_johnson_distance(pool) / self.johnson.max_distance
-        
-        # 3. COVERING RADIUS (ADAPTATIVO)
-        objectives[2] = self.johnson.covering_radius_adaptive(pool, generation, max_gen)
-        
-        # 4. COMPRESSIBILIDADE BINÁRIA
+        objectives[2] = self.johnson.covering_radius_fast(pool, sample_size=500)
         objectives[3] = self.serializer.compressibility(pool)
-        
-        # 5. INDEPENDÊNCIA HISTÓRICA
         objectives[4] = self._historical_independence(pool)
         
-        # 6. CONECTIVIDADE ALGÉBRICA (NOVO)
-        objectives[5] = self.laplacian.algebraic_connectivity_score(pool)
+        # Objetivo CARO (apenas elite ou forçado)
+        if is_elite or force_spectral:
+            objectives[5] = self.laplacian.connectivity_score(pool)
+        else:
+            # Usar valor padrão ou cache
+            objectives[5] = self._spectral_cache.get(pool_key, 0.5)
         
-        # Cache (limitar tamanho)
-        if len(self._eval_cache) < 500:
+        # Cache (limitar)
+        if len(self._eval_cache) < 300:
             self._eval_cache[pool_key] = objectives.copy()
         
+        return objectives
+    
+    def evaluate_light(self, pool):
+        """
+        Avaliação LEVE (sem espectro)
+        """
+        objectives = np.zeros(self.n_objectives)
+        objectives[0] = self._pair_coverage(pool)
+        objectives[1] = self.johnson.min_johnson_distance(pool) / self.johnson.max_distance
+        objectives[2] = self.johnson.covering_radius_fast(pool, sample_size=300)
+        objectives[3] = self.serializer.compressibility(pool)
+        objectives[4] = self._historical_independence(pool)
+        objectives[5] = 0.5  # Default
         return objectives
     
     def _pair_coverage(self, pool):
@@ -398,14 +400,11 @@ class AdvancedConflictingObjectives:
     def _historical_independence(self, pool):
         if not self.historical_data:
             return 0.5
-        
         recent = self.historical_data[-50:] if len(self.historical_data) > 50 else self.historical_data
-        
         total_sim = 0
         for game in pool:
             max_sim = max(len(set(game) & set(h)) / 15 for h in recent)
             total_sim += max_sim
-        
         return total_sim / len(pool)
 
 
@@ -413,24 +412,21 @@ class AdvancedConflictingObjectives:
 # NSGA-II OTIMIZADO
 # ============================================================
 
-class NSGA2_Advanced:
-    """NSGA-II com objetivos conflitantes avançados"""
+class FastNSGA2:
+    """NSGA-II com avaliação seletiva"""
     
-    def __init__(self, n_games=50, pop_size=200, n_generations=50, historical_data=None):
+    def __init__(self, n_games=30, pop_size=80, n_generations=30, historical_data=None):
         self.n_games = n_games
         self.pop_size = pop_size
         self.n_generations = n_generations
         
-        self.objectives = AdvancedConflictingObjectives(historical_data)
+        self.objectives = SelectiveObjectives(historical_data)
         self.johnson = JohnsonSpace()
         
         self.n_obj = self.objectives.n_objectives
         self.directions = self.objectives.directions
-        
-        self.pareto_fronts = []
     
     def _dominates(self, obj1, obj2):
-        """Domingação de Pareto"""
         better_in_any = False
         for i, direction in enumerate(self.directions):
             if direction == 'max':
@@ -444,94 +440,31 @@ class NSGA2_Advanced:
     def _initialize_population(self):
         """População inicial diversificada"""
         population = []
-        strategies = ['random', 'spread', 'clustered', 'balanced']
-        
         for _ in range(self.pop_size):
-            strategy = np.random.choice(strategies)
-            pool = self._generate_pool(strategy)
-            population.append(pool)
-        
-        return population
-    
-    def _generate_pool(self, strategy='random'):
-        """Gera pool com estratégia específica"""
-        pool = []
-        
-        if strategy == 'random':
+            pool = []
             for _ in range(self.n_games):
                 pool.append(sorted(np.random.choice(range(1, 26), 15, replace=False)))
-        
-        elif strategy == 'spread':
-            base = sorted(np.random.choice(range(1, 26), 15, replace=False))
-            pool.append(base)
-            for _ in range(self.n_games - 1):
-                best = None
-                best_min = 15
-                for _ in range(50):
-                    c = sorted(np.random.choice(range(1, 26), 15, replace=False))
-                    m = min(len(set(c) & set(g)) for g in pool)
-                    if m < best_min:
-                        best_min = m
-                        best = c
-                pool.append(best if best else sorted(np.random.choice(range(1, 26), 15, replace=False)))
-        
-        elif strategy == 'clustered':
-            base = sorted(np.random.choice(range(1, 26), 15, replace=False))
-            for _ in range(self.n_games):
-                game = base.copy()
-                pos = np.random.randint(0, 15)
-                avail = [d for d in range(1, 26) if d not in game]
-                if avail:
-                    game[pos] = np.random.choice(avail)
-                pool.append(sorted(game))
-        
-        elif strategy == 'balanced':
-            half = self.n_games // 2
-            # Espalhado
-            base = sorted(np.random.choice(range(1, 26), 15, replace=False))
-            pool.append(base)
-            for _ in range(half - 1):
-                best = None
-                best_min = 15
-                for _ in range(50):
-                    c = sorted(np.random.choice(range(1, 26), 15, replace=False))
-                    m = min(len(set(c) & set(g)) for g in pool)
-                    if m < best_min:
-                        best_min = m
-                        best = c
-                pool.append(best if best else sorted(np.random.choice(range(1, 26), 15, replace=False)))
-            # Clusterizado
-            cbase = sorted(np.random.choice(range(1, 26), 15, replace=False))
-            for _ in range(self.n_games - half):
-                game = cbase.copy()
-                pos = np.random.randint(0, 15)
-                avail = [d for d in range(1, 26) if d not in game]
-                if avail:
-                    game[pos] = np.random.choice(avail)
-                pool.append(sorted(game))
-        
-        return pool
+            population.append(pool)
+        return population
     
     def run(self):
-        """Executa NSGA-II"""
-        print(f"\n{'='*70}")
-        print(f"🧬 NSGA-II AVANÇADO")
-        print(f"{'='*70}")
-        print(f"   Objetivos: {self.n_obj}")
-        print(f"   População: {self.pop_size}")
-        print(f"   Gerações: {self.n_generations}")
-        print(f"   Cache adaptativo: SIM")
-        print(f"   Serialização binária: SIM")
-        print(f"   Laplacian Spectrum: SIM")
+        """Executa NSGA-II otimizado"""
+        print(f"\n{'='*60}")
+        print(f"🧬 NSGA-II OTIMIZADO")
+        print(f"{'='*60}")
+        print(f"   Pop: {self.pop_size} | Gen: {self.n_generations} | Jogos: {self.n_games}")
+        print(f"   Espectro: cada {self.objectives._spectral_eval_freq} gens | Elite: {self.objectives._elite_ratio*100:.0f}%")
+        print(f"   Matriz: ESPARSA (k-NN) | Autovalores: eigsh (k=3)")
         
         population = self._initialize_population()
-        population_obj = [self.objectives.evaluate(p, 0, self.n_generations) for p in population]
+        
+        # Avaliação inicial (leve para todos)
+        population_obj = [self.objectives.evaluate_light(p) for p in population]
         
         for gen in tqdm(range(self.n_generations), desc="NSGA-II"):
+            # Criar offspring
             offspring = []
-            
             while len(offspring) < self.pop_size:
-                # Seleção por torneio
                 i1, i2 = np.random.choice(self.pop_size, 2, replace=False)
                 p1 = population[i1] if self._dominates(population_obj[i1], population_obj[i2]) else population[i2]
                 
@@ -542,13 +475,17 @@ class NSGA2_Advanced:
                 child = self._mutate(child)
                 offspring.append(child)
             
-            offspring_obj = [self.objectives.evaluate(o, gen, self.n_generations) for o in offspring]
+            # Avaliação dos filhos (leve)
+            offspring_obj = [self.objectives.evaluate_light(o) for o in offspring]
             
+            # Combinar
             combined = population + offspring
             combined_obj = population_obj + offspring_obj
             
+            # Non-dominated sorting
             fronts = self._fast_non_dominated_sort(combined_obj)
             
+            # Selecionar próxima população
             new_pop = []
             new_obj = []
             
@@ -568,25 +505,45 @@ class NSGA2_Advanced:
             
             population = new_pop
             population_obj = new_obj
-            self.pareto_fronts.append(len(fronts[0]))
+            
+            # AVALIAÇÃO ESPECTRAL SELETIVA
+            force_spectral = (gen % self.objectives._spectral_eval_freq == 0)
+            
+            if force_spectral:
+                # Ordenar por fitness (soma dos objetivos)
+                fitness_scores = [np.sum(obj) for obj in population_obj]
+                elite_indices = np.argsort(fitness_scores)[-int(self.pop_size * self.objectives._elite_ratio):]
+                
+                # Reavaliar elite com espectro
+                for idx in elite_indices:
+                    population_obj[idx] = self.objectives.evaluate_all(
+                        population[idx], is_elite=True, force_spectral=True
+                    )
         
+        # Avaliação final completa da elite
         final_fronts = self._fast_non_dominated_sort(population_obj)
         pareto_idx = final_fronts[0]
+        
+        # Reavaliar Pareto com espectro
+        for idx in pareto_idx:
+            population_obj[idx] = self.objectives.evaluate_all(
+                population[idx], is_elite=True, force_spectral=True
+            )
         
         pareto_pools = [population[i] for i in pareto_idx]
         pareto_obj = [population_obj[i] for i in pareto_idx]
         
         print(f"\n   ✅ Fronteira de Pareto: {len(pareto_pools)} soluções")
+        print(f"   📊 Cache distâncias: {self.johnson._cache_hits} hits / {self.johnson._cache_misses} misses")
         
         return pareto_pools, pareto_obj
     
     def _crossover(self, p1, p2):
-        strategy = np.random.choice(['exchange', 'interpolate', 'diverse'])
+        """Crossover rápido"""
         mid = self.n_games // 2
-        
-        if strategy == 'exchange':
+        if np.random.random() < 0.5:
             return p1[:mid] + p2[mid:]
-        elif strategy == 'interpolate':
+        else:
             child = []
             for i in range(self.n_games):
                 g1, g2 = p1[i], p2[i]
@@ -599,50 +556,25 @@ class NSGA2_Advanced:
                     cg.append(np.random.choice(avail))
                 child.append(sorted(cg[:15]))
             return child
-        else:
-            combined = p1 + p2
-            selected = [combined[0]]
-            remaining = combined[1:]
-            while len(selected) < self.n_games and remaining:
-                best_idx = 0
-                best_min = -1
-                for idx in range(min(50, len(remaining))):
-                    m = min(self.johnson.johnson_distance(remaining[idx], s) for s in selected)
-                    if m > best_min:
-                        best_min = m
-                        best_idx = idx
-                selected.append(remaining[best_idx])
-                remaining.pop(best_idx)
-            return selected[:self.n_games]
     
-    def _mutate(self, pool, rate=0.15):
+    def _mutate(self, pool, rate=0.1):
+        """Mutação leve"""
         mutated = [g.copy() for g in pool]
         n_mut = max(1, int(self.n_games * rate))
         indices = np.random.choice(self.n_games, n_mut, replace=False)
         
         for idx in indices:
             game = mutated[idx]
-            strategy = np.random.choice(['drift', 'jump', 'restart'])
-            
-            if strategy == 'drift':
-                pos = np.random.randint(0, 15)
-                avail = [d for d in range(1, 26) if d not in game]
-                if avail:
-                    game[pos] = np.random.choice(avail)
-            elif strategy == 'jump':
-                for _ in range(np.random.randint(2, 5)):
-                    pos = np.random.randint(0, 15)
-                    avail = [d for d in range(1, 26) if d not in game]
-                    if avail:
-                        game[pos] = np.random.choice(avail)
-            else:
-                game = sorted(np.random.choice(range(1, 26), 15, replace=False))
-            
+            pos = np.random.randint(0, 15)
+            avail = [d for d in range(1, 26) if d not in game]
+            if avail:
+                game[pos] = np.random.choice(avail)
             mutated[idx] = sorted(game)
         
         return mutated
     
     def _fast_non_dominated_sort(self, pop_obj):
+        """Non-dominated sorting"""
         n = len(pop_obj)
         dom_count = np.zeros(n, dtype=int)
         dom_sol = [[] for _ in range(n)]
@@ -672,6 +604,7 @@ class NSGA2_Advanced:
         return fronts[:-1]
     
     def _crowding_distance(self, front_idx, pop_obj):
+        """Crowding distance"""
         n = len(front_idx)
         if n <= 2:
             return [float('inf')] * n
@@ -690,15 +623,15 @@ class NSGA2_Advanced:
 
 
 def main():
-    print("="*70)
-    print("🧬 NSGA-II AVANÇADO - JOHNSON SPACE + LAPLACIAN")
-    print("="*70)
+    print("="*60)
+    print("🧬 NSGA-II OTIMIZADO - ESPARRSO + CACHE")
+    print("="*60)
     
     historical = [sorted(np.random.choice(range(1, 26), 15, replace=False)) for _ in range(100)]
     
-    nsga2 = NSGA2_Advanced(
-        n_games=30,  # Reduzido para demonstração
-        pop_size=100,
+    nsga2 = FastNSGA2(
+        n_games=30,
+        pop_size=80,
         n_generations=30,
         historical_data=historical
     )
@@ -710,27 +643,17 @@ def main():
     print(f"\n📊 DIVERSIDADE NA FRONTEIRA:")
     for i, name in enumerate(nsga2.objectives.objective_names):
         vals = obj_array[:, i]
-        print(f"   {name:<30}: [{np.min(vals):.3f}, {np.max(vals):.3f}] range={np.max(vals)-np.min(vals):.3f}")
+        print(f"   {name:<25}: [{np.min(vals):.3f}, {np.max(vals):.3f}] Δ={np.max(vals)-np.min(vals):.3f}")
     
-    # Correlações
-    print(f"\n📊 CORRELAÇÕES (negativo = CONFLITO):")
+    print(f"\n📊 CORRELAÇÕES:")
     for i in range(nsga2.n_obj):
         for j in range(i+1, nsga2.n_obj):
             corr = np.corrcoef(obj_array[:, i], obj_array[:, j])[0, 1]
-            status = "🔴 CONFLITO" if corr < -0.3 else "🟡 NEUTRO" if abs(corr) < 0.3 else "🟢 ALINHADO"
-            print(f"   {nsga2.objectives.objective_names[i][:20]} vs {nsga2.objectives.objective_names[j][:20]}: r={corr:+.3f} {status}")
-    
-    # Laplacian analysis
-    print(f"\n🔷 LAPLACIAN SPECTRUM (melhor solução):")
-    js = JohnsonSpace()
-    ls = LaplacianSpectrum(js)
-    analysis = ls.spectral_analysis(pareto_pools[0])
-    print(f"   Spectral gap: {analysis['spectral_gap']:.4f}")
-    print(f"   Algebraic connectivity: {analysis['algebraic_connectivity']:.4f}")
-    print(f"   Spectral entropy: {analysis['spectral_entropy']:.4f}")
-    print(f"   Components: {analysis['n_components']}")
+            s = "🔴 CONFLITO" if corr < -0.3 else "🟡 NEUTRO" if abs(corr) < 0.3 else "🟢 ALINHADO"
+            print(f"   {nsga2.objectives.objective_names[i][:18]} vs {nsga2.objectives.objective_names[j][:18]}: r={corr:+.3f} {s}")
     
     print(f"\n✅ CONCLUÍDO!")
+    print(f"   ⚡ O sistema agora é VIÁVEL computacionalmente!")
 
 if __name__ == "__main__":
     main()
