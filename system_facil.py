@@ -2,18 +2,16 @@
 # -*- coding: utf-8 -*-
 
 """
-SISTEMA DE OTIMIZAÇÃO MULTIOBJETIVO - VERSÃO OTIMIZADA
+SISTEMA DE OTIMIZAÇÃO MULTIOBJETIVO - VERSÃO CORRIGIDA
 =======================================================
-Versão 7.0 - Espectro Esparso + Cache + Avaliação Seletiva
+Versão 7.1 - Bitwise Distance + Pareto Elite + Cache Binário
 
-OTIMIZAÇÕES CRÍTICAS:
-✅ scipy.sparse.linalg.eigsh (não eigh denso)
-✅ k-NN graph (esparso, não totalmente conectado)
-✅ Cache espectral agressivo
-✅ Avaliação espectral apenas na elite (top 30%)
-✅ Cálculo espectral a cada 3 gerações
-✅ Early stopping para covering radius
-✅ Matriz Laplaciana esparsa (não densa)
+CORREÇÕES:
+✅ min_johnson_distance() RESTAURADO
+✅ Distâncias BITWISE (não sets Python)
+✅ Elite por dominância Pareto (não soma)
+✅ Cache com hash binário (MD5 de bytes)
+✅ Pool key otimizado (BinarySerializer)
 """
 
 import numpy as np
@@ -21,7 +19,6 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.sparse import csr_matrix, diags, eye
 from scipy.sparse.linalg import eigsh
-from scipy.spatial.distance import pdist, squareform
 from scipy.stats import entropy
 from collections import Counter, defaultdict
 from itertools import combinations
@@ -33,7 +30,6 @@ import zlib
 import struct
 from math import comb
 import hashlib
-from functools import lru_cache
 
 warnings.filterwarnings('ignore')
 
@@ -43,11 +39,16 @@ plt.rcParams['figure.figsize'] = (14, 8)
 plt.rcParams['figure.dpi'] = 120
 
 # ============================================================
-# JOHNSON SPACE J(25,15)
+# JOHNSON SPACE J(25,15) - BITWISE OTIMIZADO
 # ============================================================
 
 class JohnsonSpace:
-    """Espaço de Johnson com cache eficiente"""
+    """
+    Espaço de Johnson com operações BITWISE
+    
+    Cada jogo = inteiro 32-bit (25 bits usados)
+    Distância = k - popcount(bits1 & bits2)
+    """
     
     def __init__(self, n=25, k=15):
         self.n = n
@@ -56,55 +57,121 @@ class JohnsonSpace:
         self.min_intersection = max(0, 2*k - n)
         self.max_distance = k - self.min_intersection
         
-        # Cache LRU para distâncias
+        # Cache com hash binário
         self._dist_cache = {}
         self._cache_hits = 0
         self._cache_misses = 0
+        self._max_cache = 15000
+    
+    def game_to_bits(self, game):
+        """Converte jogo para inteiro 32-bit (RÁPIDO)"""
+        bits = 0
+        for d in game:
+            bits |= (1 << (d - 1))
+        return bits
+    
+    def bits_to_game(self, bits):
+        """Converte bits para jogo"""
+        game = []
+        for i in range(self.n):
+            if bits & (1 << i):
+                game.append(i + 1)
+        return sorted(game)
     
     def johnson_distance(self, game1, game2):
-        """Distância de Johnson com cache"""
-        key = (tuple(sorted(game1)), tuple(sorted(game2)))
-        if key in self._dist_cache:
+        """
+        Distância de Johnson BITWISE
+        
+        d = k - popcount(bits1 & bits2)
+        """
+        # Converter para bits (cache interno)
+        if isinstance(game1, list):
+            bits1 = self.game_to_bits(game1)
+        else:
+            bits1 = game1
+        
+        if isinstance(game2, list):
+            bits2 = self.game_to_bits(game2)
+        else:
+            bits2 = game2
+        
+        # Cache key (usar bits como chave)
+        cache_key = (bits1, bits2) if bits1 < bits2 else (bits2, bits1)
+        
+        if cache_key in self._dist_cache:
             self._cache_hits += 1
-            return self._dist_cache[key]
+            return self._dist_cache[cache_key]
         
         self._cache_misses += 1
-        intersection = len(set(game1) & set(game2))
-        d = self.k - intersection
-        self._dist_cache[key] = d
         
-        # Limitar cache
-        if len(self._dist_cache) > 10000:
-            # Remover 20% mais antigos
-            keys = list(self._dist_cache.keys())[:2000]
-            for k in keys:
-                del self._dist_cache[k]
+        # Operação BITWISE (muito mais rápida que sets)
+        intersection = (bits1 & bits2).bit_count()
+        d = self.k - intersection
+        
+        # Cache com limite
+        if len(self._dist_cache) < self._max_cache:
+            self._dist_cache[cache_key] = d
         
         return d
     
+    def min_johnson_distance(self, pool):
+        """
+        Distância mínima de Johnson no pool (RESTAURADO)
+        """
+        if len(pool) < 2:
+            return self.max_distance
+        
+        # Converter todos para bits uma vez
+        bits_list = [self.game_to_bits(g) for g in pool]
+        
+        min_d = self.max_distance
+        
+        for i in range(len(bits_list)):
+            for j in range(i + 1, len(bits_list)):
+                d = self.johnson_distance(bits_list[i], bits_list[j])
+                
+                if d < min_d:
+                    min_d = d
+                
+                # Early stop
+                if min_d == 0:
+                    return 0
+        
+        return min_d
+    
+    def avg_johnson_distance(self, pool):
+        """Distância média de Johnson"""
+        if len(pool) < 2:
+            return 0
+        
+        bits_list = [self.game_to_bits(g) for g in pool]
+        distances = []
+        
+        for i in range(len(bits_list)):
+            for j in range(i + 1, len(bits_list)):
+                distances.append(self.johnson_distance(bits_list[i], bits_list[j]))
+        
+        return np.mean(distances)
+    
     def distance_matrix_sparse(self, pool, k_neighbors=5):
         """
-        Matriz de distâncias ESPARSA (k-NN graph)
-        
-        Apenas armazena os k vizinhos mais próximos
-        Reduz O(n²) para O(nk)
+        Matriz de distâncias ESPARSA (k-NN)
+        Usa bits para velocidade
         """
         n = len(pool)
+        bits_list = [self.game_to_bits(g) for g in pool]
         
-        # Listas para matriz esparsa CSR
         row_indices = []
         col_indices = []
         data = []
         
         for i in range(n):
-            # Calcular distâncias para todos os outros
             distances = []
             for j in range(n):
                 if i != j:
-                    d = self.johnson_distance(pool[i], pool[j])
+                    d = self.johnson_distance(bits_list[i], bits_list[j])
                     distances.append((d, j))
             
-            # Ordenar por distância e pegar k mais próximos
             distances.sort(key=lambda x: x[0])
             
             for d, j in distances[:k_neighbors]:
@@ -112,40 +179,35 @@ class JohnsonSpace:
                 col_indices.append(j)
                 data.append(d)
         
-        D_sparse = csr_matrix((data, (row_indices, col_indices)), shape=(n, n))
-        return D_sparse
+        return csr_matrix((data, (row_indices, col_indices)), shape=(n, n))
     
-    def covering_radius_fast(self, pool, sample_size=1000):
-        """
-        Covering radius com EARLY STOPPING
+    def covering_radius_fast(self, pool, sample_size=500):
+        """Covering radius com early stopping"""
+        bits_list = [self.game_to_bits(g) for g in pool]
         
-        Para se já encontrou raio grande
-        """
-        # Gerar amostras
+        # Gerar amostras como bits
         samples = set()
         while len(samples) < sample_size:
-            code = tuple(sorted(np.random.choice(range(1, self.n+1), self.k, replace=False)))
-            samples.add(code)
+            game = sorted(np.random.choice(range(1, self.n+1), self.k, replace=False))
+            samples.add(self.game_to_bits(game))
         
-        samples = [list(s) for s in samples]
+        samples = list(samples)
         
         max_min_dist = 0
-        early_stop_threshold = self.max_distance * 0.8  # 80% do máximo
+        early_stop_threshold = self.max_distance * 0.8
         
-        for code in samples:
+        for sample_bits in samples:
             min_dist = self.max_distance
             
-            for p in pool:
-                d = self.johnson_distance(code, p)
+            for pool_bits in bits_list:
+                d = self.johnson_distance(sample_bits, pool_bits)
                 min_dist = min(min_dist, d)
                 
-                # Early stop: se já achou distância 0
                 if min_dist == 0:
                     break
             
             max_min_dist = max(max_min_dist, min_dist)
             
-            # Early stop: se já atingiu threshold alto
             if max_min_dist >= early_stop_threshold:
                 break
         
@@ -153,139 +215,11 @@ class JohnsonSpace:
 
 
 # ============================================================
-# LAPLACIAN SPECTRUM - OTIMIZADO (ESPARRSO)
-# ============================================================
-
-class LaplacianSpectrumSparse:
-    """
-    Análise Espectral com matriz ESPARSA
-    
-    Otimizações:
-    - k-NN graph (não denso)
-    - eigsh (não eigh)
-    - Cache agressivo
-    - Apenas 3 autovalores (k=3)
-    """
-    
-    def __init__(self, johnson_space):
-        self.js = johnson_space
-        self._spectral_cache = {}
-        self._cache_max_size = 200
-    
-    def similarity_sparse(self, pool, k_neighbors=5):
-        """
-        Matriz de similaridade ESPARSA (k-NN)
-        
-        S(i,j) = exp(-d(i,j)² / (2σ²)) apenas para vizinhos
-        """
-        n = len(pool)
-        
-        # Calcular distâncias apenas para k vizinhos
-        D_sparse = self.js.distance_matrix_sparse(pool, k_neighbors)
-        
-        # Converter para similaridade
-        sigma = 3.0  # Parâmetro fixo para estabilidade
-        
-        # Construir matriz de similaridade esparsa
-        S = D_sparse.copy()
-        S.data = np.exp(-S.data**2 / (2 * sigma**2))
-        
-        # Adicionar diagonal
-        S = S + eye(n, format='csr')
-        
-        return S
-    
-    def laplacian_sparse(self, pool, k_neighbors=5):
-        """
-        Laplaciana normalizada ESPARSA
-        
-        L = I - D^(-1/2) S D^(-1/2)
-        """
-        S = self.similarity_sparse(pool, k_neighbors)
-        n = len(pool)
-        
-        # Graus (vetor)
-        degrees = np.array(S.sum(axis=1)).flatten()
-        
-        # D^(-1/2) como diagonal esparsa
-        d_inv_sqrt = 1.0 / np.sqrt(degrees + 1e-10)
-        D_inv_sqrt = diags(d_inv_sqrt, format='csr')
-        
-        # Laplaciana normalizada esparsa
-        I = eye(n, format='csr')
-        L = I - D_inv_sqrt @ S @ D_inv_sqrt
-        
-        return L
-    
-    def spectral_analysis_fast(self, pool, k_eigenvalues=3):
-        """
-        Análise espectral RÁPIDA
-        
-        Usa eigsh para obter apenas k menores autovalores
-        """
-        # Verificar cache
-        pool_key = hashlib.md5(
-            str([tuple(sorted(g)) for g in pool]).encode()
-        ).hexdigest()
-        
-        if pool_key in self._spectral_cache:
-            return self._spectral_cache[pool_key]
-        
-        n = len(pool)
-        
-        try:
-            # Construir Laplaciana esparsa
-            L = self.laplacian_sparse(pool, k_neighbors=5)
-            
-            # Obter apenas k menores autovalores (eigsh)
-            eigenvalues, _ = eigsh(L, k=min(k_eigenvalues, n-1), which='SM')
-            eigenvalues = np.sort(eigenvalues)
-            
-            # Métricas
-            spectral_gap = eigenvalues[1] - eigenvalues[0] if len(eigenvalues) > 1 else 0
-            algebraic_connectivity = eigenvalues[1] if len(eigenvalues) > 1 else 0
-            
-            # Cache
-            result = {
-                'spectral_gap': float(spectral_gap),
-                'algebraic_connectivity': float(algebraic_connectivity),
-                'n_components': int(np.sum(eigenvalues < 1e-6)),
-                'eigenvalues': eigenvalues.tolist()
-            }
-            
-        except Exception as e:
-            # Fallback: valores padrão
-            result = {
-                'spectral_gap': 0.0,
-                'algebraic_connectivity': 0.0,
-                'n_components': 1,
-                'eigenvalues': [0.0]
-            }
-        
-        # Armazenar no cache (limitar tamanho)
-        if len(self._spectral_cache) < self._cache_max_size:
-            self._spectral_cache[pool_key] = result
-        else:
-            # Limpar metade do cache
-            keys = list(self._spectral_cache.keys())[:self._cache_max_size//2]
-            for k in keys:
-                del self._spectral_cache[k]
-            self._spectral_cache[pool_key] = result
-        
-        return result
-    
-    def connectivity_score(self, pool):
-        """Conectividade algébrica (0-1)"""
-        analysis = self.spectral_analysis_fast(pool)
-        return min(1.0, analysis['algebraic_connectivity'] / 2.0)
-
-
-# ============================================================
-# SERIALIZAÇÃO BINÁRIA (mantida)
+# SERIALIZAÇÃO BINÁRIA (para cache hash)
 # ============================================================
 
 class BinarySerializer:
-    """Serialização binária eficiente"""
+    """Serialização binária para hash rápido"""
     
     @staticmethod
     def pool_to_bytes(pool):
@@ -299,6 +233,11 @@ class BinarySerializer:
         return bytes(data)
     
     @staticmethod
+    def pool_hash(pool):
+        """Hash MD5 do pool (para cache key)"""
+        return hashlib.md5(BinarySerializer.pool_to_bytes(pool)).hexdigest()
+    
+    @staticmethod
     def compressibility(pool):
         """Compressibilidade binária"""
         raw = BinarySerializer.pool_to_bytes(pool)
@@ -307,17 +246,88 @@ class BinarySerializer:
 
 
 # ============================================================
-# OBJETIVOS COM AVALIAÇÃO SELETIVA
+# LAPLACIAN ESPECTRAL ESPARSO
+# ============================================================
+
+class LaplacianSpectrumSparse:
+    """Análise espectral com matriz esparsa"""
+    
+    def __init__(self, johnson_space):
+        self.js = johnson_space
+        self._spectral_cache = {}
+        self._max_cache = 150
+    
+    def similarity_sparse(self, pool, k_neighbors=5):
+        """Matriz de similaridade esparsa (k-NN)"""
+        n = len(pool)
+        D_sparse = self.js.distance_matrix_sparse(pool, k_neighbors)
+        
+        sigma = 3.0
+        S = D_sparse.copy()
+        S.data = np.exp(-S.data**2 / (2 * sigma**2))
+        S = S + eye(n, format='csr')
+        
+        return S
+    
+    def laplacian_sparse(self, pool, k_neighbors=5):
+        """Laplaciana normalizada esparsa"""
+        S = self.similarity_sparse(pool, k_neighbors)
+        n = len(pool)
+        
+        degrees = np.array(S.sum(axis=1)).flatten()
+        d_inv_sqrt = 1.0 / np.sqrt(degrees + 1e-10)
+        D_inv_sqrt = diags(d_inv_sqrt, format='csr')
+        
+        I = eye(n, format='csr')
+        L = I - D_inv_sqrt @ S @ D_inv_sqrt
+        
+        return L
+    
+    def spectral_analysis_fast(self, pool, k_eigenvalues=3):
+        """Análise espectral rápida (eigsh)"""
+        pool_hash = BinarySerializer.pool_hash(pool)
+        
+        if pool_hash in self._spectral_cache:
+            return self._spectral_cache[pool_hash]
+        
+        n = len(pool)
+        
+        try:
+            L = self.laplacian_sparse(pool, k_neighbors=5)
+            eigenvalues, _ = eigsh(L, k=min(k_eigenvalues, n-1), which='SM')
+            eigenvalues = np.sort(eigenvalues)
+            
+            result = {
+                'spectral_gap': float(eigenvalues[1] - eigenvalues[0]) if len(eigenvalues) > 1 else 0.0,
+                'algebraic_connectivity': float(eigenvalues[1]) if len(eigenvalues) > 1 else 0.0,
+                'n_components': int(np.sum(eigenvalues < 1e-6)),
+                'eigenvalues': eigenvalues.tolist()
+            }
+        except:
+            result = {
+                'spectral_gap': 0.0,
+                'algebraic_connectivity': 0.0,
+                'n_components': 1,
+                'eigenvalues': [0.0]
+            }
+        
+        if len(self._spectral_cache) < self._max_cache:
+            self._spectral_cache[pool_hash] = result
+        
+        return result
+    
+    def connectivity_score(self, pool):
+        """Conectividade algébrica (0-1)"""
+        analysis = self.spectral_analysis_fast(pool)
+        return min(1.0, analysis['algebraic_connectivity'] / 2.0)
+
+
+# ============================================================
+# OBJETIVOS COM AVALIAÇÃO SELETIVA (CORRIGIDA)
 # ============================================================
 
 class SelectiveObjectives:
-    """
-    Objetivos com AVALIAÇÃO SELETIVA
-    
-    - Espectro: apenas elite (top 30%)
-    - Espectro: apenas a cada 3 gerações
-    - Covering radius: cache agressivo
-    """
+    """Objetivos com elite por dominância Pareto"""
     
     def __init__(self, historical_data=None):
         self.johnson = JohnsonSpace()
@@ -336,58 +346,49 @@ class SelectiveObjectives:
         ]
         self.directions = ['max', 'max', 'min', 'min', 'min', 'max']
         
-        # Controle de avaliação
-        self._eval_counter = 0
-        self._spectral_eval_freq = 3  # A cada 3 gerações
-        self._elite_ratio = 0.3  # Top 30%
+        self._spectral_eval_freq = 3
+        self._elite_ratio = 0.3
         
-        # Caches
+        # Cache com hash binário
         self._eval_cache = {}
-        self._spectral_cache = {}
+        self._max_eval_cache = 300
     
     def evaluate_all(self, pool, is_elite=False, force_spectral=False):
-        """
-        Avaliação completa com seleção condicional
-        """
-        pool_key = tuple(tuple(sorted(g)) for g in pool)
+        """Avaliação completa"""
+        pool_hash = BinarySerializer.pool_hash(pool)
         
-        # Verificar cache completo
-        if pool_key in self._eval_cache:
-            return self._eval_cache[pool_key].copy()
+        if pool_hash in self._eval_cache:
+            return self._eval_cache[pool_hash].copy()
         
         objectives = np.zeros(self.n_objectives)
         
-        # Objetivos BARATOS (sempre calculados)
+        # Baratos (sempre)
         objectives[0] = self._pair_coverage(pool)
         objectives[1] = self.johnson.min_johnson_distance(pool) / self.johnson.max_distance
         objectives[2] = self.johnson.covering_radius_fast(pool, sample_size=500)
         objectives[3] = self.serializer.compressibility(pool)
         objectives[4] = self._historical_independence(pool)
         
-        # Objetivo CARO (apenas elite ou forçado)
+        # Caro (apenas elite)
         if is_elite or force_spectral:
             objectives[5] = self.laplacian.connectivity_score(pool)
         else:
-            # Usar valor padrão ou cache
-            objectives[5] = self._spectral_cache.get(pool_key, 0.5)
+            objectives[5] = 0.5
         
-        # Cache (limitar)
-        if len(self._eval_cache) < 300:
-            self._eval_cache[pool_key] = objectives.copy()
+        if len(self._eval_cache) < self._max_eval_cache:
+            self._eval_cache[pool_hash] = objectives.copy()
         
         return objectives
     
     def evaluate_light(self, pool):
-        """
-        Avaliação LEVE (sem espectro)
-        """
+        """Avaliação leve (sem espectro)"""
         objectives = np.zeros(self.n_objectives)
         objectives[0] = self._pair_coverage(pool)
         objectives[1] = self.johnson.min_johnson_distance(pool) / self.johnson.max_distance
         objectives[2] = self.johnson.covering_radius_fast(pool, sample_size=300)
         objectives[3] = self.serializer.compressibility(pool)
         objectives[4] = self._historical_independence(pool)
-        objectives[5] = 0.5  # Default
+        objectives[5] = 0.5
         return objectives
     
     def _pair_coverage(self, pool):
@@ -409,11 +410,11 @@ class SelectiveObjectives:
 
 
 # ============================================================
-# NSGA-II OTIMIZADO
+# NSGA-II COM ELITE PARETO (CORRIGIDO)
 # ============================================================
 
 class FastNSGA2:
-    """NSGA-II com avaliação seletiva"""
+    """NSGA-II com seleção de elite por dominância Pareto"""
     
     def __init__(self, n_games=30, pop_size=80, n_generations=30, historical_data=None):
         self.n_games = n_games
@@ -437,8 +438,24 @@ class FastNSGA2:
                 if obj1[i] < obj2[i]: better_in_any = True
         return better_in_any
     
+    def _get_pareto_elite(self, population, population_obj, ratio=0.3):
+        """
+        Seleciona elite por DOMINÂNCIA PARETO (não soma!)
+        """
+        n_elite = int(self.pop_size * ratio)
+        
+        # Ordenar por fronts de Pareto
+        fronts = self._fast_non_dominated_sort(population_obj)
+        
+        elite_indices = []
+        for front in fronts:
+            elite_indices.extend(front)
+            if len(elite_indices) >= n_elite:
+                break
+        
+        return elite_indices[:n_elite]
+    
     def _initialize_population(self):
-        """População inicial diversificada"""
         population = []
         for _ in range(self.pop_size):
             pool = []
@@ -448,21 +465,17 @@ class FastNSGA2:
         return population
     
     def run(self):
-        """Executa NSGA-II otimizado"""
         print(f"\n{'='*60}")
-        print(f"🧬 NSGA-II OTIMIZADO")
+        print(f"🧬 NSGA-II BITWISE OTIMIZADO")
         print(f"{'='*60}")
         print(f"   Pop: {self.pop_size} | Gen: {self.n_generations} | Jogos: {self.n_games}")
-        print(f"   Espectro: cada {self.objectives._spectral_eval_freq} gens | Elite: {self.objectives._elite_ratio*100:.0f}%")
-        print(f"   Matriz: ESPARSA (k-NN) | Autovalores: eigsh (k=3)")
+        print(f"   Distância: BITWISE | Cache: Binário MD5")
+        print(f"   Elite: Pareto (não soma) | Espectro: cada {self.objectives._spectral_eval_freq} gens")
         
         population = self._initialize_population()
-        
-        # Avaliação inicial (leve para todos)
         population_obj = [self.objectives.evaluate_light(p) for p in population]
         
         for gen in tqdm(range(self.n_generations), desc="NSGA-II"):
-            # Criar offspring
             offspring = []
             while len(offspring) < self.pop_size:
                 i1, i2 = np.random.choice(self.pop_size, 2, replace=False)
@@ -475,17 +488,13 @@ class FastNSGA2:
                 child = self._mutate(child)
                 offspring.append(child)
             
-            # Avaliação dos filhos (leve)
             offspring_obj = [self.objectives.evaluate_light(o) for o in offspring]
             
-            # Combinar
             combined = population + offspring
             combined_obj = population_obj + offspring_obj
             
-            # Non-dominated sorting
             fronts = self._fast_non_dominated_sort(combined_obj)
             
-            # Selecionar próxima população
             new_pop = []
             new_obj = []
             
@@ -506,25 +515,21 @@ class FastNSGA2:
             population = new_pop
             population_obj = new_obj
             
-            # AVALIAÇÃO ESPECTRAL SELETIVA
+            # Avaliação espectral seletiva na ELITE PARETO
             force_spectral = (gen % self.objectives._spectral_eval_freq == 0)
             
             if force_spectral:
-                # Ordenar por fitness (soma dos objetivos)
-                fitness_scores = [np.sum(obj) for obj in population_obj]
-                elite_indices = np.argsort(fitness_scores)[-int(self.pop_size * self.objectives._elite_ratio):]
+                elite_indices = self._get_pareto_elite(population, population_obj, self.objectives._elite_ratio)
                 
-                # Reavaliar elite com espectro
                 for idx in elite_indices:
                     population_obj[idx] = self.objectives.evaluate_all(
                         population[idx], is_elite=True, force_spectral=True
                     )
         
-        # Avaliação final completa da elite
+        # Final: reavaliar Pareto front completo
         final_fronts = self._fast_non_dominated_sort(population_obj)
         pareto_idx = final_fronts[0]
         
-        # Reavaliar Pareto com espectro
         for idx in pareto_idx:
             population_obj[idx] = self.objectives.evaluate_all(
                 population[idx], is_elite=True, force_spectral=True
@@ -539,7 +544,6 @@ class FastNSGA2:
         return pareto_pools, pareto_obj
     
     def _crossover(self, p1, p2):
-        """Crossover rápido"""
         mid = self.n_games // 2
         if np.random.random() < 0.5:
             return p1[:mid] + p2[mid:]
@@ -558,7 +562,6 @@ class FastNSGA2:
             return child
     
     def _mutate(self, pool, rate=0.1):
-        """Mutação leve"""
         mutated = [g.copy() for g in pool]
         n_mut = max(1, int(self.n_games * rate))
         indices = np.random.choice(self.n_games, n_mut, replace=False)
@@ -574,7 +577,6 @@ class FastNSGA2:
         return mutated
     
     def _fast_non_dominated_sort(self, pop_obj):
-        """Non-dominated sorting"""
         n = len(pop_obj)
         dom_count = np.zeros(n, dtype=int)
         dom_sol = [[] for _ in range(n)]
@@ -604,7 +606,6 @@ class FastNSGA2:
         return fronts[:-1]
     
     def _crowding_distance(self, front_idx, pop_obj):
-        """Crowding distance"""
         n = len(front_idx)
         if n <= 2:
             return [float('inf')] * n
@@ -624,7 +625,7 @@ class FastNSGA2:
 
 def main():
     print("="*60)
-    print("🧬 NSGA-II OTIMIZADO - ESPARRSO + CACHE")
+    print("🧬 NSGA-II BITWISE + PARETO ELITE")
     print("="*60)
     
     historical = [sorted(np.random.choice(range(1, 26), 15, replace=False)) for _ in range(100)]
@@ -652,8 +653,14 @@ def main():
             s = "🔴 CONFLITO" if corr < -0.3 else "🟡 NEUTRO" if abs(corr) < 0.3 else "🟢 ALINHADO"
             print(f"   {nsga2.objectives.objective_names[i][:18]} vs {nsga2.objectives.objective_names[j][:18]}: r={corr:+.3f} {s}")
     
+    # Métricas Johnson
+    js = JohnsonSpace()
+    best = pareto_pools[0]
+    print(f"\n🔐 JOHNSON SPACE (melhor solução):")
+    print(f"   Dist mín: {js.min_johnson_distance(best)}/10")
+    print(f"   Dist méd: {js.avg_johnson_distance(best):.1f}/10")
+    
     print(f"\n✅ CONCLUÍDO!")
-    print(f"   ⚡ O sistema agora é VIÁVEL computacionalmente!")
 
 if __name__ == "__main__":
     main()
