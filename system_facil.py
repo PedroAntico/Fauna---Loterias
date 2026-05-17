@@ -397,37 +397,41 @@ class NSGA2:
         return fronts[:-1]  # Remover último front vazio
     
     def _crowding_distance(self, front_indices, population_obj):
-        """
-        Distância de multidão (crowding distance)
-        
-        Mede densidade de soluções ao redor de cada ponto
-        """
+
         n = len(front_indices)
+
         if n <= 2:
-            return [float('inf')] * n
-        
-        distances = np.zeros(n)
+            return {idx: float('inf') for idx in front_indices}
+
+        distances = {idx: 0.0 for idx in front_indices}
+
         n_obj = len(population_obj[0])
-        
+
         for obj_idx in range(n_obj):
-            # Ordenar por este objetivo
-            sorted_indices = sorted(front_indices, 
-                                   key=lambda i: population_obj[i][obj_idx])
-            
-            distances[0] = float('inf')
-            distances[-1] = float('inf')
-            
-            obj_range = (population_obj[sorted_indices[-1]][obj_idx] - 
-                        population_obj[sorted_indices[0]][obj_idx])
-            
-            if obj_range > 0:
-                for i in range(1, n - 1):
-                    distances[i] += (
-                        population_obj[sorted_indices[i+1]][obj_idx] -
-                        population_obj[sorted_indices[i-1]][obj_idx]
-                    ) / obj_range
-        
-        return distances.tolist()
+
+            sorted_front = sorted( front_indices,key=lambda i: population_obj[i][obj_idx]
+        )
+
+            distances[sorted_front[0]] = float('inf')
+            distances[sorted_front[-1]] = float('inf')
+
+            obj_min = population_obj[sorted_front[0]][obj_idx]
+            obj_max = population_obj[sorted_front[-1]][obj_idx]
+
+            obj_range = obj_max - obj_min
+
+            if obj_range == 0:
+                continue
+
+            for i in range(1, n - 1):
+
+                prev_obj = population_obj[sorted_front[i - 1]][obj_idx]
+                next_obj = population_obj[sorted_front[i + 1]][obj_idx]
+
+                distances[sorted_front[i]] += (  next_obj - prev_obj ) / obj_range
+
+        return distances
+    
     
     def _crossover(self, parent1, parent2):
         """Crossover de pools (SBX-like para combinatória)"""
@@ -598,21 +602,20 @@ class NSGA2:
                     # Truncar último front por crowding distance
                     remaining = self.pop_size - len(new_population)
                     distances = self._crowding_distance(front, combined_obj)
+
+                    sorted_by_dist = sorted(  front,  key=lambda idx: distances[idx], reverse=True)
                     
-                    # Selecionar os mais diversos
-                    sorted_by_dist = sorted(zip(front, distances), 
-                                           key=lambda x: x[1], reverse=True)
-                    
-                    for idx, _ in sorted_by_dist[:remaining]:
+                    for idx in sorted_by_dist[:remaining]:
                         new_population.append(combined[idx])
                         new_population_obj.append(combined_obj[idx])
                     break
             
             population = new_population
             population_obj = new_population_obj
+            current_fronts = self._fast_non_dominated_sort(population_obj)
             
             # Registrar Pareto front
-            pareto_front = [population_obj[i] for i in fronts[0]]
+            pareto_front = [population_obj[i] for i in current_fronts[0]]
             self.pareto_fronts.append(pareto_front)
             self.fitness_history.append(len(fronts[0]))
         
