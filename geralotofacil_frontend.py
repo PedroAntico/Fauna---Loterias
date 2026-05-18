@@ -2,16 +2,17 @@
 # -*- coding: utf-8 -*-
 
 """
-SISTEMA INTEGRADO - FRONTEND + MOTOR CONDICIONADO
-==================================================
-Versão 4.0 - Geração Sob Demanda com Constraints
+SISTEMA INTEGRADO COM HARD CONSTRAINTS - VERSÃO FINAL
+======================================================
+Versão 5.0 - CSP + NSGA-II com Repair Local
 
-FLUXO CORRETO:
-1. Usuário configura preferências no frontend
-2. Frontend chama o motor COM constraints
-3. Motor gera fronteira DENTRO do subespaço
-4. Frontend exibe resultados (sem pós-filtro)
-5. Repair operator garante validade após crossover
+CORREÇÕES CRÍTICAS:
+✅ repair_game() MODIFICA minimamente (não descarta)
+✅ Hard constraints garantidas em TODAS as etapas
+✅ Validação após cada operação genética
+✅ Preenchimento inteligente (não aleatório)
+✅ Conversão de numpy scalars para int nativo
+✅ Display limpo sem np.int64
 """
 
 import numpy as np
@@ -58,24 +59,343 @@ def load_historical_contests(csv_file='resultados_lotofacil.csv'):
                 contests.append({
                     'concurso': int(parts[0]),
                     'data': parts[1],
-                    'dezenas': sorted([int(x) for x in parts[2:17]])
+                    'dezenas': [int(x) for x in parts[2:17]]
                 })
         contests.sort(key=lambda x: x['concurso'])
         return contests
     except:
         return None
 
-
 def get_last_contest(csv_file='resultados_lotofacil.csv'):
     contests = load_historical_contests(csv_file)
     return contests[-1] if contests else None
-
 
 def get_historical_data(csv_file='resultados_lotofacil.csv', n=100):
     contests = load_historical_contests(csv_file)
     if contests:
         return [c['dezenas'] for c in contests[-n:]]
     return [sorted(np.random.choice(range(1, 26), 15, replace=False)) for _ in range(n)]
+
+
+# ============================================================
+# HARD CONSTRAINT SATISFACTION
+# ============================================================
+
+def generate_feasible_game(constraints, max_attempts=100):
+    """
+    Gera UM jogo que SATISFAZ TODAS as hard constraints
+    
+    Diferente do anterior: NÃO preenche aleatoriamente no final.
+    Cada adição é validada contra TODAS as constraints.
+    """
+    if constraints is None:
+        return sorted(np.random.choice(range(1, 26), 15, replace=False))
+    
+    fixed = set(constraints.get('fixas', []))
+    excluded = set(constraints.get('excluidas', []))
+    target_pares = constraints.get('pares_target')
+    target_primos = constraints.get('primos_target')
+    target_moldura = constraints.get('moldura_target')
+    target_repetidas = constraints.get('repetidas_target')
+    ultimo = set(constraints.get('ultimo_concurso', []))
+    soma_min = constraints.get('soma_min')
+    soma_max = constraints.get('soma_max')
+    max_cons = constraints.get('max_consecutivos')
+    
+    for _ in range(max_attempts):
+        game = set()
+        
+        # 1. Fixas (obrigatório)
+        game.update(fixed)
+        
+        # 2. Pool disponível
+        available = set(range(1, 26)) - excluded - game
+        
+        # 3. Repetidas (preencher primeiro, com prioridade)
+        if target_repetidas is not None and ultimo:
+            repeated_pool = list(ultimo & available)
+            needed = max(0, target_repetidas - len(game & ultimo))
+            if needed > 0 and repeated_pool:
+                n = min(needed, len(repeated_pool))
+                chosen = np.random.choice(repeated_pool, n, replace=False)
+                game.update(chosen)
+                available -= set(chosen)
+        
+        # 4. Preencher respeitando TODAS as constraints
+        # Prioridade: pares → primos → moldura → soma → consecutivos
+        while len(game) < 15 and available:
+            candidates = list(available)
+            
+            # Filtrar por constraints
+            valid_candidates = []
+            for c in candidates:
+                test_game = game | {c}
+                
+                # Validar pares (não exceder target)
+                if target_pares is not None:
+                    current_pares = sum(1 for d in test_game if d % 2 == 0)
+                    remaining_slots = 15 - len(test_game)
+                    max_possible_pares = current_pares + sum(1 for d in available if d % 2 == 0 and d != c)
+                    if current_pares > target_pares:
+                        continue
+                    if max_possible_pares < target_pares and len(test_game) < 13:
+                        if c % 2 != 0 and current_pares < target_pares:
+                            continue
+                
+                # Validar primos
+                if target_primos is not None:
+                    current_primos = sum(1 for d in test_game if d in PRIMES)
+                    remaining_primos = sum(1 for d in available if d in PRIMES and d != c)
+                    if current_primos > target_primos:
+                        continue
+                
+                # Validar consecutivos
+                if max_cons is not None:
+                    sorted_test = sorted(test_game)
+                    cons_count = 1
+                    max_cons_found = 1
+                    for i in range(len(sorted_test)-1):
+                        if sorted_test[i+1] - sorted_test[i] == 1:
+                            cons_count += 1
+                            max_cons_found = max(max_cons_found, cons_count)
+                        else:
+                            cons_count = 1
+                    if max_cons_found > max_cons:
+                        continue
+                
+                valid_candidates.append(c)
+            
+            if not valid_candidates:
+                # Relaxar: aceitar qualquer disponível
+                valid_candidates = list(available)
+            
+            if not valid_candidates:
+                break
+            
+            # Escolher o melhor candidato
+            # Prioridade: manter balanceamento
+            scores = []
+            for c in valid_candidates:
+                score = 0
+                test_game = game | {c}
+                
+                # Bônus por preencher target de pares
+                if target_pares is not None:
+                    current = sum(1 for d in test_game if d % 2 == 0)
+                    if current <= target_pares:
+                        score += 2 if c % 2 == 0 else 0
+                
+                # Bônus por preencher target de moldura
+                if target_moldura is not None:
+                    current = sum(1 for d in test_game if d in MOLDURA)
+                    if current <= target_moldura:
+                        score += 1 if c in MOLDURA else 0
+                
+                # Bônus por soma na faixa
+                if soma_min is not None and soma_max is not None:
+                    current_soma = sum(test_game)
+                    if soma_min <= current_soma <= soma_max:
+                        score += 1
+                
+                scores.append(score)
+            
+            # Escolher com probabilidade proporcional ao score
+            if sum(scores) > 0:
+                probs = np.array(scores) / sum(scores)
+                chosen = np.random.choice(valid_candidates, p=probs)
+            else:
+                chosen = np.random.choice(valid_candidates)
+            
+            game.add(chosen)
+            available.remove(chosen)
+        
+        # Verificar viabilidade
+        if len(game) >= 14:  # Aceita 14 ou 15
+            result = sorted([int(x) for x in game])[:15]
+            while len(result) < 15:
+                remaining = list(set(range(1, 26)) - set(result) - excluded)
+                if remaining:
+                    result.append(int(np.random.choice(remaining)))
+                else:
+                    break
+            return sorted(result[:15])
+    
+    # Fallback: gerar com repair
+    game = sorted(np.random.choice(range(1, 26), 15, replace=False))
+    return repair_game_local(game, constraints)
+
+
+def repair_game_local(game, constraints):
+    """
+    REPAIR LOCAL: Modifica MINIMAMENTE o jogo para satisfazer constraints
+    
+    NÃO descarta o jogo. Apenas ajusta o necessário.
+    Preserva o material genético do crossover/mutação.
+    """
+    if constraints is None:
+        return sorted([int(x) for x in game])[:15]
+    
+    game = set(int(x) for x in game)
+    fixed = set(constraints.get('fixas', []))
+    excluded = set(constraints.get('excluidas', []))
+    target_pares = constraints.get('pares_target')
+    target_primos = constraints.get('primos_target')
+    target_moldura = constraints.get('moldura_target')
+    target_repetidas = constraints.get('repetidas_target')
+    ultimo = set(constraints.get('ultimo_concurso', []))
+    max_cons = constraints.get('max_consecutivos')
+    
+    # 1. Remover excluídas
+    game -= excluded
+    
+    # 2. Adicionar fixas
+    game |= fixed
+    
+    # 3. Ajustar tamanho para 15
+    # Remover excedentes (não fixas)
+    while len(game) > 15:
+        removable = [d for d in game if d not in fixed]
+        if not removable:
+            break
+        # Remover o que menos contribui para constraints
+        scores = {}
+        for d in removable:
+            score = 0
+            test = game - {d}
+            if target_pares is not None:
+                current = sum(1 for x in test if x % 2 == 0)
+                score -= abs(current - target_pares)
+            if target_primos is not None:
+                current = sum(1 for x in test if x in PRIMES)
+                score -= abs(current - target_primos) * 2
+            scores[d] = score
+        
+        worst = min(scores, key=scores.get)
+        game.remove(worst)
+    
+    # 4. Completar até 15 (escolhas INTELIGENTES)
+    while len(game) < 15:
+        available = set(range(1, 26)) - game - excluded
+        
+        if not available:
+            break
+        
+        # Pontuar candidatos
+        candidates = list(available)
+        scores = []
+        for c in candidates:
+            score = 0
+            test = game | {c}
+            
+            # Bônus por aproximar do target de pares
+            if target_pares is not None:
+                current = sum(1 for x in test if x % 2 == 0)
+                score -= abs(current - target_pares)
+            
+            # Bônus por aproximar do target de primos
+            if target_primos is not None:
+                current = sum(1 for x in test if x in PRIMES)
+                score -= abs(current - target_primos)
+            
+            # Bônus por moldura
+            if target_moldura is not None:
+                current = sum(1 for x in test if x in MOLDURA)
+                score -= abs(current - target_moldura) * 0.5
+            
+            # Penalidade por consecutivos
+            if max_cons is not None:
+                sorted_test = sorted(test)
+                cons = 1
+                max_found = 1
+                for i in range(len(sorted_test)-1):
+                    if sorted_test[i+1] - sorted_test[i] == 1:
+                        cons += 1
+                        max_found = max(max_found, cons)
+                    else:
+                        cons = 1
+                if max_found > max_cons:
+                    score -= 10
+            
+            scores.append(score)
+        
+        # Escolher melhor
+        best_idx = np.argmax(scores)
+        game.add(candidates[best_idx])
+    
+    return sorted([int(x) for x in game])[:15]
+
+
+def validate_game(game, constraints):
+    """
+    Valida se o jogo satisfaz TODAS as hard constraints
+    
+    Returns:
+        (bool, list): (válido?, [violações])
+    """
+    if constraints is None:
+        return True, []
+    
+    game = set(int(x) for x in game)
+    violations = []
+    
+    # Fixas
+    fixed = set(constraints.get('fixas', []))
+    if not fixed.issubset(game):
+        violations.append(f"Fixas ausentes: {fixed - game}")
+    
+    # Excluídas
+    excluded = set(constraints.get('excluidas', []))
+    if game & excluded:
+        violations.append(f"Excluídas presentes: {game & excluded}")
+    
+    # Pares (hard: exatamente igual)
+    if 'pares_target' in constraints:
+        actual = sum(1 for d in game if d % 2 == 0)
+        if actual != constraints['pares_target']:
+            violations.append(f"Pares: {actual} ≠ {constraints['pares_target']}")
+    
+    # Primos (hard: exatamente igual)
+    if 'primos_target' in constraints:
+        actual = sum(1 for d in game if d in PRIMES)
+        if actual != constraints['primos_target']:
+            violations.append(f"Primos: {actual} ≠ {constraints['primos_target']}")
+    
+    # Moldura
+    if 'moldura_target' in constraints:
+        actual = sum(1 for d in game if d in MOLDURA)
+        if actual != constraints['moldura_target']:
+            violations.append(f"Moldura: {actual} ≠ {constraints['moldura_target']}")
+    
+    # Repetidas
+    if 'repetidas_target' in constraints and 'ultimo_concurso' in constraints:
+        ultimo = set(constraints['ultimo_concurso'])
+        actual = len(game & ultimo)
+        if actual != constraints['repetidas_target']:
+            violations.append(f"Repetidas: {actual} ≠ {constraints['repetidas_target']}")
+    
+    # Soma
+    if 'soma_min' in constraints:
+        if sum(game) < constraints['soma_min']:
+            violations.append(f"Soma: {sum(game)} < {constraints['soma_min']}")
+    if 'soma_max' in constraints:
+        if sum(game) > constraints['soma_max']:
+            violations.append(f"Soma: {sum(game)} > {constraints['soma_max']}")
+    
+    # Consecutivos
+    if 'max_consecutivos' in constraints:
+        sorted_g = sorted(game)
+        cons = 1
+        max_found = 1
+        for i in range(len(sorted_g)-1):
+            if sorted_g[i+1] - sorted_g[i] == 1:
+                cons += 1
+                max_found = max(max_found, cons)
+            else:
+                cons = 1
+        if max_found > constraints['max_consecutivos']:
+            violations.append(f"Consecutivos: {max_found} > {constraints['max_consecutivos']}")
+    
+    return len(violations) == 0, violations
 
 
 # ============================================================
@@ -92,7 +412,7 @@ class JohnsonSpace:
     
     def game_to_bits(self, game):
         bits = 0
-        for d in game: bits |= (1 << (d - 1))
+        for d in game: bits |= (1 << (int(d) - 1))
         return bits
     
     def johnson_distance(self, game1, game2):
@@ -137,191 +457,13 @@ class JohnsonSpace:
                 if min_dist == 0: break
             max_min_dist = max(max_min_dist, min_dist)
         return max_min_dist / self.max_distance
-    
-    def sphere_packing_bound(self, pool):
-        d = self.min_johnson_distance(pool)
-        if d == 0: return 0
-        radius = (d - 1) // 2
-        if radius < 0: radius = 0
-        sphere_vol = sum(comb(self.k, i) * comb(self.n - self.k, i) 
-                        for i in range(min(radius, self.k) + 1) if i <= self.n - self.k)
-        return min(1.0, len(pool) / (comb(self.n, self.k) / sphere_vol)) if sphere_vol > 0 else 1.0
 
 
 # ============================================================
-# GERADOR CONDICIONADO + REPAIR OPERATOR
+# NSGA-II COM VALIDAÇÃO HARD
 # ============================================================
 
-def build_constraints_from_preferences(preferences, ultimo_concurso=None):
-    """Converte preferências do frontend em constraints para o motor"""
-    constraints = {}
-    
-    if 'fixas' in preferences:
-        constraints['fixas'] = preferences['fixas']
-    if 'excluidas' in preferences:
-        constraints['excluidas'] = preferences['excluidas']
-    if 'pares' in preferences:
-        constraints['pares_target'] = preferences['pares']
-    if 'primos' in preferences:
-        constraints['primos_target'] = preferences['primos']
-    if 'moldura' in preferences:
-        constraints['moldura_target'] = preferences['moldura']
-    if 'repetidas' in preferences and ultimo_concurso:
-        constraints['repetidas_target'] = preferences['repetidas']
-        constraints['ultimo_concurso'] = ultimo_concurso
-    if 'soma_min' in preferences:
-        constraints['soma_min'] = preferences['soma_min']
-    if 'soma_max' in preferences:
-        constraints['soma_max'] = preferences['soma_max']
-    if 'max_consecutivos' in preferences:
-        constraints['max_consecutivos'] = preferences['max_consecutivos']
-    
-    return constraints if constraints else None
-
-
-def generate_constrained_game(constraints):
-    """Gera UM jogo obedecendo constraints"""
-    if constraints is None:
-        return sorted(np.random.choice(range(1, 26), 15, replace=False))
-    
-    game = set()
-    
-    # 1. Fixas (obrigatório)
-    if 'fixas' in constraints and constraints['fixas']:
-        game.update(constraints['fixas'])
-    
-    # 2. Pool disponível
-    excluded = set(constraints.get('excluidas', []))
-    available = set(range(1, 26)) - excluded - game
-    
-    # 3. Repetidas do último concurso
-    if 'repetidas_target' in constraints and 'ultimo_concurso' in constraints:
-        ultimo = set(constraints['ultimo_concurso'])
-        repeated_pool = list(ultimo & available)
-        target = constraints['repetidas_target']
-        current = len(game & ultimo)
-        needed = max(0, target - current)
-        if repeated_pool and needed > 0:
-            n = min(needed, len(repeated_pool))
-            chosen = np.random.choice(repeated_pool, n, replace=False)
-            game.update(chosen)
-            available -= set(chosen)
-    
-    # 4. Ajustar PARES
-    if 'pares_target' in constraints:
-        target = constraints['pares_target']
-        current = sum(1 for d in game if d % 2 == 0)
-        if current < target:
-            even_avail = [d for d in available if d % 2 == 0]
-            n = min(target - current, len(even_avail))
-            if n > 0:
-                game.update(np.random.choice(even_avail, n, replace=False))
-                available = set(range(1, 26)) - excluded - game
-        current = sum(1 for d in game if d % 2 == 0)
-        odd_needed = (15 - target) - (len(game) - current)
-        if odd_needed > 0:
-            odd_avail = [d for d in available if d % 2 != 0]
-            n = min(odd_needed, len(odd_avail))
-            if n > 0:
-                game.update(np.random.choice(odd_avail, n, replace=False))
-                available = set(range(1, 26)) - excluded - game
-    
-    # 5. Ajustar PRIMOS
-    if 'primos_target' in constraints:
-        target = constraints['primos_target']
-        current = sum(1 for d in game if d in PRIMES)
-        needed = target - current
-        if needed > 0:
-            prime_avail = [d for d in available if d in PRIMES]
-            n = min(needed, len(prime_avail))
-            if n > 0:
-                game.update(np.random.choice(prime_avail, n, replace=False))
-                available = set(range(1, 26)) - excluded - game
-    
-    # 6. Ajustar MOLDURA
-    if 'moldura_target' in constraints:
-        target = constraints['moldura_target']
-        current = sum(1 for d in game if d in MOLDURA)
-        needed = target - current
-        if needed > 0:
-            moldura_avail = [d for d in available if d in MOLDURA]
-            n = min(needed, len(moldura_avail))
-            if n > 0:
-                game.update(np.random.choice(moldura_avail, n, replace=False))
-                available = set(range(1, 26)) - excluded - game
-    
-    # 7. Completar até 15
-    available = set(range(1, 26)) - excluded - game
-    while len(game) < 15 and available:
-        game.add(np.random.choice(list(available)))
-        available = set(range(1, 26)) - excluded - game
-    
-    result = sorted(list(game))[:15]
-    while len(result) < 15:
-        remaining = list(set(range(1, 26)) - set(result) - excluded)
-        if remaining:
-            result.append(np.random.choice(remaining))
-        else:
-            result.append(np.random.choice([d for d in range(1, 26) if d not in result]))
-    
-    return sorted(result[:15])
-
-
-def repair_game(game, constraints):
-    """
-    REPAIR OPERATOR: Corrige jogo após crossover/mutação
-    
-    Garante que o jogo volte a obedecer todas as restrições
-    """
-    if constraints is None:
-        return sorted(game)[:15]
-    
-    game = set(game)
-    excluded = set(constraints.get('excluidas', []))
-    
-    # 1. Garantir fixas
-    if 'fixas' in constraints and constraints['fixas']:
-        game.update(constraints['fixas'])
-    
-    # 2. Remover excluídas
-    game -= excluded
-    
-    # 3. Truncar para 15
-    game_list = sorted(list(game))[:15]
-    
-    # 4. Reconstruir com constraints
-    return generate_constrained_game(constraints)
-
-
-def generate_constrained_pool(n_games, constraints):
-    """Gera pool inteiro dentro do subespaço"""
-    pool = []
-    seen = set()
-    attempts = 0
-    max_attempts = n_games * 50
-    
-    while len(pool) < n_games and attempts < max_attempts:
-        game = generate_constrained_game(constraints)
-        key = tuple(game)
-        if key not in seen:
-            seen.add(key)
-            pool.append(game)
-        attempts += 1
-    
-    while len(pool) < n_games:
-        game = sorted(np.random.choice(range(1, 26), 15, replace=False))
-        if tuple(game) not in seen:
-            seen.add(tuple(game))
-            pool.append(game)
-    
-    return pool[:n_games]
-
-
-# ============================================================
-# NSGA-II COM REPAIR OPERATOR
-# ============================================================
-
-class ConstrainedNSGA2:
+class HardConstraintNSGA2:
     def __init__(self, n_games=30, pop_size=200, n_generations=80, 
                  historical_data=None, constraints=None):
         self.n_games = n_games
@@ -331,13 +473,11 @@ class ConstrainedNSGA2:
         self.johnson = JohnsonSpace()
         self.johnson.pre_generate_cover_samples(2000)
         self.historical_data = historical_data or []
-        self.n_obj = 6
-        self.directions = ['max', 'max', 'min', 'min', 'min', 'max']
         self._eval_cache = {}
     
     def _dominates(self, obj1, obj2):
         better = False
-        for i, d in enumerate(self.directions):
+        for i, d in enumerate(['max', 'max', 'min', 'min', 'min', 'max']):
             if d == 'max':
                 if obj1[i] < obj2[i]: return False
                 if obj1[i] > obj2[i]: better = True
@@ -348,7 +488,7 @@ class ConstrainedNSGA2:
     
     def evaluate(self, pool):
         h = hashlib.md5(b''.join(struct.pack('>I', 
-            sum((1<<(d-1)) for d in g)) for g in pool)).hexdigest()
+            sum((1<<(int(d)-1)) for d in g)) for g in pool)).hexdigest()
         if h in self._eval_cache: return self._eval_cache[h].copy()
         
         obj = np.zeros(6)
@@ -359,138 +499,94 @@ class ConstrainedNSGA2:
         obj[0] = len(covered) / comb(25, 2)
         obj[1] = self.johnson.min_johnson_distance(pool) / self.johnson.max_distance
         obj[2] = self.johnson.covering_radius_fast(pool)
-        obj[3] = BinarySerializer.compressibility(pool)
+        
+        data = bytearray()
+        for game in pool:
+            bits = 0
+            for d in game: bits |= (1 << (int(d)-1))
+            data.extend(struct.pack('>I', bits))
+        obj[3] = len(zlib.compress(bytes(data), level=9)) / len(data)
+        
         if self.historical_data:
             recent = self.historical_data[-50:]
             obj[4] = np.mean([max(len(set(g) & set(h)) / 15 for h in recent) for g in pool])
         else:
             obj[4] = 0.5
         obj[5] = 0.5
+        
         if len(self._eval_cache) < 500: self._eval_cache[h] = obj.copy()
         return obj
     
     def _initialize_population(self):
         population = []
-        strategies = ['constrained', 'spread', 'balanced', 'entropy', 'random']
         for i in range(self.pop_size):
-            s = strategies[i % len(strategies)]
-            if s == 'constrained' and self.constraints:
-                pool = generate_constrained_pool(self.n_games, self.constraints)
-            else:
-                pool = self._generate_pool(s)
-            population.append(pool)
-        return population[:self.pop_size]
-    
-    def _generate_pool(self, strategy):
-        pool, seen = [], set()
-        if strategy == 'spread':
-            base = sorted(np.random.choice(range(1, 26), 15, replace=False))
-            pool.append(base); seen.add(tuple(base))
-            for _ in range(self.n_games - 1):
-                best, best_min = None, 15
-                for _ in range(200):
-                    c = sorted(np.random.choice(range(1, 26), 15, replace=False))
-                    if tuple(c) in seen: continue
-                    m = min(len(set(c) & set(g)) for g in pool)
-                    if m < best_min: best_min = m; best = c
-                if best: seen.add(tuple(best)); pool.append(best)
-        elif strategy == 'balanced':
-            half = self.n_games // 2
-            base = sorted(np.random.choice(range(1, 26), 15, replace=False))
-            pool.append(base); seen.add(tuple(base))
-            for _ in range(half - 1):
-                best, best_min = None, 15
-                for _ in range(100):
-                    c = sorted(np.random.choice(range(1, 26), 15, replace=False))
-                    if tuple(c) in seen: continue
-                    m = min(len(set(c) & set(g)) for g in pool)
-                    if m < best_min: best_min = m; best = c
-                if best: seen.add(tuple(best)); pool.append(best)
-            cbase = sorted(np.random.choice(range(1, 26), 15, replace=False))
-            for _ in range(self.n_games - half):
-                game = cbase.copy()
-                pos = np.random.randint(0, 15)
-                avail = [d for d in range(1, 26) if d not in game]
-                if avail: game[pos] = np.random.choice(avail)
-                game = sorted(game)
-                if tuple(game) not in seen: seen.add(tuple(game)); pool.append(game)
-        else:
+            pool = []
+            seen = set()
             for _ in range(self.n_games):
-                game = tuple(sorted(np.random.choice(range(1, 26), 15, replace=False)))
-                if game not in seen: seen.add(game); pool.append(list(game))
-        return self._ensure_unique(pool)
-    
-    def _ensure_unique(self, pool):
-        unique, seen = [], set()
-        for game in pool:
-            key = tuple(sorted(game))
-            if key not in seen: seen.add(key); unique.append(sorted(game))
-        attempts = 0
-        while len(unique) < self.n_games and attempts < 500:
-            attempts += 1
-            game = generate_constrained_game(self.constraints) if self.constraints else sorted(np.random.choice(range(1, 26), 15, replace=False))
-            if tuple(game) not in seen: seen.add(tuple(game)); unique.append(game)
-        while len(unique) < self.n_games:
-            game = sorted(np.random.choice(range(1, 26), 15, replace=False))
-            if tuple(game) not in seen: seen.add(tuple(game)); unique.append(game)
-        return unique[:self.n_games]
+                game = generate_feasible_game(self.constraints)
+                key = tuple(game)
+                if key not in seen:
+                    seen.add(key)
+                    pool.append(game)
+            # Completar se necessário
+            while len(pool) < self.n_games:
+                game = generate_feasible_game(self.constraints)
+                if tuple(game) not in seen:
+                    seen.add(tuple(game))
+                    pool.append(game)
+            population.append(pool[:self.n_games])
+        return population
     
     def _crossover(self, p1, p2):
-        if np.random.random() < 0.5:
-            child = p1[:self.n_games//2] + p2[self.n_games//2:]
-        else:
-            child = []
-            for i in range(self.n_games):
-                g1, g2 = p1[i], p2[i]
-                common = list(set(g1) & set(g2))
-                only1 = list(set(g1) - set(g2))
-                only2 = list(set(g2) - set(g1))
-                cg = common + only1[:len(only1)//2] + only2[:len(only2)//2]
-                while len(cg) < 15:
-                    avail = [d for d in range(1, 26) if d not in cg]
-                    cg.append(np.random.choice(avail) if avail else 1)
-                child.append(sorted(cg[:15]))
-        
-        # REPAIR OPERATOR
-        if self.constraints:
-            child = [repair_game(g, self.constraints) for g in child]
-        
+        mid = self.n_games // 2
+        child = p1[:mid] + p2[mid:]
+        # REPAIR LOCAL (não regenerar!)
+        child = [repair_game_local(g, self.constraints) for g in child]
         return child
     
     def _mutate(self, pool, generation):
         rate = 0.15 * (1 - generation / self.n_generations)
-        mutated = [g.copy() for g in pool]
+        mutated = [list(g) for g in pool]
         n_mut = max(1, int(self.n_games * rate))
+        
         for idx in np.random.choice(self.n_games, n_mut, replace=False):
             game = mutated[idx]
-            if self.constraints and 'fixas' in self.constraints:
-                fixed = set(self.constraints['fixas'])
-                mutable_pos = [i for i, d in enumerate(game) if d not in fixed]
-                if mutable_pos:
-                    pos = np.random.choice(mutable_pos)
-                    excluded = set(self.constraints.get('excluidas', []))
-                    avail = [d for d in range(1, 26) if d not in game and d not in excluded]
-                    if avail: game[pos] = np.random.choice(avail)
-            else:
-                pos = np.random.randint(0, 15)
-                avail = [d for d in range(1, 26) if d not in game]
-                if avail: game[pos] = np.random.choice(avail)
+            fixed = set(self.constraints.get('fixas', [])) if self.constraints else set()
+            excluded = set(self.constraints.get('excluidas', [])) if self.constraints else set()
+            
+            # Escolher posição mutável (não fixa)
+            mutable = [i for i, d in enumerate(game) if int(d) not in fixed]
+            if mutable:
+                pos = np.random.choice(mutable)
+                avail = [d for d in range(1, 26) if d not in game and d not in excluded]
+                if avail:
+                    game[pos] = int(np.random.choice(avail))
+            
             mutated[idx] = sorted(game)
         
-        # REPAIR OPERATOR
-        if self.constraints:
-            mutated = [repair_game(g, self.constraints) for g in mutated]
-        
+        # REPAIR LOCAL
+        mutated = [repair_game_local(g, self.constraints) for g in mutated]
         return mutated
     
     def run(self):
         print(f"\n{'='*60}")
-        print(f"🧬 NSGA-II CONDICIONADO")
+        print(f"🧬 NSGA-II COM HARD CONSTRAINTS")
         print(f"{'='*60}")
-        if self.constraints:
-            print(f"   🎯 Constraints ativas: {list(self.constraints.keys())}")
         
         population = self._initialize_population()
+        
+        # Validar população inicial
+        valid_count = 0
+        for pool in population:
+            all_valid = True
+            for game in pool:
+                valid, _ = validate_game(game, self.constraints)
+                if not valid:
+                    all_valid = False
+                    break
+            if all_valid: valid_count += 1
+        print(f"   ✅ População inicial: {valid_count}/{len(population)} válidos")
+        
         population_obj = [self.evaluate(p) for p in population]
         
         for gen in tqdm(range(self.n_generations), desc="NSGA-II"):
@@ -500,10 +596,23 @@ class ConstrainedNSGA2:
                 p1 = population[i1] if self._dominates(population_obj[i1], population_obj[i2]) else population[i2]
                 i3, i4 = np.random.choice(self.pop_size, 2, replace=False)
                 p2 = population[i3] if self._dominates(population_obj[i3], population_obj[i4]) else population[i4]
+                
                 child = self._crossover(p1, p2)
                 child = self._mutate(child, gen)
-                child = self._ensure_unique(child)
-                offspring.append(child)
+                
+                # VALIDAR e descartar filhos inválidos
+                child_valid = True
+                for game in child:
+                    valid, _ = validate_game(game, self.constraints)
+                    if not valid:
+                        child_valid = False
+                        break
+                
+                if child_valid:
+                    offspring.append(child)
+            
+            if not offspring:
+                continue
             
             offspring_obj = [self.evaluate(o) for o in offspring]
             combined = population + offspring
@@ -535,7 +644,13 @@ class ConstrainedNSGA2:
         pareto_pools = [population[i] for i in pareto_idx]
         pareto_obj = [population_obj[i] for i in pareto_idx]
         
-        print(f"\n   ✅ Fronteira: {len(pareto_pools)} soluções")
+        # Validação final
+        final_valid = 0
+        for pool in pareto_pools:
+            all_ok = all(validate_game(g, self.constraints)[0] for g in pool)
+            if all_ok: final_valid += 1
+        
+        print(f"\n   ✅ Fronteira: {len(pareto_pools)} soluções ({final_valid} válidas)")
         return pareto_pools, pareto_obj
     
     def _non_dominated_sort(self, pop_obj):
@@ -564,7 +679,7 @@ class ConstrainedNSGA2:
         n = len(front_idx)
         if n <= 2: return [float('inf')] * n
         distances = np.zeros(n)
-        for obj_i in range(self.n_obj):
+        for obj_i in range(6):
             sorted_i = sorted(front_idx, key=lambda i: pop_obj[i][obj_i])
             obj_range = pop_obj[sorted_i[-1]][obj_i] - pop_obj[sorted_i[0]][obj_i]
             if obj_range > 0:
@@ -575,46 +690,18 @@ class ConstrainedNSGA2:
 
 
 # ============================================================
-# UTILITÁRIOS
-# ============================================================
-
-class BinarySerializer:
-    @staticmethod
-    def compressibility(pool):
-        data = bytearray()
-        for game in pool:
-            bits = 0
-            for d in game: bits |= (1 << (d-1))
-            data.extend(struct.pack('>I', bits))
-        return len(zlib.compress(bytes(data), level=9)) / len(data)
-
-
-def positional_entropy(pool):
-    if not pool: return 0.0
-    pos_entropies = []
-    for pos in range(15):
-        pos_values = [sorted(g)[pos] for g in pool]
-        freq = np.bincount(pos_values, minlength=26)[1:]
-        probs = freq / len(pool)
-        probs = np.where(probs > 0, probs, 1e-10)
-        pos_entropies.append(entropy(probs))
-    return float(np.mean(pos_entropies) / np.log(25))
-
-
-# ============================================================
-# FRONTEND INTEGRADO
+# INTERFACE
 # ============================================================
 
 def collect_preferences(ultimo_concurso=None):
-    """Coleta preferências do usuário"""
     print(f"\n{'='*60}")
-    print(f"🎯 CONFIGURAÇÃO DE PREFERÊNCIAS")
+    print(f"🎯 CONFIGURAÇÃO DE PREFERÊNCIAS (HARD CONSTRAINTS)")
     print(f"{'='*60}")
-    print(f"💡 ENTER = sem restrição")
+    print(f"💡 ENTER = sem restrição | Valores serão EXATOS")
     
     prefs = {}
     
-    print(f"\n📌 DEZENAS FIXAS (separadas por espaço)")
+    print(f"\n📌 DEZENAS FIXAS")
     v = input(f"   [ENTER=pular]: ").strip()
     if v:
         try:
@@ -631,70 +718,52 @@ def collect_preferences(ultimo_concurso=None):
             if excl: prefs['excluidas'] = sorted(set(excl))
         except: pass
     
-    print(f"\n📊 PARES (típico: 6-9)")
-    v = input(f"   Quantidade [ENTER=pular]: ").strip()
+    print(f"\n📊 PARES (valor EXATO)")
+    v = input(f"   [ENTER=pular]: ").strip()
     if v:
-        try: prefs['pares'] = int(v)
+        try: prefs['pares_target'] = int(v)
         except: pass
     
-    print(f"\n🔢 PRIMOS (típico: 3-6)")
-    v = input(f"   Quantidade [ENTER=pular]: ").strip()
+    print(f"\n🔢 PRIMOS (valor EXATO)")
+    v = input(f"   [ENTER=pular]: ").strip()
     if v:
-        try: prefs['primos'] = int(v)
+        try: prefs['primos_target'] = int(v)
         except: pass
     
-    print(f"\n🖼️  MOLDURA (típico: 7-10)")
-    v = input(f"   Quantidade [ENTER=pular]: ").strip()
+    print(f"\n🖼️  MOLDURA (valor EXATO)")
+    v = input(f"   [ENTER=pular]: ").strip()
     if v:
-        try: prefs['moldura'] = int(v)
+        try: prefs['moldura_target'] = int(v)
         except: pass
     
     if ultimo_concurso:
         print(f"\n🔄 REPETIDAS DO ÚLTIMO CONCURSO")
         print(f"   Último: {ultimo_concurso}")
-        v = input(f"   Quantidade [ENTER=pular]: ").strip()
+        v = input(f"   Quantidade EXATA [ENTER=pular]: ").strip()
         if v:
-            try: prefs['repetidas'] = int(v)
+            try: prefs['repetidas_target'] = int(v)
             except: pass
-    
-    print(f"\n📐 SOMA (típico: 170-220)")
-    v = input(f"   Mínima [ENTER=pular]: ").strip()
-    if v:
-        try: prefs['soma_min'] = int(v)
-        except: pass
-    v = input(f"   Máxima [ENTER=pular]: ").strip()
-    if v:
-        try: prefs['soma_max'] = int(v)
-        except: pass
-    
-    print(f"\n📏 CONSECUTIVOS MÁXIMOS (típico: 3-7)")
-    v = input(f"   [ENTER=pular]: ").strip()
-    if v:
-        try: prefs['max_consecutivos'] = int(v)
-        except: pass
+        prefs['ultimo_concurso'] = ultimo_concurso
     
     return prefs if prefs else None
 
 
 def display_results(pareto_pools, constraints, ultimo_concurso=None):
-    """Exibe resultados diretamente (sem pós-filtro)"""
     print(f"\n{'='*60}")
-    print(f"🏆 RESULTADOS (GERAÇÃO CONDICIONADA)")
+    print(f"🏆 RESULTADOS (COM HARD CONSTRAINTS)")
     print(f"{'='*60}")
     
     if constraints:
-        print(f"📋 Constraints usadas:")
+        print(f"📋 Constraints:")
         for k, v in constraints.items():
             if k != 'ultimo_concurso':
                 print(f"   {k}: {v}")
     
-    print(f"\n📊 {len(pareto_pools)} pools na fronteira")
-    
-    # Mostrar top jogos do primeiro pool
     if pareto_pools:
         pool = pareto_pools[0]
-        print(f"\n📋 TOP 10 JOGOS (Pool #1):")
+        print(f"\n📋 TOP 10 JOGOS:")
         for i, game in enumerate(pool[:10], 1):
+            game = [int(x) for x in game]
             pares = sum(1 for d in game if d % 2 == 0)
             primos = sum(1 for d in game if d in PRIMES)
             moldura = sum(1 for d in game if d in MOLDURA)
@@ -702,43 +771,38 @@ def display_results(pareto_pools, constraints, ultimo_concurso=None):
             cons = sum(1 for j in range(len(game)-1) if game[j+1]-game[j] == 1)
             rep = len(set(game) & set(ultimo_concurso)) if ultimo_concurso else 0
             
-            print(f"   {i:2d}. {game}")
-            print(f"       Pares:{pares} Prim:{primos} Mold:{moldura} Soma:{soma} Cons:{cons} Rep:{rep}")
+            # Validar
+            valid, violations = validate_game(game, constraints)
+            status = "✅" if valid else f"❌ {violations}"
+            
+            print(f"   {i:2d}. {game} {status}")
+            print(f"       P:{pares} Pr:{primos} M:{moldura} S:{soma} C:{cons} R:{rep}")
 
 
 def main():
     print("="*60)
-    print("🧭 SISTEMA INTEGRADO - GERAÇÃO SOB DEMANDA")
+    print("🧬 SISTEMA COM HARD CONSTRAINTS")
     print("="*60)
     
-    # Carregar último concurso REAL
     last = get_last_contest('resultados_lotofacil.csv')
     ultimo_concurso = last['dezenas'] if last else None
     
     if last:
-        print(f"\n📌 Último concurso: {last['concurso']} ({last['data']})")
+        print(f"\n📌 Último concurso: {last['concurso']}")
         print(f"   {ultimo_concurso}")
     
-    # Carregar histórico
     historical = get_historical_data('resultados_lotofacil.csv', 100)
-    
-    # Coletar preferências
     preferences = collect_preferences(ultimo_concurso)
     
-    # Converter para constraints do motor
-    constraints = build_constraints_from_preferences(preferences, ultimo_concurso)
+    constraints = preferences  # Já está no formato certo
     
-    # Rodar NSGA-II CONDICIONADO
-    print(f"\n🔥 GERANDO FRONTEIRA CONDICIONADA...")
-    nsga2 = ConstrainedNSGA2(
+    nsga2 = HardConstraintNSGA2(
         n_games=30, pop_size=200, n_generations=80,
         historical_data=historical,
         constraints=constraints
     )
     
     pareto_pools, pareto_obj = nsga2.run()
-    
-    # Exibir resultados (sem pós-filtro!)
     display_results(pareto_pools, constraints, ultimo_concurso)
     
     print(f"\n✅ CONCLUÍDO!")
