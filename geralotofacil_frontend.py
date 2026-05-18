@@ -69,7 +69,7 @@ def load_last_contest(csv_file='resultados_lotofacil.csv'):
             return None
         
         # Pegar última linha (último concurso)
-        last_line = lines[-1].strip()
+        last_line = lines[1].strip()
         parts = last_line.split(';')
         
         # Formato típico: concurso;data;b1;b2;...;b15
