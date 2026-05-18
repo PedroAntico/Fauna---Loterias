@@ -452,7 +452,7 @@ class PortfolioOptimizerV13:
 # BACKTEST REAL
 # ============================================================
 
-def run_backtest(contests, n_test=500, n_games=50):
+def run_backtest(contests, n_test=500, n_games=10):
     """
     Backtest REAL:
     - Para cada concurso nos últimos N
@@ -611,7 +611,9 @@ def main():
     
     if choice == "2":
         n_test = int(input(f"   Concursos a testar [300]: ").strip() or "300")
-        run_backtest(contests, n_test, n_games=50)
+        n_games = int(input(f"   Jogos por concurso [10]: ").strip() or "10")
+        
+        run_backtest(contests, n_test, n_games=n_games)
         return
     
     # Modo normal: gerar carteira
