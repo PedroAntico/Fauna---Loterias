@@ -320,7 +320,8 @@ class PortfolioOptimizerV13:
             sum(1 for x in d if x in MOLDURA),               # moldura
             len(set(d) & set(self.last_contest)) if self.last_contest else 8,
             sum(d) // 10,                                    # soma bucket
-            max_run                                           # max_run)
+            max_run                                           # max_run
+        )
     
     def _score_game(self, game, regime_target=None):
         score=0.0; d=sorted(game)
