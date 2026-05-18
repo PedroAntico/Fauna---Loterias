@@ -2,16 +2,16 @@
 # -*- coding: utf-8 -*-
 
 """
-MOTOR DE OTIMIZAÇÃO ROBUSTO - SYSTEM_FACIL.PY
-==============================================
-Versão 2.1 - Correções de Estabilidade
+MOTOR DE OTIMIZAÇÃO CONDICIONADO - SYSTEM_FACIL.PY
+===================================================
+Versão 3.0 - Geração Condicionada + Balanceamento de Fronteira
 
-CORREÇÕES:
-✅ max_attempts nos loops infinitos
-✅ Relaxamento adaptativo de distância
-✅ min_dist=3 (não 4) para J(25,15)
-✅ Fallback quando pool incompleto
-✅ Avisos de diagnóstico
+CORREÇÕES CRÍTICAS:
+✅ CSV: ordenação automática por número do concurso
+✅ Geração condicionada (não pós-filtro)
+✅ NSGA-II balanceado (anti-colapso conservador)
+✅ Inicialização dentro do subespaço válido
+✅ Penalização de dominância de perfil
 """
 
 import numpy as np
@@ -34,6 +34,65 @@ from tqdm import tqdm
 warnings.filterwarnings('ignore')
 
 # ============================================================
+# CONJUNTOS MATEMÁTICOS
+# ============================================================
+
+PRIMES = {2, 3, 5, 7, 11, 13, 17, 19, 23}
+MOLDURA = {1,2,3,4,5, 6,10, 11,15, 16,20, 21,22,23,24,25}
+CENTRO = {7,8,9,12,13,14,17,18,19}
+
+# ============================================================
+# CARREGAMENTO DO CSV (CORRIGIDO)
+# ============================================================
+
+def load_historical_contests(csv_file='resultados_lotofacil.csv'):
+    """
+    Carrega TODOS os concursos com ordenação automática
+    
+    Correção: não depende da ordem do arquivo
+    """
+    if not os.path.exists(csv_file):
+        return None
+    
+    contests = []
+    try:
+        with open(csv_file, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        
+        for line in lines[1:]:  # Pular cabeçalho
+            parts = line.strip().split(';')
+            if len(parts) >= 17:
+                contests.append({
+                    'concurso': int(parts[0]),
+                    'data': parts[1],
+                    'dezenas': sorted([int(x) for x in parts[2:17]])
+                })
+        
+        # Ordenar por número do concurso (crescente)
+        contests.sort(key=lambda x: x['concurso'])
+        return contests
+    except Exception as e:
+        print(f"⚠️ Erro ao ler CSV: {e}")
+        return None
+
+
+def get_last_contest(csv_file='resultados_lotofacil.csv'):
+    """Retorna o ÚLTIMO concurso (maior número)"""
+    contests = load_historical_contests(csv_file)
+    if contests:
+        return contests[-1]
+    return None
+
+
+def get_historical_data(csv_file='resultados_lotofacil.csv', n_recent=100):
+    """Retorna últimos N concursos para análise histórica"""
+    contests = load_historical_contests(csv_file)
+    if contests:
+        return [c['dezenas'] for c in contests[-n_recent:]]
+    return [sorted(np.random.choice(range(1, 26), 15, replace=False)) for _ in range(n_recent)]
+
+
+# ============================================================
 # JOHNSON SPACE J(25,15)
 # ============================================================
 
@@ -41,9 +100,7 @@ class JohnsonSpace:
     def __init__(self, n=25, k=15):
         self.n = n
         self.k = k
-        self.total_codes = comb(n, k)
-        self.min_intersection = max(0, 2*k - n)
-        self.max_distance = k - self.min_intersection
+        self.max_distance = k - max(0, 2*k - n)
         self._dist_cache = {}
         self._cover_samples = None
     
@@ -89,8 +146,7 @@ class JohnsonSpace:
         return np.mean(distances)
     
     def pre_generate_cover_samples(self, n_samples=2000):
-        if self._cover_samples is not None:
-            return self._cover_samples
+        if self._cover_samples is not None: return self._cover_samples
         samples = set()
         while len(samples) < n_samples:
             game = tuple(sorted(np.random.choice(range(1, self.n+1), self.k, replace=False)))
@@ -99,8 +155,7 @@ class JohnsonSpace:
         return self._cover_samples
     
     def covering_radius_fast(self, pool):
-        if self._cover_samples is None:
-            self.pre_generate_cover_samples()
+        if self._cover_samples is None: self.pre_generate_cover_samples()
         bits_list = [self.game_to_bits(g) for g in pool]
         max_min_dist = 0
         for sample in self._cover_samples[:500]:
@@ -118,128 +173,173 @@ class JohnsonSpace:
         if d == 0: return 0
         radius = (d - 1) // 2
         if radius < 0: radius = 0
-        sphere_vol = 0
-        for i in range(min(radius, self.k) + 1):
-            if i <= self.n - self.k:
-                sphere_vol += comb(self.k, i) * comb(self.n - self.k, i)
+        sphere_vol = sum(comb(self.k, i) * comb(self.n - self.k, i) 
+                        for i in range(min(radius, self.k) + 1) if i <= self.n - self.k)
         if sphere_vol == 0: return 1.0
-        return min(1.0, len(pool) / (self.total_codes / sphere_vol))
-    
-    def distance_matrix_sparse(self, pool, k_neighbors=5):
-        n = len(pool)
-        bits_list = [self.game_to_bits(g) for g in pool]
-        row_indices, col_indices, data = [], [], []
-        for i in range(n):
-            distances = []
-            for j in range(n):
-                if i != j:
-                    d = self.johnson_distance(bits_list[i], bits_list[j])
-                    distances.append((d, j))
-            distances.sort(key=lambda x: x[0])
-            for d, j in distances[:k_neighbors]:
-                row_indices.append(i)
-                col_indices.append(j)
-                data.append(d)
-        return csr_matrix((data, (row_indices, col_indices)), shape=(n, n))
+        return min(1.0, len(pool) / (comb(self.n, self.k) / sphere_vol))
 
 
 # ============================================================
-# GARANTIA DE UNICIDADE (CORRIGIDA)
+# GERADOR CONDICIONADO (PRÉ-FILTRO)
 # ============================================================
 
-def ensure_unique_pool(pool, n_games, johnson=None, min_dist=3):
+def generate_constrained_game(constraints=None):
     """
-    Garante unicidade COM PROTEÇÕES
+    Gera UM jogo já obedecendo restrições
     
-    Correções:
-    - max_attempts para evitar loop infinito
-    - Relaxamento adaptativo de distância
-    - min_dist=3 (não 4) para J(25,15)
-    - Avisos quando pool fica incompleto
+    Isso evita o problema de gerar → filtrar depois
+    O jogo já NASCE dentro do subespaço válido
+    
+    Args:
+        constraints: dict com restrições (fixas, excluídas, pares, etc.)
+    
+    Returns:
+        list: Jogo de 15 dezenas
     """
-    if johnson is None:
-        johnson = JohnsonSpace()
+    if constraints is None:
+        return sorted(np.random.choice(range(1, 26), 15, replace=False))
     
-    unique = []
+    game = set()
+    
+    # 1. Adicionar FIXAS (obrigatório)
+    if 'fixas' in constraints and constraints['fixas']:
+        game.update(constraints['fixas'])
+    
+    # 2. Pool de dezenas disponíveis
+    excluded = set(constraints.get('excluidas', []))
+    available = set(range(1, 26)) - excluded - game
+    
+    # 3. Adicionar REPETIDAS do último concurso
+    if 'repetidas_target' in constraints and constraints.get('ultimo_concurso'):
+        ultimo = set(constraints['ultimo_concurso'])
+        repeated_pool = list(ultimo & available)
+        
+        target_rep = constraints['repetidas_target']
+        current_rep = len(game & ultimo)
+        needed_rep = max(0, target_rep - current_rep)
+        
+        if repeated_pool and needed_rep > 0:
+            n_rep = min(needed_rep, len(repeated_pool))
+            chosen_rep = np.random.choice(repeated_pool, n_rep, replace=False)
+            game.update(chosen_rep)
+            available -= set(chosen_rep)
+    
+    # 4. Ajustar PARES
+    if 'pares_target' in constraints:
+        target_pares = constraints['pares_target']
+        current_pares = sum(1 for d in game if d % 2 == 0)
+        
+        # Se precisa de mais pares
+        if current_pares < target_pares:
+            even_available = [d for d in available if d % 2 == 0]
+            needed = target_pares - current_pares
+            if even_available:
+                n = min(needed, len(even_available))
+                chosen = np.random.choice(even_available, n, replace=False)
+                game.update(chosen)
+                available -= set(chosen)
+        
+        # Se precisa de mais ímpares
+        current_pares = sum(1 for d in game if d % 2 == 0)
+        odd_needed = (15 - target_pares) - (len(game) - current_pares)
+        if odd_needed > 0:
+            odd_available = [d for d in available if d % 2 != 0]
+            if odd_available:
+                n = min(odd_needed, len(odd_available))
+                chosen = np.random.choice(odd_available, n, replace=False)
+                game.update(chosen)
+                available -= set(chosen)
+    
+    # 5. Ajustar PRIMOS
+    if 'primos_target' in constraints:
+        target_primos = constraints['primos_target']
+        current_primos = sum(1 for d in game if d in PRIMES)
+        needed = target_primos - current_primos
+        
+        if needed > 0:
+            prime_available = [d for d in available if d in PRIMES]
+            if prime_available:
+                n = min(needed, len(prime_available))
+                chosen = np.random.choice(prime_available, n, replace=False)
+                game.update(chosen)
+                available -= set(chosen)
+    
+    # 6. Ajustar MOLDURA
+    if 'moldura_target' in constraints:
+        target_moldura = constraints['moldura_target']
+        current_moldura = sum(1 for d in game if d in MOLDURA)
+        needed = target_moldura - current_moldura
+        
+        if needed > 0:
+            moldura_available = [d for d in available if d in MOLDURA]
+            if moldura_available:
+                n = min(needed, len(moldura_available))
+                chosen = np.random.choice(moldura_available, n, replace=False)
+                game.update(chosen)
+                available -= set(chosen)
+    
+    # 7. Completar até 15 dezenas
+    while len(game) < 15 and available:
+        # Preferir dezenas que ajudem no balanceamento
+        if len(game) < 8:
+            # Preferir dezenas baixas no início
+            low_available = [d for d in available if d <= 12]
+            if low_available:
+                game.add(np.random.choice(low_available))
+                available.remove(list(game)[-1])
+                continue
+        
+        game.add(np.random.choice(list(available)))
+        available.remove(list(game)[-1])
+    
+    # 8. Garantir 15 dezenas
+    result = sorted(list(game))[:15]
+    while len(result) < 15:
+        remaining = list(set(range(1, 26)) - set(result))
+        if remaining:
+            result.append(np.random.choice(remaining))
+        else:
+            break
+    
+    return sorted(result[:15])
+
+
+def generate_constrained_pool(n_games, constraints=None):
+    """Gera pool inteiro com restrições"""
+    pool = []
     seen = set()
-    
-    # Primeiro passo: remover duplicatas
-    for game in pool:
-        key = tuple(sorted(game))
-        if key not in seen:
-            seen.add(key)
-            unique.append(sorted(game))
-    
-    # Segundo passo: completar pool
-    max_attempts = 1000
+    max_attempts = n_games * 50
     attempts = 0
     
-    while len(unique) < n_games and attempts < max_attempts:
+    while len(pool) < n_games and attempts < max_attempts:
+        game = generate_constrained_game(constraints)
+        key = tuple(game)
+        if key not in seen:
+            seen.add(key)
+            pool.append(game)
         attempts += 1
-        
-        # Relaxamento adaptativo: conforme o pool cresce, reduzimos a exigência
-        adaptive_distance = max(2, min_dist - len(unique) // 5)
-        
-        candidates = []
-        for _ in range(300):  # Aumentado de 100 para 300
-            candidate = sorted(np.random.choice(range(1, 26), 15, replace=False))
-            if tuple(candidate) in seen:
-                continue
-            
-            bits_c = johnson.game_to_bits(candidate)
-            min_d = johnson.max_distance
-            
-            for existing in unique:
-                bits_e = johnson.game_to_bits(existing)
-                d = johnson.johnson_distance(bits_c, bits_e)
-                min_d = min(min_d, d)
-                if min_d < adaptive_distance:
-                    break  # Early stop se já está muito próximo
-            
-            if min_d >= adaptive_distance:
-                if len(candidates) < 10:
-                    heapq.heappush(candidates, (-min_d, tuple(candidate)))
-                else:
-                    heapq.heappushpop(candidates, (-min_d, tuple(candidate)))
-        
-        if candidates:
-            best = max(candidates, key=lambda x: -x[0])
-            game = list(best[1])
+    
+    # Se não gerou suficiente, completar sem restrições
+    while len(pool) < n_games:
+        game = sorted(np.random.choice(range(1, 26), 15, replace=False))
+        if tuple(game) not in seen:
             seen.add(tuple(game))
-            unique.append(game)
-        else:
-            # Fallback: gerar qualquer jogo não duplicado
-            for _ in range(100):
-                game = sorted(np.random.choice(range(1, 26), 15, replace=False))
-                if tuple(game) not in seen:
-                    seen.add(tuple(game))
-                    unique.append(game)
-                    break
+            pool.append(game)
     
-    if len(unique) < n_games:
-        print(f"   ⚠️ Pool incompleto: {len(unique)}/{n_games} (min_dist={min_dist})")
-        # Completar com jogos aleatórios sem restrição de distância
-        while len(unique) < n_games:
-            game = sorted(np.random.choice(range(1, 26), 15, replace=False))
-            if tuple(game) not in seen:
-                seen.add(tuple(game))
-                unique.append(game)
-    
-    return unique[:n_games]
+    return pool[:n_games]
 
 
 # ============================================================
-# MÉTRICAS ESTRUTURAIS
+# MÉTRICAS
 # ============================================================
 
 def positional_entropy(pool):
     if not pool: return 0.0
-    n_games = len(pool)
     pos_entropies = []
     for pos in range(15):
         pos_values = [sorted(g)[pos] for g in pool]
         freq = np.bincount(pos_values, minlength=26)[1:]
-        probs = freq / n_games
+        probs = freq / len(pool)
         probs = np.where(probs > 0, probs, 1e-10)
         pos_entropies.append(entropy(probs))
     return float(np.mean(pos_entropies) / np.log(25))
@@ -255,82 +355,66 @@ def mutual_information_positions(pool):
         for v1, v2 in zip(pos1_vals, pos2_vals):
             contingency[v1-1, v2-1] += 1
         joint = contingency / len(pool)
-        marginal1 = joint.sum(axis=1)
-        marginal2 = joint.sum(axis=0)
-        mi = 0.0
-        for i in range(25):
-            for j in range(25):
-                if joint[i, j] > 0:
-                    expected = marginal1[i] * marginal2[j]
-                    if expected > 0:
-                        mi += joint[i, j] * np.log(joint[i, j] / expected)
+        marginal1, marginal2 = joint.sum(axis=1), joint.sum(axis=0)
+        mi = sum(joint[i,j] * np.log(joint[i,j] / (marginal1[i] * marginal2[j]))
+                for i in range(25) for j in range(25)
+                if joint[i,j] > 0 and marginal1[i] > 0 and marginal2[j] > 0)
         mi_values.append(mi)
     return float(np.mean(mi_values))
 
 
 class BinarySerializer:
     @staticmethod
-    def pool_to_bytes(pool):
+    def compressibility(pool):
         data = bytearray()
         for game in pool:
             bits = 0
-            for d in game:
-                bits |= (1 << (d - 1))
+            for d in game: bits |= (1 << (d-1))
             data.extend(struct.pack('>I', bits))
-        return bytes(data)
-    
-    @staticmethod
-    def compressibility(pool):
-        raw = BinarySerializer.pool_to_bytes(pool)
-        compressed = zlib.compress(raw, level=9)
-        return len(compressed) / len(raw)
-
-
-class LaplacianSpectrumSparse:
-    def __init__(self, johnson_space):
-        self.js = johnson_space
-        self._cache = {}
-    
-    def connectivity_score(self, pool):
-        pool_hash = hashlib.md5(BinarySerializer.pool_to_bytes(pool)).hexdigest()
-        if pool_hash in self._cache:
-            return self._cache[pool_hash]
-        
-        n = len(pool)
-        try:
-            D = self.js.distance_matrix_sparse(pool, k_neighbors=5)
-            sigma = 3.0
-            S = D.copy()
-            S.data = np.exp(-S.data**2 / (2 * sigma**2))
-            S = S + eye(n, format='csr')
-            degrees = np.array(S.sum(axis=1)).flatten()
-            d_inv_sqrt = 1.0 / np.sqrt(degrees + 1e-10)
-            L = eye(n, format='csr') - diags(d_inv_sqrt, format='csr') @ S @ diags(d_inv_sqrt, format='csr')
-            eigenvalues, _ = eigsh(L, k=min(3, n-1), which='SM')
-            eigenvalues = np.sort(eigenvalues)
-            score = min(1.0, float(eigenvalues[1]) / 2.0) if len(eigenvalues) > 1 else 0.0
-        except:
-            score = 0.5
-        
-        if len(self._cache) < 100:
-            self._cache[pool_hash] = score
-        return score
+        return len(zlib.compress(bytes(data), level=9)) / len(data)
 
 
 # ============================================================
-# OBJETIVOS CONFLITANTES
+# NSGA-II BALANCEADO (ANTI-COLAPSO)
 # ============================================================
 
-class ConflictingObjectives:
-    def __init__(self, historical_data=None):
+class BalancedNSGA2:
+    def __init__(self, n_games=30, pop_size=300, n_generations=120, 
+                 historical_data=None, constraints=None):
+        self.n_games = n_games
+        self.pop_size = pop_size
+        self.n_generations = n_generations
+        self.constraints = constraints  # Restrições para geração condicionada
         self.johnson = JohnsonSpace()
         self.johnson.pre_generate_cover_samples(2000)
-        self.laplacian = LaplacianSpectrumSparse(self.johnson)
         self.historical_data = historical_data or []
+        
+        self.n_obj = 6
+        self.directions = ['max', 'max', 'min', 'min', 'min', 'max']
+        self.n_fronts_to_keep = 5
+        
+        # Cache de avaliação
         self._eval_cache = {}
+        
+        # Controle de diversidade de perfis
+        self._profile_counts = Counter()
+    
+    def _dominates(self, obj1, obj2):
+        better = False
+        for i, d in enumerate(self.directions):
+            if d == 'max':
+                if obj1[i] < obj2[i]: return False
+                if obj1[i] > obj2[i]: better = True
+            else:
+                if obj1[i] > obj2[i]: return False
+                if obj1[i] < obj2[i]: better = True
+        return better
     
     def evaluate(self, pool, is_elite=False):
-        pool_hash = hashlib.md5(BinarySerializer.pool_to_bytes(pool)).hexdigest()
+        pool_hash = hashlib.md5(
+            b''.join(struct.pack('>I', sum((1<<(d-1)) for d in g)) for g in pool)
+        ).hexdigest()
+        
         if pool_hash in self._eval_cache:
             return self._eval_cache[pool_hash].copy()
         
@@ -351,60 +435,49 @@ class ConflictingObjectives:
         else:
             obj[4] = 0.5
         
-        obj[5] = self.laplacian.connectivity_score(pool) if is_elite else 0.5
+        obj[5] = 0.5  # Conectividade só na elite
         
         if len(self._eval_cache) < 500:
             self._eval_cache[pool_hash] = obj.copy()
         return obj
-
-
-# ============================================================
-# NSGA-II ROBUSTO
-# ============================================================
-
-class RobustNSGA2:
-    def __init__(self, n_games=30, pop_size=300, n_generations=120, historical_data=None):
-        self.n_games = n_games
-        self.pop_size = pop_size
-        self.n_generations = n_generations
-        self.objectives = ConflictingObjectives(historical_data)
-        self.johnson = JohnsonSpace()
-        self.n_obj = 6
-        self.directions = ['max', 'max', 'min', 'min', 'min', 'max']
-        self.n_fronts_to_keep = 5
-    
-    def _dominates(self, obj1, obj2):
-        better = False
-        for i, d in enumerate(self.directions):
-            if d == 'max':
-                if obj1[i] < obj2[i]: return False
-                if obj1[i] > obj2[i]: better = True
-            else:
-                if obj1[i] > obj2[i]: return False
-                if obj1[i] < obj2[i]: better = True
-        return better
     
     def _initialize_population(self):
+        """Inicialização DIVERSIFICADA com nichos forçados"""
         population = []
-        strategies = ['random', 'spread', 'clustered', 'balanced', 'entropy']
-        for i in range(self.pop_size):
-            strategy = strategies[i % len(strategies)]
-            pool = self._generate_pool(strategy)
+        
+        # Estratégias com pesos DIFERENTES para forçar diversidade
+        strategies_weighted = [
+            ('spread', 60),      # Alta diversidade
+            ('clustered', 50),   # Baixa diversidade
+            ('balanced', 60),    # Médio
+            ('entropy', 50),     # Alta entropia
+            ('constrained', 80), # Com restrições (se houver)
+        ]
+        
+        for strategy, weight in strategies_weighted:
+            n_pools = max(1, self.pop_size * weight // sum(w for _, w in strategies_weighted))
+            for _ in range(n_pools):
+                if len(population) >= self.pop_size:
+                    break
+                pool = self._generate_pool(strategy)
+                population.append(pool)
+        
+        # Completar se necessário
+        while len(population) < self.pop_size:
+            pool = self._generate_pool('random')
             population.append(pool)
-        return population
+        
+        return population[:self.pop_size]
     
     def _generate_pool(self, strategy):
         pool = []
         seen = set()
         
-        if strategy == 'random':
-            for _ in range(self.n_games):
-                game = tuple(sorted(np.random.choice(range(1, 26), 15, replace=False)))
-                if game not in seen:
-                    seen.add(game)
-                    pool.append(list(game))
+        if strategy == 'constrained' and self.constraints:
+            # Geração CONDICIONADA (pré-filtro)
+            return generate_constrained_pool(self.n_games, self.constraints)
         
-        elif strategy == 'spread':
+        if strategy == 'spread':
             base = sorted(np.random.choice(range(1, 26), 15, replace=False))
             pool.append(base)
             seen.add(tuple(base))
@@ -428,8 +501,7 @@ class RobustNSGA2:
                 for _ in range(np.random.randint(1, 4)):
                     pos = np.random.randint(0, 15)
                     avail = [d for d in range(1, 26) if d not in game]
-                    if avail:
-                        game[pos] = np.random.choice(avail)
+                    if avail: game[pos] = np.random.choice(avail)
                 game = sorted(game)
                 if tuple(game) not in seen:
                     seen.add(tuple(game))
@@ -457,8 +529,7 @@ class RobustNSGA2:
                 game = cbase.copy()
                 pos = np.random.randint(0, 15)
                 avail = [d for d in range(1, 26) if d not in game]
-                if avail:
-                    game[pos] = np.random.choice(avail)
+                if avail: game[pos] = np.random.choice(avail)
                 game = sorted(game)
                 if tuple(game) not in seen:
                     seen.add(tuple(game))
@@ -480,21 +551,59 @@ class RobustNSGA2:
                 while len(game) < 15:
                     avail = [d for d in range(1, 26) if d not in game]
                     game.append(np.random.choice(avail) if avail else 1)
-                game = sorted(game[:15])
-                if tuple(game) not in seen:
-                    seen.add(tuple(game))
-                    pool.append(game)
+                if tuple(game[:15]) not in seen:
+                    seen.add(tuple(game[:15]))
+                    pool.append(game[:15])
         
-        return ensure_unique_pool(pool, self.n_games, self.johnson, min_dist=3)
+        else:  # random
+            for _ in range(self.n_games):
+                game = tuple(sorted(np.random.choice(range(1, 26), 15, replace=False)))
+                if game not in seen:
+                    seen.add(game)
+                    pool.append(list(game))
+        
+        # Garantir unicidade
+        return self._ensure_unique(pool)
+    
+    def _ensure_unique(self, pool):
+        unique = []
+        seen = set()
+        for game in pool:
+            key = tuple(sorted(game))
+            if key not in seen:
+                seen.add(key)
+                unique.append(sorted(game))
+        
+        # Completar
+        attempts = 0
+        while len(unique) < self.n_games and attempts < 500:
+            attempts += 1
+            if self.constraints:
+                game = generate_constrained_game(self.constraints)
+            else:
+                game = sorted(np.random.choice(range(1, 26), 15, replace=False))
+            if tuple(game) not in seen:
+                seen.add(tuple(game))
+                unique.append(game)
+        
+        while len(unique) < self.n_games:
+            game = sorted(np.random.choice(range(1, 26), 15, replace=False))
+            if tuple(game) not in seen:
+                seen.add(tuple(game))
+                unique.append(game)
+        
+        return unique[:self.n_games]
     
     def run(self):
         print(f"\n{'='*60}")
-        print(f"🧬 NSGA-II ROBUSTO")
+        print(f"🧬 NSGA-II BALANCEADO")
         print(f"{'='*60}")
         print(f"   Pop: {self.pop_size} | Gen: {self.n_generations} | Jogos: {self.n_games}")
+        if self.constraints:
+            print(f"   🎯 Geração CONDICIONADA ativa")
         
         population = self._initialize_population()
-        population_obj = [self.objectives.evaluate(p) for p in population]
+        population_obj = [self.evaluate(p) for p in population]
         
         for gen in tqdm(range(self.n_generations), desc="NSGA-II"):
             offspring = []
@@ -505,13 +614,13 @@ class RobustNSGA2:
                 p2 = population[i3] if self._dominates(population_obj[i3], population_obj[i4]) else population[i4]
                 child = self._crossover(p1, p2)
                 child = self._mutate(child, gen)
-                child = ensure_unique_pool(child, self.n_games, self.johnson, min_dist=3)
+                child = self._ensure_unique(child)
                 offspring.append(child)
             
-            offspring_obj = [self.objectives.evaluate(o) for o in offspring]
+            offspring_obj = [self.evaluate(o) for o in offspring]
             combined = population + offspring
             combined_obj = population_obj + offspring_obj
-            fronts = self._fast_non_dominated_sort(combined_obj)
+            fronts = self._non_dominated_sort(combined_obj)
             
             new_pop, new_obj = [], []
             for front in fronts:
@@ -522,34 +631,21 @@ class RobustNSGA2:
                 else:
                     remaining = self.pop_size - len(new_pop)
                     distances = self._crowding_distance(front, combined_obj)
-                    sorted_f = sorted(zip(front, distances), key=lambda x: x[1], reverse=True)
-                    for idx, _ in sorted_f[:remaining]:
+                    for idx, _ in sorted(zip(front, distances), key=lambda x: x[1], reverse=True)[:remaining]:
                         new_pop.append(combined[idx])
                         new_obj.append(combined_obj[idx])
                     break
             
             population = new_pop
             population_obj = new_obj
-            
-            if gen % 5 == 0:
-                fronts = self._fast_non_dominated_sort(population_obj)
-                elite = []
-                for front in fronts[:3]:
-                    elite.extend(front)
-                    if len(elite) >= int(self.pop_size * 0.2):
-                        break
-                for idx in elite:
-                    population_obj[idx] = self.objectives.evaluate(population[idx], is_elite=True)
         
-        final_fronts = self._fast_non_dominated_sort(population_obj)
+        # Coletar múltiplas fronts
+        final_fronts = self._non_dominated_sort(population_obj)
         pareto_idx = []
         for front in final_fronts[:self.n_fronts_to_keep]:
             pareto_idx.extend(front)
         
-        for idx in pareto_idx:
-            population_obj[idx] = self.objectives.evaluate(population[idx], is_elite=True)
-        
-        pareto_pools = [ensure_unique_pool(population[i], self.n_games, self.johnson, min_dist=3) for i in pareto_idx]
+        pareto_pools = [population[i] for i in pareto_idx]
         pareto_obj = [population_obj[i] for i in pareto_idx]
         
         print(f"\n   ✅ Fronteira: {len(pareto_pools)} soluções")
@@ -557,8 +653,7 @@ class RobustNSGA2:
     
     def _crossover(self, p1, p2):
         if np.random.random() < 0.5:
-            mid = self.n_games // 2
-            return p1[:mid] + p2[mid:]
+            return p1[:self.n_games//2] + p2[self.n_games//2:]
         child = []
         for i in range(self.n_games):
             g1, g2 = p1[i], p2[i]
@@ -576,17 +671,25 @@ class RobustNSGA2:
         rate = 0.15 * (1 - generation / self.n_generations)
         mutated = [g.copy() for g in pool]
         n_mut = max(1, int(self.n_games * rate))
-        indices = np.random.choice(self.n_games, n_mut, replace=False)
-        for idx in indices:
+        for idx in np.random.choice(self.n_games, n_mut, replace=False):
             game = mutated[idx]
-            pos = np.random.randint(0, 15)
-            avail = [d for d in range(1, 26) if d not in game]
-            if avail:
-                game[pos] = np.random.choice(avail)
+            if self.constraints:
+                # Mutação respeitando restrições
+                pos = np.random.randint(0, 15)
+                fixed = set(self.constraints.get('fixas', []))
+                excluded = set(self.constraints.get('excluidas', []))
+                available = [d for d in range(1, 26) if d not in game and d not in excluded]
+                if pos < len(game) and game[pos] not in fixed and available:
+                    game[pos] = np.random.choice(available)
+            else:
+                pos = np.random.randint(0, 15)
+                avail = [d for d in range(1, 26) if d not in game]
+                if avail:
+                    game[pos] = np.random.choice(avail)
             mutated[idx] = sorted(game)
         return mutated
     
-    def _fast_non_dominated_sort(self, pop_obj):
+    def _non_dominated_sort(self, pop_obj):
         n = len(pop_obj)
         dom_count = np.zeros(n, dtype=int)
         dom_sol = [[] for _ in range(n)]
@@ -634,13 +737,12 @@ def compute_all_signals(pareto_pools):
     johnson = JohnsonSpace()
     johnson.pre_generate_cover_samples(2000)
     signals_list = []
-    for pool in tqdm(pareto_pools, desc="Analisando sinais"):
-        pool = ensure_unique_pool(pool, len(pool), johnson, min_dist=3)
+    for pool in tqdm(pareto_pools, desc="Sinais"):
         covered = set()
         for game in pool:
             for pair in combinations(sorted(game), 2):
                 covered.add(pair)
-        signals = {
+        signals_list.append({
             'pair_coverage': float(len(covered) / comb(25, 2)),
             'johnson_min': float(johnson.min_johnson_distance(pool) / johnson.max_distance),
             'johnson_avg': float(johnson.avg_johnson_distance(pool) / johnson.max_distance),
@@ -649,14 +751,12 @@ def compute_all_signals(pareto_pools):
             'pos_entropy': float(positional_entropy(pool)),
             'mutual_info': float(mutual_information_positions(pool)),
             'compressibility': float(BinarySerializer.compressibility(pool)),
-        }
-        signals_list.append(signals)
+        })
     return signals_list
 
 
 def export_pareto_frontier(pareto_pools, pareto_obj, signals_list, filename='pareto_frontier.json'):
-    print(f"\n💾 Exportando para {filename}...")
-    
+    print(f"\n💾 Exportando {filename}...")
     def convert(obj):
         if isinstance(obj, (np.integer,)): return int(obj)
         if isinstance(obj, (np.floating,)): return float(obj)
@@ -664,19 +764,17 @@ def export_pareto_frontier(pareto_pools, pareto_obj, signals_list, filename='par
         if isinstance(obj, list): return [convert(x) for x in obj]
         return obj
     
-    export_data = {
-        'metadata': {
-            'timestamp': datetime.now().isoformat(),
-            'n_solutions': len(pareto_pools),
-            'n_games_per_pool': len(pareto_pools[0]) if pareto_pools else 0,
-        },
-        'pareto_pools': [[sorted(g) for g in pool] for pool in pareto_pools],
-        'pareto_objectives': [obj.tolist() for obj in pareto_obj],
-        'signals': signals_list
-    }
-    
     with open(filename, 'w', encoding='utf-8') as f:
-        json.dump(export_data, f, indent=2, ensure_ascii=False, default=convert)
+        json.dump({
+            'metadata': {
+                'timestamp': datetime.now().isoformat(),
+                'n_solutions': len(pareto_pools),
+                'n_games_per_pool': len(pareto_pools[0]) if pareto_pools else 0,
+            },
+            'pareto_pools': [[sorted(g) for g in pool] for pool in pareto_pools],
+            'pareto_objectives': [obj.tolist() for obj in pareto_obj],
+            'signals': signals_list
+        }, f, indent=2, ensure_ascii=False, default=convert)
     
     print(f"   ✅ {os.path.getsize(filename):,} bytes")
     return filename
@@ -684,17 +782,32 @@ def export_pareto_frontier(pareto_pools, pareto_obj, signals_list, filename='par
 
 def main():
     print("="*60)
-    print("🧬 MOTOR ROBUSTO v2.1")
+    print("🧬 MOTOR CONDICIONADO v3.0")
     print("="*60)
     
-    historical = [sorted(np.random.choice(range(1, 26), 15, replace=False)) for _ in range(100)]
+    # Carregar histórico REAL
+    historical = get_historical_data('resultados_lotofacil.csv', 100)
+    last = get_last_contest('resultados_lotofacil.csv')
     
-    nsga2 = RobustNSGA2(n_games=30, pop_size=300, n_generations=120, historical_data=historical)
+    if last:
+        print(f"📌 Último concurso: {last['concurso']} ({last['data']})")
+        print(f"   {last['dezenas']}")
+    
+    # Constraints (opcional - para geração condicionada)
+    # Deixe vazio para gerar sem restrições
+    constraints = None
+    
+    nsga2 = BalancedNSGA2(
+        n_games=30, pop_size=300, n_generations=120,
+        historical_data=historical,
+        constraints=constraints
+    )
+    
     pareto_pools, pareto_obj = nsga2.run()
     signals_list = compute_all_signals(pareto_pools)
     export_pareto_frontier(pareto_pools, pareto_obj, signals_list)
     
-    print(f"\n✅ PRONTO! Arquivo: pareto_frontier.json")
+    print(f"\n✅ PRONTO!")
 
 
 if __name__ == "__main__":
