@@ -331,7 +331,7 @@ class PortfolioOptimizerV13:
         
         # 2. Anti-recência (reversão à média)
         if self.anti_momentum:
-            score += sum(self.anti_momentum.get(x,0) for x in game) * 1.5
+            score += sum(self.anti_momentum.get(x,0) for x in game) * 4
         
         # 3. Diversidade espacial
         score += len(set((x-1)//5 for x in game)) * 5
@@ -502,7 +502,7 @@ def run_backtest(contests, n_test=500, n_games=50):
             mh,sh=np.mean(all_f),np.std(all_f)+1e-10
             for d in range(1,26):
                 momentum[d]=(fr.get(d,0)/len(recent)-mh)/sh
-                anti_momentum[d]=-momentum[d]*0.5
+                anti_momentum[d]=-momentum[d]*0.3
         
         # Gerar jogos com estratégia
         opt = PortfolioOptimizerV13(
