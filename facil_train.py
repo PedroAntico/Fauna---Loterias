@@ -2,17 +2,16 @@
 # -*- coding: utf-8 -*-
 
 """
-SISTEMA PROBABILÍSTICO ESTRUTURAL - VERSÃO FINAL CORRIGIDA
+SISTEMA PROBABILÍSTICO ESTRUTURAL - VERSÃO CORRIGIDA FINAL
 ===========================================================
-Versão 10.0 - MCTS + Markov Corrigido + Safe Digitize
+Versão 11.0 - MultiOutput Corrigido + Transições Raras
 
-CORREÇÕES CRÍTICAS:
-✅ safe_digitize() com clamp (nunca -1)
-✅ Markov: encode ANTES de criar matriz
-✅ Markov: transições reconstruídas corretamente
-✅ MCTS substitui beam search (exploração + explotação)
-✅ Penalidade de similaridade no MCTS
-✅ Z-score temporal para momentum
+CORREÇÕES:
+✅ predict_proba: float(probas[i][0][cls]) - indexing correto
+✅ Repetidas: compara com último concurso REAL
+✅ Detecção de transições estruturais raras
+✅ Reversão extrema, persistência anormal
+✅ Score com último concurso real
 """
 
 import numpy as np
@@ -58,24 +57,13 @@ QUADRANTES = {
 }
 
 # ============================================================
-# SAFE DIGITIZE (CORRIGIDO)
+# SAFE DIGITIZE
 # ============================================================
 
 def safe_digitize(value, bins, max_class):
-    """
-    Digitize SEGURO que nunca retorna -1
-    
-    Args:
-        value: Valor a classificar
-        bins: Lista de thresholds
-        max_class: Classe máxima permitida
-    
-    Returns:
-        int: Classe entre 0 e max_class
-    """
+    """Digitize seguro que nunca retorna -1"""
     cls = np.digitize([value], bins)[0] - 1
-    cls = max(0, min(max_class, cls))
-    return cls
+    return max(0, min(max_class, cls))
 
 
 # ============================================================
@@ -103,15 +91,11 @@ def load_all_contests(csv_file='resultados_lotofacil.csv'):
 
 
 # ============================================================
-# MARKOV STATE ENCODER (CORRIGIDO)
+# MARKOV STATE ENCODER
 # ============================================================
 
 class MarkovStateEncoder:
-    """
-    Codifica estado estrutural em ID discreto
-    
-    CORRIGIDO: encode ANTES de criar matriz
-    """
+    """Codifica estado estrutural em ID discreto"""
     
     def __init__(self):
         self.state_to_id = {}
@@ -120,7 +104,6 @@ class MarkovStateEncoder:
         self.state_list = []
     
     def encode(self, pares, primos, moldura, repetidas):
-        """Codifica features em ID de estado"""
         faixa_pares = min(4, max(0, pares - 5))
         faixa_primos = min(3, max(0, primos - 2))
         faixa_moldura = min(4, max(0, moldura - 6))
@@ -141,19 +124,11 @@ class MarkovStateEncoder:
         return self.state_to_id[state_key]
     
     def build_transition_matrix(self, contests):
-        """
-        Constrói matriz de transição Markoviana
-        
-        CORRIGIDO: 
-        1. Primeiro gera TODOS os estados
-        2. Depois cria matriz
-        3. Depois preenche transições
-        """
+        """Constrói matriz de transição Markoviana"""
         print(f"📊 Construindo matriz Markoviana...")
         
         # PASSO 1: Gerar todos os estados
         self.state_list = []
-        
         for i in range(1, len(contests)):
             c = contests[i]
             d = c['dezenas']
@@ -167,7 +142,7 @@ class MarkovStateEncoder:
             state_id = self.encode(pares, primos, moldura, repetidas)
             self.state_list.append(state_id)
         
-        # PASSO 2: Criar matriz (AGORA temos estados)
+        # PASSO 2: Criar matriz
         n_states = len(self.state_to_id)
         print(f"   ✅ {n_states} estados Markovianos")
         
@@ -190,7 +165,6 @@ class MarkovStateEncoder:
         print(f"   ✅ Matriz {n_states}x{n_states} construída")
     
     def get_transition_probs(self, current_state_id):
-        """Probabilidades de transição"""
         if self.transition_matrix is None:
             return None
         if current_state_id >= len(self.transition_matrix):
@@ -198,17 +172,41 @@ class MarkovStateEncoder:
         return self.transition_matrix[current_state_id]
     
     def get_top_next_states(self, current_state_id, top_k=3):
-        """Estados mais prováveis"""
+        probs = self.get_transition_probs(current_state_id)
+        if probs is None:
+            return []
+        indices = np.argsort(probs)[-top_k:][::-1]
+        return [(int(idx), float(probs[idx])) for idx in indices if probs[idx] > 0]
+    
+    def detect_rare_transitions(self, current_state_id, threshold=0.05):
+        """
+        Detecta transições RARAS mas POSSÍVEIS
+        
+        Estados com probabilidade baixa (<5%) mas não zero
+        Podem indicar reversões extremas
+        """
         probs = self.get_transition_probs(current_state_id)
         if probs is None:
             return []
         
-        indices = np.argsort(probs)[-top_k:][::-1]
-        return [(int(idx), float(probs[idx])) for idx in indices if probs[idx] > 0]
+        rare = []
+        for state_id, prob in enumerate(probs):
+            if 0 < prob < threshold:
+                info = self.id_to_state.get(state_id, {})
+                rare.append({
+                    'state_id': state_id,
+                    'probability': float(prob),
+                    'pares': info.get('faixa_pares', 0) + 5,
+                    'primos': info.get('faixa_primos', 0) + 2,
+                    'moldura': info.get('faixa_moldura', 0) + 6,
+                })
+        
+        rare.sort(key=lambda x: x['probability'], reverse=True)
+        return rare
 
 
 # ============================================================
-# FEATURE ENGINE (COM SAFE_DIGITIZE)
+# FEATURE ENGINE
 # ============================================================
 
 class StateFeatureEngine:
@@ -233,7 +231,6 @@ class StateFeatureEngine:
         ]
     
     def extract_state(self, idx):
-        """Extrai estado para o concurso idx"""
         if idx < 50:
             return None
         
@@ -243,7 +240,6 @@ class StateFeatureEngine:
         
         features = {}
         
-        # Estruturais
         features['soma'] = sum(d)
         features['pares'] = sum(1 for x in d if x % 2 == 0)
         features['primos'] = sum(1 for x in d if x in PRIMES)
@@ -283,7 +279,6 @@ class StateFeatureEngine:
         probs = np.where(probs>0, probs, 1e-10)
         features['entropia_posicional'] = entropy(probs)
         
-        # EMAs
         for w in [5, 10]:
             if idx >= w:
                 window = self.contests[idx-w+1:idx+1]
@@ -301,7 +296,6 @@ class StateFeatureEngine:
                     sum(1 for x in c['dezenas'] if x in MOLDURA) for c in window
                 ])
                 
-                # Repetidas com índices REAIS
                 reps = []
                 for j in range(idx-w+1, idx+1):
                     if j > 0:
@@ -310,22 +304,15 @@ class StateFeatureEngine:
                         reps.append(rep)
                 features[f'repetidas_ema_{w}'] = np.mean(reps) if reps else 0
         
-        # Momentum
         if idx >= 10:
             curr = self.contests[idx-4:idx+1]
             prev = self.contests[idx-9:idx-4]
             curr_pares = np.mean([sum(1 for x in c['dezenas'] if x%2==0) for c in curr])
             prev_pares = np.mean([sum(1 for x in c['dezenas'] if x%2==0) for c in prev])
             features['pares_momentum_5'] = curr_pares - prev_pares
-            
-            curr_primos = np.mean([sum(1 for x in c['dezenas'] if x in PRIMES) for c in curr])
-            prev_primos = np.mean([sum(1 for x in c['dezenas'] if x in PRIMES) for c in prev])
-            features['primos_momentum_5'] = curr_primos - prev_primos
         else:
             features['pares_momentum_5'] = 0
-            features['primos_momentum_5'] = 0
         
-        # Volatilidade
         if idx >= 10:
             recent = self.contests[idx-9:idx+1]
             pares_series = [sum(1 for x in c['dezenas'] if x%2==0) for c in recent]
@@ -340,7 +327,6 @@ class StateFeatureEngine:
         return features
     
     def build_dataset(self):
-        """Constrói dataset com SAFE_DIGITIZE"""
         X_list, y_list = [], []
         
         for i in tqdm(range(50, self.n_contests - 1), desc="Dataset"):
@@ -351,7 +337,6 @@ class StateFeatureEngine:
                 x_vec = [float(state_t.get(name, 0)) for name in self.feature_names]
                 X_list.append(x_vec)
                 
-                # SAFE_DIGITIZE (nunca -1)
                 y_vec = [
                     safe_digitize(state_t1['pares'], [6, 7, 8, 9], 4),
                     safe_digitize(state_t1['primos'], [3, 4, 5, 6], 3),
@@ -366,14 +351,127 @@ class StateFeatureEngine:
 
 
 # ============================================================
-# MCTS (MONTE CARLO TREE SEARCH)
+# RANKER CORRIGIDO (MultiOutput indexing)
+# ============================================================
+
+class StructuralRanker:
+    """Ranker com MultiOutputClassifier - indexing CORRIGIDO"""
+    
+    def __init__(self, feature_engine):
+        self.engine = feature_engine
+        self.model = None
+        self.is_trained = False
+        self.last_contest_dezenas = None
+        
+        # Guardar último concurso para calcular repetidas
+        if feature_engine.n_contests > 0:
+            self.last_contest_dezenas = set(feature_engine.contests[-1]['dezenas'])
+    
+    def train(self):
+        print(f"\n📊 TREINANDO RANKER...")
+        
+        X, y = self.engine.build_dataset()
+        
+        if len(X) < 100:
+            print("   ⚠️  Dados insuficientes")
+            return False
+        
+        print(f"   Dataset: {X.shape[0]} amostras, {X.shape[1]} features")
+        
+        if XGB_AVAILABLE:
+            base = xgb.XGBClassifier(n_estimators=80, max_depth=4,
+                                     learning_rate=0.05, random_state=42, verbosity=0)
+        else:
+            base = RandomForestClassifier(n_estimators=80, max_depth=6,
+                                         random_state=42, n_jobs=-1)
+        
+        self.model = MultiOutputClassifier(base)
+        
+        tscv = TimeSeriesSplit(n_splits=3)
+        for train_idx, val_idx in tscv.split(X):
+            self.model.fit(X[train_idx], y[train_idx])
+        
+        self.is_trained = True
+        print(f"   ✅ Treinado")
+        return True
+    
+    def predict_proba(self, features_vector):
+        """
+        Retorna probabilidades para cada target
+        
+        MultiOutputClassifier.predict_proba() retorna:
+        [array([[p0, p1, p2, ...]]), array([[p0, p1, ...]]), ...]
+        
+        Onde cada elemento é um array 2D (1 amostra × n classes)
+        """
+        if not self.is_trained:
+            return None
+        return self.model.predict_proba(np.array([features_vector]))
+    
+    def score_game(self, game, features_vector):
+        """
+        Score CORRIGIDO:
+        - Indexing: float(probas[i][0][cls])
+        - Repetidas: compara com último concurso REAL
+        """
+        probas = self.predict_proba(features_vector)
+        if probas is None:
+            return 0.5
+        
+        d = sorted(game)
+        score = 0.0
+        
+        # 1. Pares (target 0)
+        cls = safe_digitize(sum(1 for x in d if x % 2 == 0), [6, 7, 8, 9], 4)
+        if probas[0].shape[1] > cls:
+            score += float(probas[0][0][cls]) * 0.25
+        
+        # 2. Primos (target 1)
+        cls = safe_digitize(sum(1 for x in d if x in PRIMES), [3, 4, 5, 6], 3)
+        if probas[1].shape[1] > cls:
+            score += float(probas[1][0][cls]) * 0.20
+        
+        # 3. Moldura (target 2)
+        cls = safe_digitize(sum(1 for x in d if x in MOLDURA), [7, 8, 9, 10], 4)
+        if probas[2].shape[1] > cls:
+            score += float(probas[2][0][cls]) * 0.20
+        
+        # 4. Repetidas (target 3) - CORRIGIDO: usa último concurso REAL
+        if self.last_contest_dezenas:
+            rep = len(set(d) & self.last_contest_dezenas)
+        else:
+            rep = 8  # Estimativa
+        cls = safe_digitize(rep, [7, 8, 9, 10], 4)
+        if probas[3].shape[1] > cls:
+            score += float(probas[3][0][cls]) * 0.15
+        
+        # 5. Soma (target 4)
+        cls = safe_digitize(sum(d), [170, 190, 210, 230], 4)
+        if probas[4].shape[1] > cls:
+            score += float(probas[4][0][cls]) * 0.10
+        
+        # 6. Max run (target 5)
+        run = 1; mr = 1
+        for i in range(len(d)-1):
+            if d[i+1] - d[i] == 1:
+                run += 1
+                mr = max(mr, run)
+            else:
+                run = 1
+        cls = safe_digitize(mr, [2, 3, 4, 5], 4)
+        if probas[5].shape[1] > cls:
+            score += float(probas[5][0][cls]) * 0.10
+        
+        return float(min(1.0, max(0.0, score)))
+
+
+# ============================================================
+# MCTS GENERATOR
 # ============================================================
 
 class MCTSNode:
-    """Nó da árvore MCTS"""
-    
     def __init__(self, game=None, parent=None):
-        self.game = game or []  # Jogo parcial
+        self.game = game or []
         self.parent = parent
         self.children = []
         self.visits = 0
@@ -389,30 +487,24 @@ class MCTSNode:
     def ucb_score(self, exploration_weight=1.4):
         if self.visits == 0:
             return float('inf')
-        exploitation = self.total_score / self.visits
-        exploration = exploration_weight * sqrt(log(self.parent.visits + 1) / self.visits)
-        return exploitation + exploration
+        return self.total_score / self.visits + exploration_weight * sqrt(
+            log(self.parent.visits + 1) / self.visits
+        )
 
 
 class MCTSGenerator:
-    """
-    Monte Carlo Tree Search para geração de jogos
+    """Monte Carlo Tree Search para geração de jogos"""
     
-    Vantagens sobre beam search:
-    - Explora + Explota (não apenas guloso)
-    - Mantém diversidade estrutural
-    - Penaliza similaridade naturalmente
-    """
-    
-    def __init__(self, constraints=None, momentum=None, markov=None, 
+    def __init__(self, constraints=None, momentum=None, markov=None,
                  current_markov_state=None, ranker=None, features_vec=None,
-                 n_simulations=50, exploration_weight=1.4):
+                 rare_transitions=None, n_simulations=50, exploration_weight=1.4):
         self.constraints = constraints or {}
         self.momentum = momentum or {}
         self.markov = markov
         self.current_markov_state = current_markov_state
         self.ranker = ranker
         self.features_vec = features_vec
+        self.rare_transitions = rare_transitions or []
         
         self.n_simulations = n_simulations
         self.exploration_weight = exploration_weight
@@ -420,16 +512,12 @@ class MCTSGenerator:
         self.fixed = set(self.constraints.get('fixas', []))
         self.excluded = set(self.constraints.get('excluidas', []))
         
-        # Cache de scores
         self._score_cache = {}
     
     def _get_available_actions(self, game):
-        """Dezenas disponíveis para adicionar"""
-        return [d for d in range(1, 26) 
-                if d not in game and d not in self.excluded]
+        return [d for d in range(1, 26) if d not in game and d not in self.excluded]
     
     def _score_game(self, game):
-        """Score de um jogo (completo ou parcial)"""
         key = tuple(sorted(game))
         if key in self._score_cache:
             return self._score_cache[key]
@@ -463,26 +551,38 @@ class MCTSGenerator:
         if cons > 5:
             score -= (cons - 5) * 3
         
-        # 5. Score do ranker (se disponível)
+        # 5. Score do ranker
         if self.ranker and self.features_vec and len(game) == 15:
             score += self.ranker.score_game(game, self.features_vec) * 10
         
-        # 6. Score Markov (se disponível)
+        # 6. Score Markov
         if self.markov and self.current_markov_state is not None and len(game) == 15:
             pares = sum(1 for d in game if d % 2 == 0)
             primos = sum(1 for d in game if d in PRIMES)
             moldura = sum(1 for d in game if d in MOLDURA)
-            rep = 8
+            rep = len(set(game) & set(self.constraints.get('ultimo_concurso', [])))
             game_state = self.markov.encode(pares, primos, moldura, rep)
             probs = self.markov.get_transition_probs(self.current_markov_state)
             if probs is not None and game_state < len(probs):
                 score += probs[game_state] * 15
         
+        # 7. Bônus por transições raras (reversões extremas)
+        if self.rare_transitions and len(game) == 15:
+            pares = sum(1 for d in game if d % 2 == 0)
+            primos = sum(1 for d in game if d in PRIMES)
+            moldura = sum(1 for d in game if d in MOLDURA)
+            rep = len(set(game) & set(self.constraints.get('ultimo_concurso', [])))
+            game_state = self.markov.encode(pares, primos, moldura, rep)
+            
+            for rare in self.rare_transitions:
+                if rare['state_id'] == game_state:
+                    score += rare['probability'] * 8  # Bônus proporcional
+                    break
+        
         self._score_cache[key] = score
         return score
     
     def _select(self, node):
-        """Seleciona nó para expansão (UCT)"""
         while not node.is_terminal():
             if not node.is_fully_expanded():
                 return self._expand(node)
@@ -490,16 +590,14 @@ class MCTSGenerator:
         return node
     
     def _expand(self, node):
-        """Expande nó adicionando uma ação não tentada"""
         if node.untried_actions is None:
             node.untried_actions = self._get_available_actions(node.game)
         
         if not node.untried_actions:
             return node
         
-        # Escolher ação com maior potencial
         action_scores = []
-        for action in node.untried_actions[:20]:  # Amostrar para eficiência
+        for action in node.untried_actions[:20]:
             new_game = node.game + [action]
             score = self._score_game(new_game)
             action_scores.append((score, action))
@@ -509,26 +607,18 @@ class MCTSGenerator:
         
         node.untried_actions.remove(best_action)
         
-        new_game = node.game + [best_action]
-        child = MCTSNode(new_game, parent=node)
+        child = MCTSNode(node.game + [best_action], parent=node)
         node.children.append(child)
         
         return child
     
     def _simulate(self, node):
-        """Simula jogo completo a partir do nó"""
         game = list(node.game)
         available = self._get_available_actions(game)
         
-        # Completar com escolhas ponderadas
         while len(game) < 15 and available:
-            scores = []
-            for d in available[:30]:
-                s = self._score_game(game + [d])
-                scores.append((s, d))
+            scores = [(self._score_game(game + [d]), d) for d in available[:30]]
             scores.sort(key=lambda x: x[0], reverse=True)
-            
-            # Escolher entre top 3 (não sempre o melhor)
             top_n = min(3, len(scores))
             chosen = scores[random.randint(0, top_n-1)][1]
             game.append(chosen)
@@ -537,30 +627,23 @@ class MCTSGenerator:
         return self._score_game(game)
     
     def _backpropagate(self, node, score):
-        """Propaga score para todos os ancestrais"""
         while node is not None:
             node.visits += 1
             node.total_score += score
             node = node.parent
     
     def generate_one(self):
-        """Gera UM jogo usando MCTS"""
         root = MCTSNode(list(self.fixed))
         
         for _ in range(self.n_simulations):
             leaf = self._select(root)
-            if leaf.is_terminal():
-                score = self._score_game(leaf.game)
-            else:
-                score = self._simulate(leaf)
+            score = self._score_game(leaf.game) if leaf.is_terminal() else self._simulate(leaf)
             self._backpropagate(leaf, score)
         
-        # Selecionar melhor caminho (mais visitado)
         if root.children:
             best_child = max(root.children, key=lambda c: c.visits)
             game = best_child.game
             
-            # Completar se necessário
             if len(game) < 15:
                 available = self._get_available_actions(game)
                 while len(game) < 15 and available:
@@ -571,7 +654,6 @@ class MCTSGenerator:
             
             return sorted(game)[:15]
         
-        # Fallback
         game = list(self.fixed)
         available = self._get_available_actions(game)
         while len(game) < 15 and available:
@@ -580,103 +662,15 @@ class MCTSGenerator:
         return sorted(game)[:15]
     
     def generate_many(self, n_games=100):
-        """Gera múltiplos jogos com MCTS"""
         games = []
         seen = set()
-        
         for _ in tqdm(range(n_games), desc="MCTS"):
             game = self.generate_one()
             key = tuple(game)
             if key not in seen and len(game) == 15:
                 seen.add(key)
                 games.append(game)
-        
         return games
-
-
-# ============================================================
-# RANKER (COM SAFE_DIGITIZE)
-# ============================================================
-
-class StructuralRanker:
-    """Ranker com MultiOutputClassifier"""
-    
-    def __init__(self, feature_engine):
-        self.engine = feature_engine
-        self.model = None
-        self.is_trained = False
-    
-    def train(self):
-        print(f"\n📊 TREINANDO RANKER...")
-        
-        X, y = self.engine.build_dataset()
-        
-        if len(X) < 100:
-            print("   ⚠️  Dados insuficientes")
-            return False
-        
-        print(f"   Dataset: {X.shape[0]} amostras, {X.shape[1]} features")
-        
-        if XGB_AVAILABLE:
-            base = xgb.XGBClassifier(n_estimators=80, max_depth=4,
-                                     learning_rate=0.05, random_state=42, verbosity=0)
-        else:
-            base = RandomForestClassifier(n_estimators=80, max_depth=6,
-                                         random_state=42, n_jobs=-1)
-        
-        self.model = MultiOutputClassifier(base)
-        
-        tscv = TimeSeriesSplit(n_splits=3)
-        for train_idx, val_idx in tscv.split(X):
-            self.model.fit(X[train_idx], y[train_idx])
-        
-        self.is_trained = True
-        print(f"   ✅ Treinado")
-        return True
-    
-    def predict_proba(self, features_vector):
-        if not self.is_trained:
-            return None
-        return self.model.predict_proba(np.array([features_vector]))
-    
-    def score_game(self, game, features_vector):
-        """Score com SAFE_DIGITIZE"""
-        probas = self.predict_proba(features_vector)
-        if probas is None:
-            return 0.5
-        
-        d = sorted(game)
-        score = 0.0
-        
-        # Pares
-        cls = safe_digitize(sum(1 for x in d if x%2==0), [6,7,8,9], 4)
-        if cls < len(probas[0]): score += probas[0][cls] * 0.25
-        
-        # Primos
-        cls = safe_digitize(sum(1 for x in d if x in PRIMES), [3,4,5,6], 3)
-        if cls < len(probas[1]): score += probas[1][cls] * 0.20
-        
-        # Moldura
-        cls = safe_digitize(sum(1 for x in d if x in MOLDURA), [7,8,9,10], 4)
-        if cls < len(probas[2]): score += probas[2][cls] * 0.20
-        
-        # Repetidas
-        cls = safe_digitize(sum(1 for x in d if x in MOLDURA), [7,8,9,10], 4)
-        if cls < len(probas[3]): score += probas[3][cls] * 0.15
-        
-        # Soma
-        cls = safe_digitize(sum(d), [170,190,210,230], 4)
-        if cls < len(probas[4]): score += probas[4][cls] * 0.10
-        
-        # Max run
-        run=1; mr=1
-        for i in range(len(d)-1):
-            if d[i+1]-d[i]==1: run+=1; mr=max(mr,run)
-            else: run=1
-        cls = safe_digitize(mr, [2,3,4,5], 4)
-        if cls < len(probas[5]): score += probas[5][cls] * 0.10
-        
-        return min(1.0, max(0.0, score))
 
 
 # ============================================================
@@ -709,9 +703,9 @@ def collect_preferences():
     return prefs if prefs else None
 
 
-def display_results(games, markov=None, current_state=None):
+def display_results(games, markov=None, current_state=None, rare_transitions=None):
     print(f"\n{'='*60}")
-    print(f"🏆 TOP JOGOS (MCTS)")
+    print(f"🏆 TOP JOGOS (MCTS + MARKOV)")
     print(f"{'='*60}")
     
     if markov and current_state is not None:
@@ -720,10 +714,16 @@ def display_results(games, markov=None, current_state=None):
             print(f"📊 Estados Markov mais prováveis:")
             for sid, prob in top_states:
                 info = markov.id_to_state.get(sid, {})
-                print(f"   ID:{sid} Prob:{prob:.3f} → "
-                      f"Pares:{info.get('faixa_pares',0)+5} "
-                      f"Primos:{info.get('faixa_primos',0)+2} "
-                      f"Moldura:{info.get('faixa_moldura',0)+6}")
+                print(f"   P:{info.get('faixa_pares',0)+5} "
+                      f"Pr:{info.get('faixa_primos',0)+2} "
+                      f"M:{info.get('faixa_moldura',0)+6} "
+                      f"({prob:.1%})")
+        
+        if rare_transitions:
+            print(f"\n⚠️  Transições RARAS detectadas:")
+            for r in rare_transitions[:3]:
+                print(f"   P:{r['pares']} Pr:{r['primos']} "
+                      f"M:{r['moldura']} ({r['probability']:.1%})")
     
     for i, game in enumerate(games[:15], 1):
         p = sum(1 for d in game if d%2==0)
@@ -736,7 +736,7 @@ def display_results(games, markov=None, current_state=None):
 
 def main():
     print("="*60)
-    print("🧬 MCTS + MARKOV + XGBOOST")
+    print("🧬 MCTS + MARKOV + RARE TRANSITIONS")
     print("="*60)
     
     contests = load_all_contests('resultados_lotofacil.csv')
@@ -746,7 +746,7 @@ def main():
     
     print(f"📂 {len(contests)} concursos")
     
-    # Markov (CORRIGIDO)
+    # Markov
     markov = MarkovStateEncoder()
     markov.build_transition_matrix(contests)
     
@@ -759,11 +759,12 @@ def main():
     
     # Preferências
     prefs = collect_preferences()
+    prefs['ultimo_concurso'] = contests[-1]['dezenas'] if contests else []
     
     # Momentum (Z-score)
-    if len(contests) >= 50:
+    if len(contests) >= 100:
         recent = contests[-50:]
-        older = contests[-100:-50] if len(contests) >= 100 else contests[:-50]
+        older = contests[-100:-50]
         
         freq_recent = Counter()
         for c in recent: freq_recent.update(c['dezenas'])
@@ -771,11 +772,7 @@ def main():
         freq_older = Counter()
         for c in older: freq_older.update(c['dezenas'])
         
-        # Z-score
-        all_freqs = []
-        for d in range(1, 26):
-            all_freqs.append(freq_older.get(d, 0) / max(1, len(older)))
-        
+        all_freqs = [freq_older.get(d, 0) / len(older) for d in range(1, 26)]
         mean_hist = np.mean(all_freqs)
         std_hist = np.std(all_freqs) + 1e-10
         
@@ -796,11 +793,14 @@ def main():
         len(set(last) & set(prev))
     )
     
+    # Transições raras
+    rare_transitions = markov.detect_rare_transitions(current_markov, threshold=0.05)
+    
     # Features atuais
     current_state = engine.extract_state(len(contests) - 1)
     features_vec = [float(current_state.get(n, 0)) for n in engine.feature_names] if current_state else None
     
-    # MCTS Generator
+    # MCTS
     print(f"\n🎲 MCTS GERANDO JOGOS...")
     mcts = MCTSGenerator(
         constraints=prefs,
@@ -809,6 +809,7 @@ def main():
         current_markov_state=current_markov,
         ranker=ranker,
         features_vec=features_vec,
+        rare_transitions=rare_transitions,
         n_simulations=50,
         exploration_weight=1.4
     )
@@ -816,8 +817,7 @@ def main():
     games = mcts.generate_many(n_games=200)
     print(f"   ✅ {len(games)} jogos gerados")
     
-    # Exibir
-    display_results(games, markov, current_markov)
+    display_results(games, markov, current_markov, rare_transitions)
     
     print(f"\n✅ CONCLUÍDO!")
 
