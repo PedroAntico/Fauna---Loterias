@@ -357,12 +357,12 @@ class PortfolioOptimizerV13:
         if len(game)==15:
             sig = self._structure_signature(game)
             sig_count = self.structure_signatures.get(sig, 0)
-            score -= sig_count * 4  # Penaliza assinaturas repetidas
+            score -= sig_count * 1.5  # Penaliza assinaturas repetidas
         
         # 8. Penalidade de similaridade
         for existing in self.generated_pool[-20:]:
             common = len(set(game)&set(existing))
-            if common > 11: score -= (common-11)*5
+            if common > 12: score -= (common-11)*5
         
         # 9. Penalidade de consecutivos
         sg=sorted(game); cons=sum(1 for i in range(len(sg)-1) if sg[i+1]-sg[i]==1)
