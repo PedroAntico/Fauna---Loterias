@@ -300,15 +300,27 @@ class PortfolioOptimizerV13:
     
     def _structure_signature(self, game):
         """Assinatura estrutural (não dezenas)"""
-        d=sorted(game)
+    
+        d = sorted(game)
+    
+        # max_run
+        run = 1
+        max_run = 1
+    
+        for i in range(len(d) - 1):
+            if d[i + 1] - d[i] == 1:
+                run += 1
+                max_run = max(max_run, run)
+            else:
+                run = 1
+    
         return (
-            sum(1 for x in d if x%2==0),           # pares
-            sum(1 for x in d if x in PRIMES),      # primos
-            sum(1 for x in d if x in MOLDURA),     # moldura
-            len(set(d)&set(self.last_contest)) if self.last_contest else 8,  # repetidas
-            sum(d)//10,                              # soma bucket
-            max((lambda r=1,m=1: ([(r:=r+1 if d[i+1]-d[i]==1 else 1, m:=max(m,r)) for i in range(len(d)-1)], m)[1])()),  # max_run
-        )
+            sum(1 for x in d if x % 2 == 0),                 # pares
+            sum(1 for x in d if x in PRIMES),                # primos
+            sum(1 for x in d if x in MOLDURA),               # moldura
+            len(set(d) & set(self.last_contest)) if self.last_contest else 8,
+            sum(d) // 10,                                    # soma bucket
+            max_run                                           # max_run)
     
     def _score_game(self, game, regime_target=None):
         score=0.0; d=sorted(game)
