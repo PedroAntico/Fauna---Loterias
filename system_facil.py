@@ -887,6 +887,13 @@ def walk_forward_real(contests, n_windows=20, train_size=300, test_size=50):
             meta_model = xgb.XGBClassifier(n_estimators=30, max_depth=3, verbosity=0)
             meta_model.fit(np.array(meta_X), np.array(meta_y))
             print(f"   Meta-modelo treinado com {len(meta_X)} exemplos reais")
+
+    # SALVAR WALK-FORWARD
+    with open("walkforward_report.json", "w", encoding="utf-8") as f:
+        json.dump(resultados, f, indent=2, ensure_ascii=False)
+
+    print(f"\n📄 Relatório walk-forward salvo: walkforward_report.json")
+    
     return resultados
 
 
