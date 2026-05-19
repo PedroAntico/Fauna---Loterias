@@ -116,8 +116,6 @@ FEATURE_GROUPS = {
 # ============================================================
 # CARREGAMENTO DE DADOS
 # ============================================================
-import os
-
 def load_all_contests(csv_file='resultados_lotofacil.csv'):
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
