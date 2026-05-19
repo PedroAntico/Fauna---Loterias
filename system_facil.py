@@ -76,31 +76,54 @@ CUSTO_APOSTA = 3.0
 # ============================================================
 def load_all_contests(csv_file='resultados_lotofacil.csv'):
 
-    # caminho absoluto baseado no script
     base_dir = os.path.dirname(os.path.abspath(__file__))
     full_path = os.path.join(base_dir, csv_file)
 
     print(f"📂 Tentando abrir: {full_path}")
 
     if not os.path.exists(full_path):
-        print("❌ CSV não encontrado")
+        print("❌ Arquivo não encontrado")
         return None
 
     contests = []
 
     try:
-        with open(full_path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
 
-        for line in lines[1:]:
-            parts = line.strip().split(';')
+        with open(full_path, 'r', encoding='utf-8-sig') as f:
 
-            if len(parts) >= 17:
-                contests.append({
-                    'concurso': int(parts[0]),
-                    'data': parts[1],
-                    'dezenas': [int(x) for x in parts[2:17]]
-                })
+            for i, line in enumerate(f):
+
+                line = line.strip()
+
+                if not line:
+                    continue
+
+                parts = line.split(';')
+
+                # ignorar cabeçalho
+                if i == 0:
+                    print("HEADER:", parts)
+                    continue
+
+                try:
+
+                    concurso = int(parts[0])
+
+                    dezenas = [int(x.strip()) for x in parts[2:17]]
+
+                    if len(dezenas) != 15:
+                        print(f"⚠️ Linha inválida {i}: {parts}")
+                        continue
+
+                    contests.append({
+                        'concurso': concurso,
+                        'data': parts[1],
+                        'dezenas': dezenas
+                    })
+
+                except Exception as e:
+                    print(f"⚠️ Erro linha {i}: {e}")
+                    print(parts)
 
         contests.sort(key=lambda x: x['concurso'])
 
@@ -109,7 +132,7 @@ def load_all_contests(csv_file='resultados_lotofacil.csv'):
         return contests
 
     except Exception as e:
-        print("❌ Erro lendo CSV:", e)
+        print("❌ Erro geral:", e)
         return None
 
 
