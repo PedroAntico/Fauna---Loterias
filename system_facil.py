@@ -864,8 +864,8 @@ def main():
     if contests is None: print("❌ Arquivo não encontrado"); return
     print(f"📂 {len(contests)} concursos")
     ensure_reports_dir()
-        random.seed(42)
-        np.random.seed(42)
+    random.seed(42)
+    np.random.seed(42)
     regime_clusterer = RegimeClusterer(contests, n_clusters=4)
     print("\n📊 REGIMES:")
     for s in regime_clusterer.get_regime_stats():
