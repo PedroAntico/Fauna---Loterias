@@ -2,15 +2,16 @@
 # -*- coding: utf-8 -*-
 
 """
-SISTEMA DE GERAÇÃO ESTRUTURAL GUIADA - LOTOFÁCIL v23
-=====================================================
-CORREÇÕES:
-✅ Predict() chamado UMA vez por jogo (sem duplicação)
-✅ Estabilidade SHAP sem duplicação de registros
-✅ Geração estrutural guiada (beam search + mutação)
-✅ Simulated Annealing para exploração de carteiras
-✅ Redução de brute force aleatório
-✅ Preserva todas as funcionalidades da v22
+SISTEMA DE OTIMIZAÇÃO COMBINATÓRIA DE CARTEIRA - LOTOFÁCIL v24
+===============================================================
+Correções e aperfeiçoamentos:
+✅ Scoring separado: beam search usa heurísticas leves; learner.predict() só em jogos completos
+✅ Correção de viés de amostragem: random.sample() no beam search
+✅ Annealing com diversidade: 70% elite + 30% candidatos aleatórios
+✅ Fitness de portfólio global (cobertura, entropia, diversidade, payoff)
+✅ Estabilidade SHAP sem duplicação
+✅ Walk-forward real, ablação estrutural, exportação de relatórios
+✅ Geração guiada por beam search + mutações + simulated annealing
 """
 
 import numpy as np
@@ -27,6 +28,9 @@ import random
 
 warnings.filterwarnings('ignore')
 
+# ============================================================
+# IMPORTS OPCIONAIS
+# ============================================================
 try:
     import xgboost as xgb
     XGB_AVAILABLE = True
@@ -62,29 +66,6 @@ QUADRANTES = [
 ]
 PAYOFF = {11: 1, 12: 5, 13: 50, 14: 500, 15: 5000}
 CUSTO_APOSTA = 3.0
-
-# ============================================================
-# CARREGAMENTO DE DADOS
-# ============================================================
-def load_all_contests(csv_file='resultados_lotofacil.csv'):
-    if not os.path.exists(csv_file):
-        return None
-    contests = []
-    try:
-        with open(csv_file, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-        for line in lines[1:]:
-            parts = line.strip().split(';')
-            if len(parts) >= 17:
-                contests.append({
-                    'concurso': int(parts[0]),
-                    'data': parts[1],
-                    'dezenas': [int(x) for x in parts[2:17]]
-                })
-        contests.sort(key=lambda x: x['concurso'])
-        return contests
-    except:
-        return None
 
 # ============================================================
 # NOMES DAS FEATURES
@@ -129,9 +110,33 @@ FEATURE_GROUPS = {
 }
 
 # ============================================================
-# CONTEXTO TEMPORAL (mantido)
+# CARREGAMENTO DE DADOS
+# ============================================================
+def load_all_contests(csv_file='resultados_lotofacil.csv'):
+    if not os.path.exists(csv_file):
+        return None
+    contests = []
+    try:
+        with open(csv_file, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        for line in lines[1:]:
+            parts = line.strip().split(';')
+            if len(parts) >= 17:
+                contests.append({
+                    'concurso': int(parts[0]),
+                    'data': parts[1],
+                    'dezenas': [int(x) for x in parts[2:17]]
+                })
+        contests.sort(key=lambda x: x['concurso'])
+        return contests
+    except:
+        return None
+
+# ============================================================
+# CONTEXTO TEMPORAL
 # ============================================================
 class TemporalContext:
+    """Encapsula estado temporal disponível"""
     def __init__(self, contests_slice, historical_contests=None):
         self.contests = contests_slice
         self.n_contests = len(contests_slice)
@@ -350,7 +355,6 @@ class StableSHAPLearner:
         self.is_trained = False
 
     def _train_core(self, X, y_hits):
-        """Treina o modelo base (sem mexer no shap_stability)"""
         if X.shape[0] < 100: return False
         self.model = xgb.XGBRegressor(n_estimators=100, max_depth=5, learning_rate=0.05, random_state=42, verbosity=0) if XGB_AVAILABLE else RandomForestRegressor(n_estimators=100, max_depth=6, random_state=42)
         tscv = TimeSeriesSplit(n_splits=3)
@@ -375,13 +379,11 @@ class StableSHAPLearner:
         return True
 
     def train(self, X, y_hits, y_payoff):
-        """Treino único (sem acumular estabilidade)"""
         return self._train_core(X, y_hits)
 
     def train_multiple_rounds(self, X, y_hits, y_payoff, n_rounds=10):
-        """Treina múltiplas rodadas e acumula estabilidade APENAS aqui"""
         print(f"\n📊 ESTABILIDADE SHAP ({n_rounds} rodadas)...")
-        self.shap_stability = []  # Reset
+        self.shap_stability = []
         for r in range(n_rounds):
             np.random.seed(42 + r)
             idx = np.random.choice(len(X), min(len(X), 3000), replace=False)
@@ -417,14 +419,74 @@ class StableSHAPLearner:
 
 
 # ============================================================
-# GERAÇÃO ESTRUTURAL GUIADA (NOVO)
+# CLUSTERIZAÇÃO DE REGIMES
+# ============================================================
+class RegimeClusterer:
+    def __init__(self, contests, n_clusters=4):
+        self.n_clusters = n_clusters
+        self.regime_features = []
+        self.labels_kmeans = None
+        self.labels_gmm = None
+        self.ensemble_labels = None
+        self.kmeans = None
+        self.gmm = None
+        self.scaler = StandardScaler()
+        for i, c in enumerate(contests):
+            d = c['dezenas']
+            prev = set(contests[i-1]['dezenas']) if i > 0 else set()
+            rep = len(set(d) & prev) if prev else 8
+            vec = [rep, sum(1 for x in d if x % 2 == 0), sum(1 for x in d if x in PRIMES),
+                   sum(1 for x in d if x in MOLDURA), sum(d),
+                   sum(1 for j in range(len(d)-1) if d[j+1]-d[j]==1), max(d) - min(d),
+                   np.mean([d[j+1]-d[j] for j in range(len(d)-1)]),
+                   np.var([d[j+1]-d[j] for j in range(len(d)-1)]),
+                   sum(abs(d[j]-d[j-1]) for j in range(1, len(d)))]
+            self.regime_features.append(vec)
+        self.regime_features = np.array(self.regime_features)
+        if len(self.regime_features) > 10 and SKLEARN_AVAILABLE:
+            X_scaled = self.scaler.fit_transform(self.regime_features)
+            self.kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+            self.labels_kmeans = self.kmeans.fit_predict(X_scaled)
+            self.gmm = GaussianMixture(n_components=n_clusters, random_state=42)
+            self.labels_gmm = self.gmm.fit_predict(X_scaled)
+            self.ensemble_labels = np.array([self.labels_kmeans[i] if self.labels_kmeans[i] == self.labels_gmm[i] else self.labels_kmeans[i] for i in range(len(self.labels_kmeans))])
+        self.regime_names = {}
+        if self.kmeans is not None:
+            for i in range(n_clusters):
+                mask = self.ensemble_labels == i
+                if mask.sum() > 0:
+                    avg = self.regime_features[mask].mean(axis=0)
+                    if avg[0] >= 9: name = "alta_persistencia"
+                    elif avg[1] >= 8: name = "alto_pares"
+                    elif avg[4] <= 175: name = "compacto"
+                    elif avg[3] >= 10: name = "periferico"
+                    else: name = "balanceado"
+                    self.regime_names[i] = {'name': name, 'size': mask.sum(), 'avg_rep': avg[0], 'avg_pares': avg[1], 'avg_soma': avg[4]}
+
+    def get_regime_stats(self):
+        return [{'cluster': i, 'name': self.regime_names.get(i,{}).get('name',f'Regime_{i}'),
+                 'count': int((self.ensemble_labels==i).sum()), 'avg_rep': float(self.regime_features[self.ensemble_labels==i].mean(axis=0)[0]),
+                 'avg_pares': float(self.regime_features[self.ensemble_labels==i].mean(axis=0)[1]),
+                 'avg_soma': float(self.regime_features[self.ensemble_labels==i].mean(axis=0)[4])}
+                for i in range(self.n_clusters) if (self.ensemble_labels==i).sum() > 0]
+
+    def get_current_regime(self):
+        if len(self.regime_features) > 0 and self.kmeans is not None:
+            vec = np.array([self.regime_features[-1]])
+            vec_scaled = self.scaler.transform(vec)
+            k_label = self.kmeans.predict(vec_scaled)[0]
+            g_label = self.gmm.predict(vec_scaled)[0] if self.gmm else k_label
+            return k_label if k_label == g_label else k_label
+        return 0
+
+
+# ============================================================
+# GERADOR GUIADO CORRIGIDO (v24)
 # ============================================================
 class GuidedGenerator:
     """
-    Geração de candidatos guiada por regime estrutural.
-    Substitui brute force aleatório por:
-    - Beam search com mutações
-    - Simulated Annealing para carteiras
+    Geração de candidatos guiada por heurísticas leves (beam search).
+    learner.predict() é chamado APENAS em jogos completos.
     """
     def __init__(self, context, learner, regime_clusterer=None):
         self.context = context
@@ -432,16 +494,41 @@ class GuidedGenerator:
         self.regime = regime_clusterer
         self.last = context.get_last_contest()
 
-    def _score_game(self, game):
-        """Score de um jogo (chamada ÚNICA de predict)"""
+    def _heuristic_score(self, partial_game):
+        """Score heurístico para jogos incompletos (sem learner)"""
+        d = sorted(partial_game)
+        score = 0.0
+        remaining = 15 - len(d)
+        # Diversidade de quadrantes
+        score += len(set((x-1)//5 for x in d)) * 3
+        # Balanceamento par/ímpar (projetado)
+        current_pares = sum(1 for x in d if x % 2 == 0)
+        target_pares = 7.5
+        projected_pares = current_pares + (remaining * 0.5)
+        score -= abs(projected_pares - target_pares) * 1.5
+        # Penalidade de consecutivos
+        cons = sum(1 for i in range(len(d)-1) if d[i+1]-d[i]==1)
+        if cons > 3: score -= (cons - 3) * 2
+        # Bônus por dezenas do último concurso (repetição)
+        if self.last:
+            rep = len(set(d) & set(self.last))
+            score += rep * 2
+        # Bônus por momentum (se disponível)
+        if hasattr(self.context, 'ema_dezenas'):
+            ema_vals = [self.context.ema_dezenas.get(x, 0) for x in d]
+            score += np.mean(ema_vals) * 5
+        return score
+
+    def _learner_score(self, game):
+        """Score do learner (APENAS para jogos completos)"""
         feats = self.context.extract_features(game)
-        preds = self.learner.predict(feats)  # ÚNICA chamada
+        preds = self.learner.predict(feats)
         return preds['P12'] * 20 + preds['P13'] * 50
 
     def generate_beam_search(self, n_candidates=5000, beam_width=30):
         """
-        Beam search: constrói jogos incrementalmente,
-        mantendo top-k candidatos a cada passo.
+        Beam search: usa heurísticas leves durante construção.
+        learner.predict() apenas no final (jogos completos).
         """
         candidates = []
         seen = set()
@@ -452,16 +539,16 @@ class GuidedGenerator:
             base_options = [[]]
 
         for base in base_options:
-            # Beam search a partir desta base
             beam = [(0.0, set(base))]
             for _ in range(15 - len(base)):
                 next_beam = []
                 for score, game_set in beam:
                     available = [d for d in range(1, 26) if d not in game_set]
-                    for d in available[:20]:  # amostrar
+                    # CORRIGIDO: amostra aleatória (sem viés)
+                    sampled = random.sample(available, min(20, len(available)))
+                    for d in sampled:
                         new_set = game_set | {d}
-                        new_game = sorted(new_set)
-                        s = self._score_game(new_game)
+                        s = self._heuristic_score(new_set)  # Heurística leve
                         next_beam.append((s, new_set))
                 next_beam.sort(key=lambda x: x[0], reverse=True)
                 beam = next_beam[:beam_width]
@@ -473,9 +560,12 @@ class GuidedGenerator:
                         seen.add(key)
                         candidates.append(game)
 
-        # Completar com mutações dos melhores
+        # Completar com mutações dos melhores (usando learner)
         if candidates:
-            top_candidates = sorted(candidates, key=lambda g: self._score_game(g), reverse=True)[:100]
+            # Avaliar com learner APENAS jogos completos
+            scored = [(self._learner_score(g), g) for g in candidates]
+            scored.sort(key=lambda x: x[0], reverse=True)
+            top_candidates = [g for _, g in scored[:100]]
             for base_game in top_candidates:
                 for _ in range(20):
                     mutated = base_game.copy()
@@ -489,7 +579,7 @@ class GuidedGenerator:
                         seen.add(key)
                         candidates.append(mutated)
 
-        # Se ainda não atingiu n_candidates, completar com aleatórios
+        # Completar com aleatórios se necessário
         while len(candidates) < n_candidates:
             game = sorted(np.random.choice(range(1, 26), 15, replace=False))
             key = tuple(game)
@@ -499,15 +589,59 @@ class GuidedGenerator:
 
         return candidates[:n_candidates]
 
-    def simulated_annealing_portfolio(self, candidates, n_select=30, iterations=100):
+    def portfolio_fitness(self, portfolio):
         """
-        Simulated Annealing para selecionar carteira otimizada.
+        Fitness de portfólio GLOBAL.
+        Combina: payoff esperado, cobertura, diversidade, penalidade de overlap.
         """
-        # Pontuar todos (UMA chamada por jogo)
-        scored = []
-        for g in candidates:
-            s = self._score_game(g)
-            scored.append((s, g))
+        # Payoff esperado agregado (learner em cada jogo completo)
+        scores = [self._learner_score(g) for g in portfolio]
+        avg_score = np.mean(scores)
+
+        # Cobertura de pares
+        covered_pairs = set()
+        for g in portfolio:
+            for pair in combinations(sorted(g), 2):
+                covered_pairs.add(pair)
+        pair_coverage = len(covered_pairs) / comb(25, 2)
+
+        # Cobertura de trincas
+        covered_triples = set()
+        for g in portfolio:
+            for triple in combinations(sorted(g), 3):
+                covered_triples.add(triple)
+        triple_coverage = len(covered_triples) / comb(25, 3)
+
+        # Entropia entre jogos (diversidade)
+        all_dezenas = [d for g in portfolio for d in g]
+        freq = np.bincount(all_dezenas, minlength=26)[1:]
+        probs = freq / np.sum(freq)
+        probs = np.where(probs > 0, probs, 1e-10)
+        portfolio_entropy = entropy(probs) / np.log(25)
+
+        # Penalidade de overlap
+        overlap_penalty = 0
+        for i in range(len(portfolio)):
+            for j in range(i+1, len(portfolio)):
+                common = len(set(portfolio[i]) & set(portfolio[j]))
+                if common > 11:
+                    overlap_penalty += (common - 11) * 2
+
+        # Fitness combinado
+        fitness = (avg_score * 0.3 +
+                   pair_coverage * 20 +
+                   triple_coverage * 10 +
+                   portfolio_entropy * 15 -
+                   overlap_penalty * 0.5)
+        return fitness
+
+    def simulated_annealing_portfolio(self, candidates, n_select=30, iterations=200):
+        """
+        Simulated Annealing com diversidade de exploração.
+        70% elite + 30% candidatos aleatórios.
+        """
+        # Pontuar todos os candidatos (learner em completos)
+        scored = [(self._learner_score(g), g) for g in candidates]
         scored.sort(key=lambda x: x[0], reverse=True)
 
         # Inicializar carteira com top-N diversos
@@ -518,33 +652,30 @@ class GuidedGenerator:
             if not any(len(set(g) & set(sg)) > 11 for sg in current_portfolio):
                 current_portfolio.append(g)
 
-        # Fitness da carteira
-        def portfolio_fitness(portfolio):
-            scores = [self._score_game(g) for g in portfolio]
-            avg_score = np.mean(scores)
-            # Penalidade de similaridade
-            sim_penalty = 0
-            for i in range(len(portfolio)):
-                for j in range(i+1, len(portfolio)):
-                    if len(set(portfolio[i]) & set(portfolio[j])) > 11:
-                        sim_penalty += 2
-            return avg_score - sim_penalty
-
-        current_fitness = portfolio_fitness(current_portfolio)
+        current_fitness = self.portfolio_fitness(current_portfolio)
         best_portfolio = current_portfolio.copy()
         best_fitness = current_fitness
 
-        # Simulated Annealing
+        # Preparar pools para annealing
+        elite_pool = [g for _, g in scored[:200]]  # top 200
+        random_pool = [g for _, g in scored[200:]]  # restante
+
         temp = 10.0
         for it in range(iterations):
             temp *= 0.95
-            # Perturbar: trocar um jogo
             new_portfolio = current_portfolio.copy()
             idx = random.randint(0, len(new_portfolio)-1)
-            # Substituir por um candidato aleatório de alta qualidade
-            pool = [g for s, g in scored[:200]]  # top 200
-            new_portfolio[idx] = random.choice(pool)
-            new_fitness = portfolio_fitness(new_portfolio)
+
+            # CORRIGIDO: 70% elite, 30% aleatório
+            if random.random() < 0.7 and elite_pool:
+                new_game = random.choice(elite_pool)
+            elif random_pool:
+                new_game = random.choice(random_pool)
+            else:
+                new_game = random.choice(elite_pool)
+
+            new_portfolio[idx] = new_game
+            new_fitness = self.portfolio_fitness(new_portfolio)
 
             delta = new_fitness - current_fitness
             if delta > 0 or random.random() < np.exp(delta / max(0.1, temp)):
@@ -558,7 +689,7 @@ class GuidedGenerator:
 
 
 # ============================================================
-# ABLAÇÃO E WALK-FORWARD (mantidos da v22 com correções)
+# ABLAÇÃO E WALK-FORWARD
 # ============================================================
 def ablation_study(contests, feature_groups, train_size=300, test_size=50):
     print(f"\n🔬 ABLAÇÃO ESTRUTURAL...")
@@ -602,7 +733,7 @@ def _quick_eval(learner, context, test_data, feature_mask=None, n_games=30):
         for g in candidates:
             feats = context.extract_features(g)
             if feature_mask is not None: feats = feats[feature_mask]
-            preds = learner.predict(feats)  # ÚNICA chamada
+            preds = learner.predict(feats)
             scored.append((preds['P12']*20 + preds['P13']*50, g))
         scored.sort(key=lambda x: x[0], reverse=True)
         for _, g in scored[:n_games]:
@@ -638,7 +769,7 @@ def walk_forward_real(contests, n_windows=20, train_size=300, test_size=50):
                 candidates.append(game)
             scored = []
             for g in candidates:
-                preds = learner.predict(context.extract_features(g))  # ÚNICA chamada
+                preds = learner.predict(context.extract_features(g))
                 scored.append((preds['P12']*20 + preds['P13']*50, g))
             scored.sort(key=lambda x: x[0], reverse=True)
             for _, g in scored[:n_jogos]:
@@ -672,6 +803,10 @@ def walk_forward_real(contests, n_windows=20, train_size=300, test_size=50):
             print(f"   Meta-modelo treinado com {len(meta_X)} exemplos reais")
     return resultados
 
+
+# ============================================================
+# EXPORTAÇÃO DE RELATÓRIOS
+# ============================================================
 def export_shap_report(learner, filename="shap_report.json"):
     if learner.feature_importance is None: return
     report = []
@@ -693,16 +828,19 @@ def export_ablation_report(results, filename="ablation_report.json"):
 # ============================================================
 def main():
     print("="*70)
-    print("🧬 SISTEMA DE GERAÇÃO GUIADA v23")
+    print("🧬 SISTEMA DE OTIMIZAÇÃO DE CARTEIRA v24")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if contests is None: print("❌ Arquivo não encontrado"); return
     print(f"📂 {len(contests)} concursos")
 
-    from collections import Counter as _Counter  # já importado
+    regime_clusterer = RegimeClusterer(contests, n_clusters=4)
+    print("\n📊 REGIMES:")
+    for s in regime_clusterer.get_regime_stats():
+        print(f"   {s['name']}: {s['count']} concursos (Rep:{s['avg_rep']:.1f} Pares:{s['avg_pares']:.1f} Soma:{s['avg_soma']:.0f})")
 
     print("\nOpções:")
-    print("1. Análise SHAP + Ablação + Carteira Guiada")
+    print("1. Análise SHAP + Ablação + Carteira Otimizada")
     print("2. Walk-forward REAL (20 janelas)")
     print("3. TUDO (completo)")
     op = input("Escolha [3]: ").strip() or "3"
@@ -717,18 +855,26 @@ def main():
         ablation_results = ablation_study(contests, FEATURE_GROUPS)
         export_ablation_report(ablation_results)
 
-        print("\n🔥 GERANDO CARTEIRA GUIADA...")
-        generator = GuidedGenerator(context, learner)
+        print("\n🔥 GERANDO CARTEIRA GUIADA (BEAM SEARCH + SA)...")
+        generator = GuidedGenerator(context, learner, regime_clusterer)
         candidates = generator.generate_beam_search(n_candidates=5000, beam_width=30)
         print(f"   ✅ {len(candidates)} candidatos gerados (beam search + mutações)")
-        portfolio = generator.simulated_annealing_portfolio(candidates, n_select=30, iterations=100)
+        portfolio = generator.simulated_annealing_portfolio(candidates, n_select=30, iterations=200)
 
         print(f"\n🏆 CARTEIRA FINAL:")
         last = contests[-1]['dezenas']
         for i, g in enumerate(portfolio, 1):
             rep = len(set(g) & set(last))
             p = sum(1 for d in g if d%2==0)
-            print(f"   {i:2d}. {g} (Rep:{rep} Pares:{p})")
+            pr = sum(1 for d in g if d in PRIMES)
+            m = sum(1 for d in g if d in MOLDURA)
+            print(f"   {i:2d}. {g} (Rep:{rep} Pares:{p} Primos:{pr} Moldura:{m})")
+
+        # Métricas da carteira
+        pair_cov = len(set(p for g in portfolio for p in combinations(sorted(g),2))) / comb(25,2)
+        print(f"\n📊 Cobertura de pares: {pair_cov*100:.1f}%")
+        fitness = generator.portfolio_fitness(portfolio)
+        print(f"📊 Fitness global: {fitness:.2f}")
 
     if op in ("2", "3"):
         walk_forward_real(contests, n_windows=20, train_size=300, test_size=50)
