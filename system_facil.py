@@ -48,7 +48,16 @@ try:
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
+# ============================================================
+# SAVE JSON UTIL
+# ============================================================
+def save_json(data, filename):
+    os.makedirs("reports", exist_ok=True)
 
+    with open(filename, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+    print(f"📄 Relatório salvo: {filename}")
 # ============================================================
 # CONJUNTOS E CONSTANTES
 # ============================================================
