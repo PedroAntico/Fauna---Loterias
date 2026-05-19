@@ -49,7 +49,17 @@ try:
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
+# ============================================================
+# UTILITÁRIOS
+# ============================================================
+def ensure_reports_dir():
+    os.makedirs("reports", exist_ok=True)
 
+def save_json(data, filename):
+    ensure_reports_dir()
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    print(f"📄 Relatório salvo: {filename}")
 # ============================================================
 # CONJUNTOS E CONSTANTES
 # ============================================================
@@ -580,7 +590,18 @@ def permutation_test(strat_vals, rand_vals, n_perm=10000):
     observed = np.mean(strat_vals) - np.mean(rand_vals)
     combined = np.concatenate([strat_vals, rand_vals])
     n1 = len(strat_vals)
-    extreme = sum(1 for _ in range(n_perm) if abs(np.mean(combined[:n1]) - np.mean(combined[n1:])) >= abs(observed))
+    extreme = 0
+
+for _ in range(n_perm):
+    np.random.shuffle(combined)
+
+    perm_diff = (
+        np.mean(combined[:n1]) -
+        np.mean(combined[n1:])
+    )
+
+    if abs(perm_diff) >= abs(observed):
+        extreme += 1
     return observed, extreme / n_perm
 
 
@@ -614,7 +635,9 @@ def blind_test_with_metadata(contests, blind_size=500, n_games=30, use_topology=
             mask = np.array(regime_labels) == cluster_id
             if mask.sum() > 50:
                 # Filtrar X e y para este regime
-                # Nota: simplificado - usa todos os dados mas poderia filtrar
+                mask = regime_labels[:len(y_hits)] == cluster_id
+                X_reg = X[mask]
+                y_reg = y_hits[mask]
                 learner = HitsRegressor()
                 learner.train(X, y_hits)
                 learners_by_regime[cluster_id] = learner
@@ -665,6 +688,24 @@ def blind_test_with_metadata(contests, blind_size=500, n_games=30, use_topology=
     print(f"   Bootstrap IC 95%: [{boot_l:.1f}, {boot_u:.1f}]")
     print(f"   Permutation p: {perm_p:.4f}")
 
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    report = {
+        "metrics": metrics,
+        "theoretical": theo,
+        "permutation_p": perm_p,
+        "metadata": meta,
+        "current_regime": int(current_regime),
+        "use_topology": use_topology,
+        "use_regime_models": use_regime_models,
+        "confidence_gate": confidence_gate,
+        "bootstrap_ci": [boot_l, boot_u, boot_m],
+        "distribution": dist
+    }
+
+    save_json(report,
+        f"reports/blind_test_v28_{timestamp}.json")
+    
     return metrics, theo, perm_p, meta, current_regime
 
 
@@ -743,7 +784,21 @@ def walk_forward_with_metadata(contests, n_windows=30, train_size=300, test_size
                 corr, pval = pearsonr(values[:len(diffs)], diffs[:len(values)])
                 sig = "🔴" if pval < 0.01 else "🟡" if pval < 0.05 else "🟢"
                 print(f"   {key:<25} r={corr:+.3f} p={pval:.4f} {sig}")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+    summary = {
+        "results": resultados,
+        "mean_diff": float(np.mean(diffs)),
+        "positive_windows": int(n_pos),
+        "total_windows": len(resultados),
+    }
+
+    if 'p' in locals():
+        summary["wilcoxon_p"] = float(p)
+
+    save_json( summary,
+        f"reports/walkforward_v28_{timestamp}.json" )
+    
     return resultados, window_metas
 
 
@@ -783,7 +838,18 @@ def train_meta_model(resultados):
     if hasattr(model, 'feature_importances_'):
         for name, imp in zip(meta_names, model.feature_importances_):
             print(f"   {name}: {imp:.3f}")
+    if hasattr(model, 'feature_importances_'):
+        meta_importance = {
+            name: float(imp)
+            for name, imp in zip(meta_names, model.feature_importances_)
+        }
 
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        save_json(
+            meta_importance,
+            f"reports/meta_model_importance_{timestamp}.json"
+        )
     return model
 
 
@@ -797,7 +863,9 @@ def main():
     contests = load_all_contests('resultados_lotofacil.csv')
     if contests is None: print("❌ Arquivo não encontrado"); return
     print(f"📂 {len(contests)} concursos")
-
+    ensure_reports_dir()
+        random.seed(42)
+        np.random.seed(42)
     regime_clusterer = RegimeClusterer(contests, n_clusters=4)
     print("\n📊 REGIMES:")
     for s in regime_clusterer.get_regime_stats():
