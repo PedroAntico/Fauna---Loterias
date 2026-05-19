@@ -75,23 +75,41 @@ CUSTO_APOSTA = 3.0
 # CARREGAMENTO DE DADOS
 # ============================================================
 def load_all_contests(csv_file='resultados_lotofacil.csv'):
-    if not os.path.exists(csv_file):
+
+    # caminho absoluto baseado no script
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    full_path = os.path.join(base_dir, csv_file)
+
+    print(f"📂 Tentando abrir: {full_path}")
+
+    if not os.path.exists(full_path):
+        print("❌ CSV não encontrado")
         return None
+
     contests = []
+
     try:
-        with open(csv_file, 'r', encoding='utf-8') as f:
+        with open(full_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
+
         for line in lines[1:]:
             parts = line.strip().split(';')
+
             if len(parts) >= 17:
                 contests.append({
                     'concurso': int(parts[0]),
                     'data': parts[1],
                     'dezenas': [int(x) for x in parts[2:17]]
                 })
+
         contests.sort(key=lambda x: x['concurso'])
+
+        print(f"✅ {len(contests)} concursos carregados")
+
         return contests
-    except:
+
+    except Exception as e:
+        print("❌ Erro lendo CSV:", e)
         return None
 
 
