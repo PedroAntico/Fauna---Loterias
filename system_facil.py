@@ -694,7 +694,7 @@ class AdaptivePortfolioOptimizer:
 # ============================================================
 # WALK-FORWARD COM META-MODELO (NOVO)
 # ============================================================
-def walk_forward_meta(contests, n_windows=30, train_size=300, test_size=50):
+def walk_forward_meta(contests, n_windows=10, train_size=300, test_size=50):
     print(f"\n🔬 WALK-FORWARD META-ADAPTATIVO ({n_windows} janelas)")
 
     # Construir Meta-Modelo primeiro (usa todas as janelas disponíveis)
@@ -718,7 +718,7 @@ def walk_forward_meta(contests, n_windows=30, train_size=300, test_size=50):
 
         # Medir edge nesta janela
         strat_payoff, rand_payoff = 0, 0
-        n_jogos = 30
+        n_jogos = 10
         for tc in test_data:
             actual = set(tc['dezenas'])
             candidates = opt.generate_candidates(2000)
