@@ -592,16 +592,16 @@ def permutation_test(strat_vals, rand_vals, n_perm=10000):
     n1 = len(strat_vals)
     extreme = 0
 
-for _ in range(n_perm):
-    np.random.shuffle(combined)
+    for _ in range(n_perm):
+        np.random.shuffle(combined)
 
     perm_diff = (
         np.mean(combined[:n1]) -
-        np.mean(combined[n1:])
-    )
+        np.mean(combined[n1:]))
 
     if abs(perm_diff) >= abs(observed):
         extreme += 1
+        
     return observed, extreme / n_perm
 
 
