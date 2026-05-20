@@ -520,7 +520,11 @@ def permutation_test(strat_vals, rand_vals, n_perm=10000):
     observed = np.mean(strat_vals) - np.mean(rand_vals)
     combined = np.concatenate([strat_vals, rand_vals])
     n1 = len(strat_vals)
-    extreme = sum(1 for _ in range(n_perm) if abs(np.mean(combined[:n1]) - np.mean(combined[n1:])) >= abs(observed))
+    for _ in range(n_perm):
+    np.random.shuffle(combined)
+    perm_diff = np.mean(combined[:n1]) - np.mean(combined[n1:])
+    if abs(perm_diff) >= abs(observed):
+        extreme += 1
     return observed, extreme / n_perm
 
 def rigorous_calibration(learner, context, test_draws, n_games=2000):
