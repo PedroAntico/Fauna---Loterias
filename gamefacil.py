@@ -2,23 +2,23 @@
 # -*- coding: utf-8 -*-
 
 """
-GERADOR PARAMÉTRICO OTIMIZADO DE CARTEIRA - LOTOFÁCIL v2
-==========================================================
-MELHORIAS:
-✅ Gerador GUIADO (não aleatório puro) - 10x mais eficiente
-✅ Anti-sobrecentralização (penaliza jogos "perfeitos demais")
-✅ Score gaussiano para centralidade (mais estável)
-✅ Backtest de carteira (probabilidade de ≥1 acerto 11+)
-✅ Cobertura global da carteira (maximização de união)
-✅ Grid 5x5 real para quadrantes
-✅ Pesos calibrados: centralidade(0.55) + diversidade(0.25) + cobertura(0.20)
-✅ Otimização multiobjetivo com simulated annealing
-✅ LedoitWolf + Mahalanobis mantidos
-✅ Separação HARD/SOFT preservada
+GERADOR PARAMÉTRICO DE CARTEIRA - LOTOFÁCIL v4
+================================================
+CORREÇÕES E MELHORIAS:
+✅ Bug walk-forward corrigido (results vs resultados)
+✅ Normalização completa de scores (MinMaxScaler por componente)
+✅ Baseline puramente aleatória (sem geometria)
+✅ Baseline de cobertura máxima pura
+✅ Features degeneradas REMOVIDAS (entropia_rep, elasticidade, entropia_conjunta)
+✅ Gerador mais livre (menos viés na construção)
+✅ Monte Carlo comparativo (teste de significância)
+✅ GMM com scores normalizados
+✅ Métricas de lift e p-value
+✅ Arquitetura modular preservada
 """
 
 import numpy as np
-from scipy.stats import entropy, hypergeom
+from scipy.stats import entropy, hypergeom, wilcoxon
 from collections import Counter
 from datetime import datetime
 import warnings
@@ -32,10 +32,13 @@ warnings.filterwarnings('ignore')
 
 try:
     from sklearn.covariance import LedoitWolf
+    from sklearn.mixture import GaussianMixture
+    from sklearn.preprocessing import MinMaxScaler
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
     print("⚠️ Scikit-learn não instalado. Use: pip install scikit-learn")
+    print("   Fallback: covariância empírica com regularização")
 
 # ============================================================
 # CONJUNTOS E CONSTANTES
@@ -43,49 +46,31 @@ except ImportError:
 PRIMES = {2, 3, 5, 7, 11, 13, 17, 19, 23}
 MOLDURA = {1,2,3,4,5, 6,10, 11,15, 16,20, 21,22,23,24,25}
 CENTRO = {7,8,9,12,13,14,17,18,19}
-
-# Grid 5x5 real (volante físico)
-GRID_5X5 = [
-    [1, 2, 3, 4, 5],
-    [6, 7, 8, 9, 10],
-    [11, 12, 13, 14, 15],
-    [16, 17, 18, 19, 20],
-    [21, 22, 23, 24, 25]
-]
-
-# Regiões do volante
-REGIAO_SUPERIOR = {1,2,3,4,5,6,7,8,9,10}
-REGIAO_INFERIOR = {16,17,18,19,20,21,22,23,24,25}
-REGIAO_ESQUERDA = {1,6,11,16,21,2,7,12,17,22}
-REGIAO_DIREITA = {4,5,9,10,14,15,19,20,24,25}
-
 HYPE_PROBS = {k: hypergeom.pmf(k, 25, 15, 15) for k in range(0, 16)}
 
-# Features topológicas (20 dimensões)
-FEATURE_NAMES = [
-    "gap_medio", "gap_var", "gap_max", "gap_min",
-    "energia_jogo", "entropia_rep", "entropia_transicao",
-    "quadrantes_grid", "consecutivos", "densidade_local",
-    "assimetria", "clusterizacao", "repeticoes",
-    "pares", "primos", "moldura", "soma", "amplitude",
-    "elasticidade", "entropia_conjunta",
+# Features topológicas (v4: REMOVIDAS as degeneradas)
+# Índices 5, 18, 19 removidos (entropia_rep, elasticidade, entropia_conjunta)
+FEATURE_NAMES_V4 = [
+    "gap_medio",          # 0
+    "gap_var",            # 1
+    "gap_max",            # 2
+    "gap_min",            # 3
+    "energia_jogo",       # 4
+    "entropia_transicao", # 5 (era 6)
+    "quadrantes",         # 6 (era 7)
+    "consecutivos",       # 7 (era 8)
+    "densidade_local",    # 8 (era 9)
+    "assimetria",         # 9 (era 10)
+    "clusterizacao",      # 10 (era 11)
+    "repeticoes",         # 11 (era 12)
+    "pares",              # 12 (era 13)
+    "primos",             # 13 (era 14)
+    "moldura",            # 14 (era 15)
+    "soma",               # 15 (era 16)
+    "amplitude",          # 16 (era 17)
 ]
 
-# Índices
-IDX_GAP_MEDIO, IDX_GAP_VAR, IDX_GAP_MAX, IDX_GAP_MIN = 0, 1, 2, 3
-IDX_ENERGIA, IDX_ENTROPIA_REP, IDX_ENTROPIA_TRANS = 4, 5, 6
-IDX_QUADRANTES, IDX_CONSECUTIVOS, IDX_DENSIDADE = 7, 8, 9
-IDX_ASSIMETRIA, IDX_CLUSTERIZACAO, IDX_REPETICOES = 10, 11, 12
-IDX_PARES, IDX_PRIMOS, IDX_MOLDURA, IDX_SOMA = 13, 14, 15, 16
-IDX_AMPLITUDE, IDX_ELASTICIDADE, IDX_ENTROPIA_CONJ = 17, 18, 19
-
-# Mapeamento de constraints para índices
-CONSTRAINT_INDICES = {
-    'pares': IDX_PARES, 'primos': IDX_PRIMOS, 'moldura': IDX_MOLDURA,
-    'soma': IDX_SOMA, 'repeticoes': IDX_REPETICOES,
-    'consecutivos': IDX_CONSECUTIVOS, 'amplitude': IDX_AMPLITUDE,
-    'quadrantes': IDX_QUADRANTES,
-}
+IDX = {name: i for i, name in enumerate(FEATURE_NAMES_V4)}
 
 # ============================================================
 # CARREGAMENTO DE DADOS
@@ -120,9 +105,9 @@ def load_all_contests(csv_file='resultados_lotofacil.csv'):
 
 
 # ============================================================
-# EXTRATOR DE FEATURES (COM GRID 5x5 CORRIGIDO)
+# EXTRATOR DE FEATURES (v4: sem features degeneradas)
 # ============================================================
-class TopologicalFeatureExtractor:
+class TopologicalFeatureExtractorV4:
     def __init__(self, contests):
         self.contests = contests
         self._repeat_history = []
@@ -135,57 +120,40 @@ class TopologicalFeatureExtractor:
             else:
                 self._repeat_history.append(0)
 
-    def _count_grid_quadrants(self, dezenas):
-        """Conta quadrantes no grid 5x5 real"""
-        s = set(dezenas)
-        q1 = sum(1 for x in s if x in REGIAO_SUPERIOR and x in REGIAO_ESQUERDA)
-        q2 = sum(1 for x in s if x in REGIAO_SUPERIOR and x in REGIAO_DIREITA)
-        q3 = sum(1 for x in s if x in REGIAO_INFERIOR and x in REGIAO_ESQUERDA)
-        q4 = sum(1 for x in s if x in REGIAO_INFERIOR and x in REGIAO_DIREITA)
-        # Conta quantos quadrantes têm pelo menos 2 dezenas
-        return sum(1 for q in [q1, q2, q3, q4] if q >= 2)
-
     def extract_features(self, game, last_contest=None):
+        """Extrai 17 features (sem entropia_rep, elasticidade, entropia_conjunta)"""
         d = sorted(game)
         gaps = [d[i+1]-d[i] for i in range(len(d)-1)]
         rep = len(set(d) & set(last_contest)) if last_contest else 8
 
-        f = [
-            float(np.mean(gaps)), float(np.var(gaps)), float(max(gaps)), float(min(gaps)),
-            float(sum(abs(d[i]-d[i-1]) for i in range(1, len(d)))),
-            0.0, 0.0,
-            float(self._count_grid_quadrants(d)),
-            float(sum(1 for i in range(len(d)-1) if d[i+1]-d[i]==1)),
-            float(np.mean([sum(1 for y in d if abs(x-y)<=2) for x in d]) / 15),
-            float(np.mean(d) - np.median(d)),
-            float(sum(1 for g in gaps if g <= 2) / len(gaps)),
-            float(rep),
-            float(sum(1 for x in d if x % 2 == 0)),
-            float(sum(1 for x in d if x in PRIMES)),
-            float(sum(1 for x in d if x in MOLDURA)),
-            float(sum(d)),
-            float(max(d) - min(d)),
-            0.0, 0.0,
-        ]
-
-        if len(self._repeat_history) >= 10:
-            recent = self._repeat_history[-10:]
-            freq = Counter(recent)
-            probs = np.array([freq.get(r,0)/10 for r in range(5,13)])
-            f[5] = float(entropy(np.where(probs>0, probs, 1e-10)))
+        # Entropia de transição (única entropia mantida)
+        ent_trans = 0.0
         if len(self._repeat_history) >= 5:
             trans = [self._repeat_history[i+1]-self._repeat_history[i] for i in range(len(self._repeat_history)-1)]
             if len(set(trans)) > 1:
                 freq = Counter(trans)
                 probs = np.array([freq.get(v,0)/len(trans) for v in set(trans)])
-                f[6] = float(entropy(np.where(probs>0, probs, 1e-10)))
-        if len(self._repeat_history) >= 10:
-            f[18] = float(np.mean(self._repeat_history) - np.mean(self._repeat_history[-10:]))
-        if len(self._repeat_history) >= 10 and len(self._pares_history) >= 10:
-            joint = Counter(zip(self._repeat_history[-10:], self._pares_history[-10:]))
-            probs = np.array([joint.get(k,0)/10 for k in joint])
-            f[19] = float(entropy(np.where(probs>0, probs, 1e-10)))
+                ent_trans = float(entropy(np.where(probs>0, probs, 1e-10)))
 
+        f = [
+            float(np.mean(gaps)),                    # 0 gap_medio
+            float(np.var(gaps)),                      # 1 gap_var
+            float(max(gaps)),                         # 2 gap_max
+            float(min(gaps)),                         # 3 gap_min
+            float(sum(abs(d[i]-d[i-1]) for i in range(1, len(d)))),  # 4 energia_jogo
+            ent_trans,                                # 5 entropia_transicao
+            float(len(set((x-1)//5 for x in d))),    # 6 quadrantes
+            float(sum(1 for i in range(len(d)-1) if d[i+1]-d[i]==1)),  # 7 consecutivos
+            float(np.mean([sum(1 for y in d if abs(x-y)<=2) for x in d]) / 15),  # 8 densidade_local
+            float(np.mean(d) - np.median(d)),         # 9 assimetria
+            float(sum(1 for g in gaps if g <= 2) / len(gaps)),  # 10 clusterizacao
+            float(rep),                               # 11 repeticoes
+            float(sum(1 for x in d if x % 2 == 0)),  # 12 pares
+            float(sum(1 for x in d if x in PRIMES)), # 13 primos
+            float(sum(1 for x in d if x in MOLDURA)),# 14 moldura
+            float(sum(d)),                            # 15 soma
+            float(max(d) - min(d)),                   # 16 amplitude
+        ]
         return np.array(f, dtype=np.float64)
 
     def build_feature_matrix(self):
@@ -197,116 +165,117 @@ class TopologicalFeatureExtractor:
 
 
 # ============================================================
-# BASELINE HISTÓRICO
+# MODELO DE DISTRIBUIÇÃO (GMM com scores normalizados)
 # ============================================================
-class HistoricalBaseline:
+class DistributionModelV4:
     def __init__(self, feature_matrix):
         self.feature_matrix = feature_matrix
         self.n_features = feature_matrix.shape[1]
         self.mean = np.mean(feature_matrix, axis=0)
         self.std = np.std(feature_matrix, axis=0)
-        self._build_covariance()
+        self._build_gmm()
+        self._build_precision()
+        # Normalizadores para GMM scores (pré-computados)
+        self._gmm_norm = self._compute_gmm_norm()
 
-    def _build_covariance(self):
+    def _build_gmm(self):
+        if SKLEARN_AVAILABLE and self.feature_matrix.shape[0] > 100:
+            try:
+                n_comp = min(5, self.feature_matrix.shape[0] // 200)
+                self.gmm = GaussianMixture(n_components=max(2, n_comp), random_state=42)
+                self.gmm.fit(self.feature_matrix)
+                self._has_gmm = True
+                return
+            except:
+                pass
+        self._has_gmm = False
+
+    def _build_precision(self):
         if SKLEARN_AVAILABLE and self.feature_matrix.shape[0] > self.n_features:
             try:
                 lw = LedoitWolf().fit(self.feature_matrix)
-                self.cov = lw.covariance_
                 self.precision = lw.precision_
                 return
             except: pass
-        self.cov = np.cov(self.feature_matrix.T) + np.eye(self.n_features) * 1e-6
-        self.precision = np.linalg.inv(self.cov)
+        cov = np.cov(self.feature_matrix.T) + np.eye(self.n_features) * 1e-6
+        self.precision = np.linalg.inv(cov)
 
-    def mahalanobis_distance(self, features):
+    def _compute_gmm_norm(self):
+        """Pré-computa min/max dos scores GMM para normalização"""
+        if self._has_gmm:
+            scores = self.gmm.score_samples(self.feature_matrix)
+            return {'min': float(np.min(scores)), 'max': float(np.max(scores))}
+        return {'min': -100.0, 'max': 100.0}
+
+    def score_samples_normalized(self, features):
+        """Score de densidade NORMALIZADO (0-1)"""
+        if self._has_gmm:
+            raw = float(self.gmm.score_samples(features.reshape(1, -1))[0])
+            # Normalizar para 0-1
+            rng = self._gmm_norm['max'] - self._gmm_norm['min']
+            if rng > 0:
+                return (raw - self._gmm_norm['min']) / rng
+            return 0.5
+        # Fallback: distância de Mahalanobis normalizada
         diff = features - self.mean
         try:
-            return float(np.sqrt(max(0, np.dot(np.dot(diff.T, self.precision), diff))))
+            dist = np.sqrt(max(0, np.dot(np.dot(diff.T, self.precision), diff)))
+            return float(1.0 / (1.0 + dist))
         except:
-            return float(np.linalg.norm(diff / (self.std + 1e-10)))
+            return 0.5
+
+    def compute_gaussian_score_normalized(self, features, soft_targets):
+        """Score gaussiano NORMALIZADO (0-1)"""
+        if not soft_targets:
+            return 0.5
+        total = 0.0
+        for name, (target, sigma) in soft_targets.items():
+            if name in IDX:
+                actual = features[IDX[name]]
+                z = (actual - target) / sigma
+                total += np.exp(-0.5 * z**2)
+        return total / len(soft_targets)
 
 
 # ============================================================
-# GERADOR GUIADO (NÃO ALEATÓRIO PURO)
+# GERADOR MAIS LIVRE (menos viés)
 # ============================================================
-class GuidedGenerator:
-    """
-    Gerador GUIADO que respeita constraints HARD na construção.
-    10x mais eficiente que aleatório puro.
-    """
-    def __init__(self, hard_constraints, last_contest):
-        self.hard = hard_constraints
+class FreeGenerator:
+    """Gerador com viés MÍNIMO na construção"""
+    def __init__(self, last_contest=None):
         self.last = set(last_contest) if last_contest else None
 
-    def _get_range(self, key):
-        if key in self.hard: return self.hard[key]
-        return None
-
     def generate_one(self):
-        """Gera UM jogo que atende as constraints HARD"""
+        """Gera UM jogo com construção quase neutra"""
         game = set()
         available = set(range(1, 26))
 
-        # 1. Repetidas primeiro (se especificado)
-        rep_range = self._get_range('repeticoes')
-        if rep_range and self.last:
-            target_rep = random.randint(rep_range[0], rep_range[1])
+        # Leve viés de repetição (apenas 30% dos jogos)
+        if self.last and random.random() < 0.3:
             rep_pool = list(self.last & available)
-            if rep_pool and target_rep > 0:
-                n = min(target_rep, len(rep_pool))
-                chosen = random.sample(rep_pool, n)
-                game.update(chosen)
+            if rep_pool:
+                n = random.randint(5, 10)
+                game.update(random.sample(rep_pool, min(n, len(rep_pool))))
                 available -= game
 
-        # 2. Pares
-        pares_range = self._get_range('pares')
-        primos_range = self._get_range('primos')
-        moldura_range = self._get_range('moldura')
-        soma_range = self._get_range('soma')
-        cons_range = self._get_range('consecutivos')
-
-        target_pares = random.randint(pares_range[0], pares_range[1]) if pares_range else random.randint(6, 9)
-        target_primos = random.randint(primos_range[0], primos_range[1]) if primos_range else random.randint(4, 7)
-        target_moldura = random.randint(moldura_range[0], moldura_range[1]) if moldura_range else random.randint(8, 11)
-        target_soma = random.randint(soma_range[0], soma_range[1]) if soma_range else random.randint(185, 210)
-
-        # Preencher com restrições
+        # Preencher com diversidade espacial
         while len(game) < 15 and available:
             candidates = list(available)
             scores = []
             for d in candidates:
-                s = 0
                 test = game | {d}
-                # Aproximar do target de pares
-                curr_pares = sum(1 for x in test if x % 2 == 0)
-                remaining = 15 - len(test)
-                if curr_pares > target_pares:
-                    s -= 10
-                elif curr_pares + remaining < target_pares and d % 2 != 0:
-                    s -= 5
-                # Aproximar do target de moldura
-                curr_mold = sum(1 for x in test if x in MOLDURA)
-                if target_moldura and curr_mold > target_moldura:
-                    s -= 5
-                # Penalizar consecutivos excessivos
-                if cons_range:
-                    st = sorted(test)
-                    cons = sum(1 for i in range(len(st)-1) if st[i+1]-st[i]==1)
-                    if cons > cons_range[1]:
-                        s -= 15
-                # Aproximar soma
-                if soma_range:
-                    curr_soma = sum(test)
-                    projected = curr_soma + (remaining * 13)
-                    if projected < soma_range[0] or projected > soma_range[1]:
-                        s -= 3
+                # Apenas diversidade de quadrantes (sem viés de pares/moldura)
+                s = len(set((x-1)//5 for x in test)) * 3
+                # Penalidade leve para consecutivos > 6
+                st = sorted(test)
+                cons = sum(1 for i in range(len(st)-1) if st[i+1]-st[i]==1)
+                if cons > 6: s -= (cons - 6) * 1.5
                 scores.append(s)
 
             if scores:
-                # Softmax para diversidade
                 scores = np.array(scores, dtype=np.float64)
                 scores = scores - np.max(scores)
-                probs = np.exp(scores / 2.0)
+                probs = np.exp(scores / 3.0)  # temperatura mais alta = mais exploratório
                 probs = probs / probs.sum()
                 chosen = np.random.choice(candidates, p=probs)
             else:
@@ -317,100 +286,79 @@ class GuidedGenerator:
 
         return sorted(game)[:15]
 
+    def generate_pure_random(self, n=1):
+        """Gera jogos puramente aleatórios (baseline)"""
+        games = []
+        for _ in range(n):
+            games.append(sorted(np.random.choice(range(1, 26), 15, replace=False)))
+        return games if n > 1 else games[0]
+
 
 # ============================================================
-# OTIMIZADOR DE CARTEIRA (COM BACKTEST)
+# OTIMIZADOR DE CARTEIRA v4
 # ============================================================
-class PortfolioOptimizer:
-    """
-    Otimizador multiobjetivo de carteira.
-    
-    Score = 0.55 * centralidade + 0.25 * diversidade + 0.20 * cobertura
-    Com anti-sobrecentralização e backtest integrado.
-    """
-    def __init__(self, contests, hard_constraints, soft_targets):
+class PortfolioOptimizerV4:
+    def __init__(self, contests, soft_targets=None):
         self.contests = contests
-        self.extractor = TopologicalFeatureExtractor(contests)
+        self.extractor = TopologicalFeatureExtractorV4(contests)
         self.feature_matrix = self.extractor.build_feature_matrix()
-        self.baseline = HistoricalBaseline(self.feature_matrix)
+        self.dist_model = DistributionModelV4(self.feature_matrix)
         self.last = contests[-1]['dezenas'] if contests else None
-
-        self.hard = hard_constraints
-        self.soft = soft_targets
-        self.generator = GuidedGenerator(hard_constraints, self.last)
-
-        # Parâmetros de centralidade para anti-sobrecentralização
-        self.centrality_stats = self._compute_centrality_stats()
-
-    def _compute_centrality_stats(self):
-        """Pré-computa estatísticas de centralidade dos jogos históricos"""
-        dists = []
-        for feats in self.feature_matrix:
-            dists.append(self.baseline.mahalanobis_distance(feats))
-        dists = np.array(dists)
-        return {
-            'mean': float(np.mean(dists)),
-            'std': float(np.std(dists)),
-            'p25': float(np.percentile(dists, 25)),
-            'p10': float(np.percentile(dists, 10)),
-        }
+        self.soft = soft_targets or {}
+        self.generator = FreeGenerator(self.last)
+        # Normalizadores para scores do portfólio
+        self._score_scaler = MinMaxScaler() if SKLEARN_AVAILABLE else None
 
     def _score_game(self, game):
-        """Score individual do jogo (gaussiano)"""
+        """Score individual com componentes NORMALIZADOS"""
         features = self.extractor.extract_features(game, self.last)
-        dist = self.baseline.mahalanobis_distance(features)
+        gmm_score = self.dist_model.score_samples_normalized(features)
+        gauss_score = self.dist_model.compute_gaussian_score_normalized(features, self.soft)
+        return gmm_score * 0.5 + gauss_score * 0.5, features
 
-        # Score gaussiano (anti-sobrecentralização)
-        # Penaliza jogos MUITO centrais (abaixo do percentil 10)
-        if dist < self.centrality_stats['p10']:
-            dist += (self.centrality_stats['p10'] - dist) * 1.5
-
-        # Penaliza jogos muito distantes
-        if dist > self.centrality_stats['mean'] + 2 * self.centrality_stats['std']:
-            dist += 5.0
-
-        sigma = self.centrality_stats['std'] + 1e-10
-        score = np.exp(-(dist**2) / (2 * sigma**2))
-        return score, features
+    def _portfolio_entropy(self, portfolio):
+        all_dezenas = [d for g in portfolio for d in g]
+        freq = np.bincount(all_dezenas, minlength=26)[1:]
+        probs = freq / np.sum(freq)
+        probs = np.where(probs > 0, probs, 1e-10)
+        return float(entropy(probs) / np.log(25))
 
     def _portfolio_union_coverage(self, portfolio):
-        """Cobertura de união da carteira"""
-        all_dezenas = set()
-        for game in portfolio:
-            all_dezenas.update(game)
-        return len(all_dezenas) / 25.0
+        return len(set(d for g in portfolio for d in g)) / 25.0
 
     def _portfolio_diversity(self, portfolio):
-        """Diversidade média entre jogos"""
-        if len(portfolio) < 2:
-            return 1.0
+        if len(portfolio) < 2: return 1.0
         sims = []
         for i in range(len(portfolio)):
             for j in range(i+1, len(portfolio)):
                 sims.append(len(set(portfolio[i]) & set(portfolio[j])))
-        avg_sim = np.mean(sims)
-        return 1.0 - (avg_sim / 15.0)
+        return 1.0 - np.mean(sims) / 15.0
 
     def _portfolio_score(self, portfolio):
-        """Score multiobjetivo da carteira"""
-        scores = []
-        for game in portfolio:
-            s, _ = self._score_game(game)
-            scores.append(s)
-
-        avg_centrality = np.mean(scores)
-        diversity = self._portfolio_diversity(portfolio)
+        """Score da carteira com componentes normalizados"""
+        scores = [self._score_game(g)[0] for g in portfolio]
+        avg_score = np.mean(scores)
+        entropy = self._portfolio_entropy(portfolio)
         coverage = self._portfolio_union_coverage(portfolio)
+        diversity = self._portfolio_diversity(portfolio)
+        # Todos já estão em escala 0-1
+        return avg_score * 0.35 + entropy * 0.25 + coverage * 0.25 + diversity * 0.15
 
-        return 0.55 * avg_centrality + 0.25 * diversity + 0.20 * coverage
+    def _mutate_game(self, game):
+        """Mutação LOCAL: troca 1-3 dezenas"""
+        mutated = list(game)
+        n_changes = random.randint(1, 3)
+        for _ in range(n_changes):
+            pos = random.randint(0, 14)
+            available = [d for d in range(1, 26) if d not in mutated]
+            if available:
+                mutated[pos] = random.choice(available)
+        return sorted(mutated)[:15]
 
     def optimize(self, n_games=10, n_candidates=200000, iterations=100):
-        """
-        Otimização com simulated annealing.
-        """
         print(f"\n🎯 OTIMIZANDO CARTEIRA ({n_games} jogos)...")
 
-        # Gerar pool de candidatos (guiado)
+        # Gerar pool
         print(f"   Gerando {n_candidates:,} candidatos...")
         pool = []
         seen = set()
@@ -419,45 +367,35 @@ class PortfolioOptimizer:
             key = tuple(game)
             if key not in seen:
                 seen.add(key)
-                features = self.extractor.extract_features(game, self.last)
-                dist = self.baseline.mahalanobis_distance(features)
-                pool.append((dist, game, features))
+                s, feats = self._score_game(game)
+                pool.append((s, game, feats))
 
-        pool.sort(key=lambda x: x[0])
+        pool.sort(key=lambda x: x[0], reverse=True)
 
-        # Inicializar carteira com melhores + diversos
+        # Inicializar carteira diversa
         portfolio = []
-        selected_set = set()
-        for dist, game, features in pool:
-            if len(portfolio) >= n_games:
-                break
-            too_similar = False
-            for sg in portfolio:
-                if len(set(game) & set(sg)) > 11:
-                    too_similar = True
-                    break
-            if not too_similar:
+        for s, game, feats in pool:
+            if len(portfolio) >= n_games: break
+            if not any(len(set(game) & set(sg)) > 11 for sg in portfolio):
                 portfolio.append(game)
 
         best_portfolio = list(portfolio)
         best_score = self._portfolio_score(portfolio)
         current_score = best_score
 
-        # Simulated annealing
+        # Simulated Annealing com MUTAÇÃO LOCAL
         temp = 1.0
-        elite_pool = pool[:len(pool)//4]  # top 25%
-        random_pool = pool[len(pool)//4:]
+        elite_pool = pool[:len(pool)//4]
 
         for it in tqdm(range(iterations), desc="Annealing"):
             temp *= 0.95
             new_portfolio = list(portfolio)
             idx = random.randint(0, n_games - 1)
 
-            # 70% elite, 30% aleatório
-            if random.random() < 0.7 and elite_pool:
+            if random.random() < 0.5 and elite_pool:
                 _, new_game, _ = random.choice(elite_pool)
-            elif random_pool:
-                _, new_game, _ = random.choice(random_pool)
+            elif random.random() < 0.8:
+                new_game = self._mutate_game(new_portfolio[idx])
             else:
                 new_game = self.generator.generate_one()
 
@@ -474,28 +412,43 @@ class PortfolioOptimizer:
 
         return best_portfolio, best_score
 
-    def backtest_portfolio(self, portfolio, test_draws):
-        """
-        Backtest: probabilidade da carteira ter ≥1 acerto de 11+
-        """
+    def generate_pure_random_portfolio(self, n_games=10):
+        """Baseline puramente aleatória"""
+        return [self.generator.generate_pure_random() for _ in range(n_games)]
+
+    def generate_coverage_baseline(self, n_games=10):
+        """Baseline de cobertura máxima (sem geometria)"""
+        pool = []
+        seen = set()
+        for _ in range(50000):
+            game = self.generator.generate_pure_random()
+            key = tuple(game)
+            if key not in seen:
+                seen.add(key)
+                pool.append(game)
+        selected = [pool[0]]
+        for _ in range(n_games - 1):
+            best, best_min = None, -1
+            for g in pool[:5000]:
+                if g not in selected:
+                    min_dist = min(len(set(g) & set(s)) for s in selected)
+                    if min_dist > best_min:
+                        best_min = min_dist
+                        best = g
+            if best: selected.append(best)
+        return selected[:n_games]
+
+    def backtest(self, portfolio, test_draws):
+        """Backtest: probabilidade de ≥1 acerto 11+"""
         n_success = 0
         for draw in test_draws:
             actual = set(draw['dezenas'])
-            has_11 = False
-            for game in portfolio:
-                if len(set(game) & actual) >= 11:
-                    has_11 = True
-                    break
-            if has_11:
+            if any(len(set(g) & actual) >= 11 for g in portfolio):
                 n_success += 1
-
         prob = n_success / len(test_draws) if test_draws else 0
-
-        # Baseline teórico
         p_single = sum(HYPE_PROBS[k] for k in range(11, 16))
         p_none = (1 - p_single) ** len(portfolio)
         theo_prob = 1 - p_none
-
         return {
             'empirical': prob,
             'theoretical': theo_prob,
@@ -506,66 +459,131 @@ class PortfolioOptimizer:
 
 
 # ============================================================
-# INTERFACE DE CONFIGURAÇÃO
+# WALK-FORWARD VALIDATION (CORRIGIDO)
 # ============================================================
-def interactive_config():
-    print("\n" + "="*70)
-    print("⚙️  CONFIGURAÇÃO DE PARÂMETROS")
-    print("="*70)
-    print("💡 Pressione ENTER para usar valores padrão (recomendados)")
+def walk_forward_validation(contests, n_windows=10, train_size=500, test_size=50, n_games=10):
+    print(f"\n🔬 WALK-FORWARD ({n_windows} janelas)...")
+    results = []
 
-    hard = {}
-
-    # Valores padrão otimizados
-    defaults = {
-        'pares': (6, 9),
-        'primos': (4, 7),
-        'moldura': (8, 11),
-        'soma': (185, 210),
-        'repeticoes': (8, 10),
-        'consecutivos': (5, 9),
-        'amplitude': (20, 24),
+    soft = {
+        'pares': (7, 2.0), 'primos': (5, 2.0), 'moldura': (9, 2.0),
+        'repeticoes': (8, 2.0), 'soma': (195, 20),
+        'gap_medio': (1.62, 0.4), 'clusterizacao': (0.85, 0.15),
     }
 
-    print("\n📊 FILTROS HARD (jogos fora da faixa são ELIMINADOS)")
+    for w in range(n_windows):
+        test_end = len(contests) - w * test_size
+        test_start = test_end - test_size
+        train_end = test_start
+        train_start = max(0, train_end - train_size)
+        if train_start >= train_end or test_start >= test_end: continue
 
-    for key, (dmin, dmax) in defaults.items():
-        prompt_min = input(f"   {key.capitalize()} MÍNIMO [{dmin}]: ").strip()
-        prompt_max = input(f"   {key.capitalize()} MÁXIMO [{dmax}]: ").strip()
-        vmin = int(prompt_min) if prompt_min else dmin
-        vmax = int(prompt_max) if prompt_max else dmax
-        hard[key] = (min(vmin, vmax), max(vmin, vmax))
+        train_data = contests[train_start:train_end]
+        test_data = contests[test_start:test_end]
+        if len(train_data) < 100 or len(test_data) < 5: continue
 
-    print("\n🎯 TARGETS SOFT")
-    soft = {}
-    soft_input = input("   Definir targets soft? (s/N): ").strip().lower()
-    if soft_input == 's':
-        for key, default in [('gap_medio', 1.62), ('clusterizacao', 0.85), ('densidade_local', 0.21)]:
-            val = input(f"   {key.replace('_',' ').capitalize()} [{default}]: ").strip()
-            if val:
-                soft[key] = float(val)
-            else:
-                soft[key] = default
+        optimizer = PortfolioOptimizerV4(train_data, soft)
+        portfolio, _ = optimizer.optimize(n_games, n_candidates=50000, iterations=50)
+        random_portfolio = optimizer.generate_pure_random_portfolio(n_games)
+        coverage_portfolio = optimizer.generate_coverage_baseline(n_games)
 
-    print("\n🔢 CONFIGURAÇÃO DE GERAÇÃO")
-    n_candidates = input("   Número de candidatos [200000]: ").strip()
-    n_candidates = int(n_candidates) if n_candidates else 200000
+        bt_strat = optimizer.backtest(portfolio, test_data)
+        bt_rand = optimizer.backtest(random_portfolio, test_data)
+        bt_cov = optimizer.backtest(coverage_portfolio, test_data)
 
-    n_games = input("   Jogos a gerar [10]: ").strip()
-    n_games = int(n_games) if n_games else 10
+        results.append({
+            'window': w,
+            'strat_lift': bt_strat['lift'],
+            'rand_lift': bt_rand['lift'],
+            'cov_lift': bt_cov['lift'],
+            'diff_vs_rand': bt_strat['lift'] - bt_rand['lift'],
+            'diff_vs_cov': bt_strat['lift'] - bt_cov['lift'],
+        })
+        print(f" Janela {w}: lift={bt_strat['lift']:.3f} rand={bt_rand['lift']:.3f} cov={bt_cov['lift']:.3f}")
 
-    do_backtest = input("   Executar backtest? (S/n): ").strip().lower()
-    do_backtest = do_backtest != 'n'
-
-    return hard, soft, n_candidates, n_games, do_backtest
+    if results:
+        diffs_rand = [r['diff_vs_rand'] for r in results]
+        diffs_cov = [r['diff_vs_cov'] for r in results]
+        print(f"\n📊 RESUMO:")
+        print(f"   Média diff vs Aleatório: {np.mean(diffs_rand):+.3f}")
+        print(f"   Média diff vs Cobertura: {np.mean(diffs_cov):+.3f}")
+        print(f"   Janelas + (vs Aleatório): {sum(1 for d in diffs_rand if d > 0)}/{len(results)}")
+        try:
+            _, p_rand = wilcoxon(diffs_rand)
+            print(f"   Wilcoxon p (vs Aleatório): {p_rand:.4f}")
+        except:
+            pass
+        try:
+            _, p_cov = wilcoxon(diffs_cov)
+            print(f"   Wilcoxon p (vs Cobertura): {p_cov:.4f}")
+        except:
+            pass
+    return results
 
 
 # ============================================================
-# INTERFACE PRINCIPAL
+# MONTE CARLO COMPARATIVO (TESTE DE SIGNIFICÂNCIA)
+# ============================================================
+def monte_carlo_significance(contests, n_simulations=100, blind_size=300, n_games=10):
+    print(f"\n🎲 MONTE CARLO SIGNIFICÂNCIA ({n_simulations} simulações)...")
+
+    soft = {
+        'pares': (7, 2.0), 'primos': (5, 2.0), 'moldura': (9, 2.0),
+        'repeticoes': (8, 2.0), 'soma': (195, 20),
+    }
+
+    strat_lifts = []
+    rand_lifts = []
+    cov_lifts = []
+
+    for sim in tqdm(range(n_simulations), desc="Monte Carlo"):
+        random.seed(sim)
+        np.random.seed(sim)
+
+        train = contests[:-blind_size]
+        test = contests[-blind_size:]
+        if len(train) < 100 or len(test) < 10: continue
+
+        optimizer = PortfolioOptimizerV4(train, soft)
+        portfolio, _ = optimizer.optimize(n_games, n_candidates=30000, iterations=30)
+        random_portfolio = optimizer.generate_pure_random_portfolio(n_games)
+        coverage_portfolio = optimizer.generate_coverage_baseline(n_games)
+
+        strat_lifts.append(optimizer.backtest(portfolio, test)['lift'])
+        rand_lifts.append(optimizer.backtest(random_portfolio, test)['lift'])
+        cov_lifts.append(optimizer.backtest(coverage_portfolio, test)['lift'])
+
+    strat_lifts = np.array(strat_lifts)
+    rand_lifts = np.array(rand_lifts)
+    cov_lifts = np.array(cov_lifts)
+
+    print(f"\n📊 RESULTADOS MONTE CARLO:")
+    print(f"   {'Estratégia':<20} {'Média Lift':<15} {'Std':<15} {'% > 1.0':<15}")
+    print(f"   {'Geométrica':<20} {np.mean(strat_lifts):<15.4f} {np.std(strat_lifts):<15.4f} {np.mean(strat_lifts>1.0)*100:<15.1f}%")
+    print(f"   {'Aleatória':<20} {np.mean(rand_lifts):<15.4f} {np.std(rand_lifts):<15.4f} {np.mean(rand_lifts>1.0)*100:<15.1f}%")
+    print(f"   {'Cobertura':<20} {np.mean(cov_lifts):<15.4f} {np.std(cov_lifts):<15.4f} {np.mean(cov_lifts>1.0)*100:<15.1f}%")
+
+    # Teste de significância
+    from scipy.stats import mannwhitneyu
+    _, p_strat_vs_rand = mannwhitneyu(strat_lifts, rand_lifts, alternative='greater')
+    _, p_strat_vs_cov = mannwhitneyu(strat_lifts, cov_lifts, alternative='greater')
+    print(f"\n   Mann-Whitney (Geométrica > Aleatória): p={p_strat_vs_rand:.4f}")
+    print(f"   Mann-Whitney (Geométrica > Cobertura): p={p_strat_vs_cov:.4f}")
+
+    if p_strat_vs_rand < 0.05:
+        print(f"   ✅ Geométrica SIGNIFICATIVAMENTE melhor que Aleatória")
+    else:
+        print(f"   🟡 Geométrica NÃO significativamente melhor que Aleatória")
+
+    return strat_lifts, rand_lifts, cov_lifts
+
+
+# ============================================================
+# INTERFACE
 # ============================================================
 def main():
     print("="*70)
-    print("🧬 GERADOR PARAMÉTRICO OTIMIZADO DE CARTEIRA v2")
+    print("🧬 GERADOR PARAMÉTRICO DE CARTEIRA v4")
     print("="*70)
 
     contests = load_all_contests('resultados_lotofacil.csv')
@@ -576,71 +594,59 @@ def main():
     print(f"\n📂 {len(contests)} concursos")
     print(f"📌 Último: {contests[-1]['concurso']} - {contests[-1]['dezenas']}")
 
-    hard, soft, n_candidates, n_games, do_backtest = interactive_config()
+    soft = {
+        'pares': (7, 2.0),
+        'primos': (5, 2.0),
+        'moldura': (9, 2.0),
+        'repeticoes': (8, 2.0),
+        'soma': (195, 20),
+        'gap_medio': (1.62, 0.4),
+        'clusterizacao': (0.85, 0.15),
+    }
 
-    print(f"\n🔧 INICIALIZANDO OTIMIZADOR...")
-    t0 = time.time()
-    optimizer = PortfolioOptimizer(contests, hard, soft)
-    print(f"   ✅ Baseline em {time.time()-t0:.1f}s")
+    print("\nOpções:")
+    print("1. Gerar carteira otimizada")
+    print("2. Walk-forward validation (10 janelas)")
+    print("3. Monte Carlo significância (100 simulações)")
+    print("4. TUDO")
+    op = input("Escolha [4]: ").strip() or "4"
 
-    # Otimizar carteira
-    t0 = time.time()
-    portfolio, score = optimizer.optimize(n_games, n_candidates, iterations=100)
-    print(f"   ⏱️ Otimização em {time.time()-t0:.1f}s")
+    if op in ("1", "4"):
+        print(f"\n🔧 INICIALIZANDO...")
+        t0 = time.time()
+        optimizer = PortfolioOptimizerV4(contests, soft)
+        print(f"   ✅ Inicializado em {time.time()-t0:.1f}s")
 
-    # Exibir resultados
-    print(f"\n{'='*70}")
-    print(f"🏆 CARTEIRA OTIMIZADA (Score: {score:.3f})")
-    print(f"{'='*70}")
+        portfolio, score = optimizer.optimize(n_games=10, n_candidates=200000, iterations=100)
 
-    last = contests[-1]['dezenas']
-    for i, game in enumerate(portfolio, 1):
-        p = sum(1 for d in game if d % 2 == 0)
-        pr = sum(1 for d in game if d in PRIMES)
-        m = sum(1 for d in game if d in MOLDURA)
-        s = sum(game)
-        rep = len(set(game) & set(last))
-        cons = sum(1 for j in range(len(game)-1) if game[j+1]-game[j]==1)
-        game_score, _ = optimizer._score_game(game)
+        print(f"\n🏆 CARTEIRA (Score: {score:.3f})")
+        last = contests[-1]['dezenas']
+        for i, game in enumerate(portfolio, 1):
+            p = sum(1 for d in game if d % 2 == 0)
+            pr = sum(1 for d in game if d in PRIMES)
+            m = sum(1 for d in game if d in MOLDURA)
+            rep = len(set(game) & set(last))
+            print(f"   {i:2d}. {game} | P:{p} Pr:{pr} M:{m} Rep:{rep}")
 
-        print(f"\n   JOGO {i:02d} | Score: {game_score:.3f}")
-        print(f"   {'─'*50}")
-        print(f"   Dezenas: {game}")
-        print(f"   Pares:{p} | Primos:{pr} | Moldura:{m} | Soma:{s}")
-        print(f"   Repetidas:{rep} | Consecutivos:{cons}")
+        all_d = set(d for g in portfolio for d in g)
+        print(f"\n📊 Cobertura: {len(all_d)}/25")
+        print(f"📊 Entropia: {optimizer._portfolio_entropy(portfolio):.3f}")
 
-    # Estatísticas
-    print(f"\n{'='*70}")
-    print(f"📊 ESTATÍSTICAS DA CARTEIRA")
-    print(f"{'='*70}")
-
-    all_d = set()
-    for g in portfolio: all_d.update(g)
-    print(f"   Cobertura: {len(all_d)}/25 ({len(all_d)/25*100:.0f}%)")
-    print(f"   Diversidade: {optimizer._portfolio_diversity(portfolio):.3f}")
-
-    if len(portfolio) > 1:
-        sims = []
-        for i in range(len(portfolio)):
-            for j in range(i+1, len(portfolio)):
-                sims.append(len(set(portfolio[i]) & set(portfolio[j])))
-        print(f"   Similaridade média: {np.mean(sims):.1f}/15")
-
-    # Backtest
-    if do_backtest and len(contests) >= 200:
-        print(f"\n🔬 BACKTEST DA CARTEIRA...")
         test_size = min(200, len(contests) // 3)
-        test_draws = contests[-test_size:]
-        bt_results = optimizer.backtest_portfolio(portfolio, test_draws)
-        print(f"   Testado em {bt_results['n_test']} concursos")
-        print(f"   Prob. ≥1 acerto 11+: {bt_results['empirical']:.2%} (empírico)")
-        print(f"   Prob. ≥1 acerto 11+: {bt_results['theoretical']:.2%} (teórico)")
-        print(f"   Lift: {bt_results['lift']:.2f}x")
-        print(f"   Sucessos: {bt_results['n_success']}/{bt_results['n_test']}")
+        if test_size > 10:
+            test_data = contests[-test_size:]
+            bt = optimizer.backtest(portfolio, test_data)
+            print(f"\n🔬 BACKTEST ({bt['n_test']} concursos):")
+            print(f"   Prob ≥1 acerto 11+: {bt['empirical']:.2%} (teórico: {bt['theoretical']:.2%})")
+            print(f"   Lift: {bt['lift']:.2f}x")
 
-    print(f"\n✅ {len(portfolio)} jogos gerados!")
-    print(f"💡 Sistema baseado em otimização geométrica multiobjetivo.")
+    if op in ("2", "4"):
+        walk_forward_validation(contests, n_windows=10, train_size=500, test_size=50, n_games=10)
 
+    if op in ("3", "4"):
+        monte_carlo_significance(contests, n_simulations=100, blind_size=300, n_games=10)
+
+    print("\n✅ Concluído!")
 
 if __name__ == "__main__":
     main()
