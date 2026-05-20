@@ -61,21 +61,62 @@ FEATURE_NAMES = [
 # CARREGAMENTO DE DADOS
 # ============================================================
 def load_all_contests(csv_file='resultados_lotofacil.csv'):
-    if not os.path.exists(csv_file): return None
-    contests = []
-    try:
-        with open(csv_file, 'r', encoding='utf-8') as f:
-            for line in f.readlines()[1:]:
-                parts = line.strip().split(';')
-                if len(parts) >= 17:
-                    contests.append({
-                        'concurso': int(parts[0]), 'data': parts[1],
-                        'dezenas': [int(x) for x in parts[2:17]]
-                    })
-        contests.sort(key=lambda x: x['concurso'])
-        return contests
-    except: return None
 
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    csv_path = os.path.join(base_dir, csv_file)
+
+    if not os.path.exists(csv_path):
+        print(f"❌ Arquivo não encontrado: {csv_path}")
+        return None
+
+    contests = []
+
+    try:
+        print(f"📂 Tentando abrir: {csv_path}")
+
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+
+        for i, line in enumerate(lines[1:]):  # pula cabeçalho
+
+            parts = line.strip().split(';')
+
+            # DEBUG
+            if len(parts) < 17:
+                print(f"⚠️ Linha {i+2} inválida: {parts}")
+                continue
+
+            try:
+                concurso = int(parts[0])
+                data = parts[1]
+
+                dezenas = []
+
+                # pega EXATAMENTE as 15 bolas
+                for x in parts[2:17]:
+                    dezenas.append(int(x))
+
+                contests.append({
+                    'concurso': concurso,
+                    'data': data,
+                    'dezenas': dezenas
+                })
+
+            except Exception as e:
+                print(f"❌ Erro na linha {i+2}: {e}")
+                print(parts)
+                continue
+
+        contests.sort(key=lambda x: x['concurso'])
+
+        print(f"✅ {len(contests)} concursos carregados")
+
+        return contests
+
+    except Exception as e:
+        print(f"❌ Erro lendo CSV: {e}")
+        return None
+        
 def generate_synthetic_contests(n_contests=3686):
     contests = []
     for i in range(1, n_contests + 1):
