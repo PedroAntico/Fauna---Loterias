@@ -1,0 +1,105 @@
+{
+  "timestamp": "2026-05-20T14:06:39.027923",
+  "total_concursos": 3009,
+  "entropia_condicional": 2.169816030978378,
+  "anomaly_baseline": {
+    "real_rate": 0.05018278497839814,
+    "random_rate": 0.0535,
+    "ratio": 0.9379959809046382,
+    "z_score": -1.4741321676068952
+  },
+  "comparison_results": {
+    "soma": {
+      "real_mean": 183.16849451645064,
+      "random_mean": 182.9388,
+      "real_std": 39.982563386662456,
+      "random_std": 40.72419495287783,
+      "difference_pct": 0.1255581191363722,
+      "ks_pvalue": 0.7777973511000925,
+      "mw_pvalue": 0.7615846227985136
+    },
+    "pares": {
+      "real_mean": 3.015619807244932,
+      "random_mean": 3.00516,
+      "real_std": 1.20211758836828,
+      "random_std": 1.1656128750146852,
+      "difference_pct": 0.3480615755877153,
+      "ks_pvalue": 0.6086406577168553,
+      "mw_pvalue": 0.6338675010639112
+    },
+    "primos": {
+      "real_mean": 1.7218344965104686,
+      "random_mean": 1.69602,
+      "real_std": 1.0661372076596982,
+      "random_std": 1.056000075568179,
+      "difference_pct": 1.5220632133152037,
+      "ks_pvalue": 0.9970189734219708,
+      "mw_pvalue": 0.30954475571567275
+    },
+    "fibonacci": {
+      "real_mean": 0.8760385510136258,
+      "random_mean": 0.907,
+      "real_std": 0.8263608029463216,
+      "random_std": 0.8360568162511445,
+      "difference_pct": -3.4136106930952823,
+      "ks_pvalue": 0.3260157643720517,
+      "mw_pvalue": 0.052895172170264515
+    },
+    "amplitude": {
+      "real_mean": 43.62944499833832,
+      "random_mean": 43.61606,
+      "real_std": 9.012745879743711,
+      "random_std": 9.188630478825448,
+      "difference_pct": 0.030688233504640942,
+      "ks_pvalue": 0.9191933676277373,
+      "mw_pvalue": 0.877845662752774
+    },
+    "consecutivas": {
+      "real_mean": 0.9561316051844466,
+      "random_mean": 0.9623,
+      "real_std": 1.197678236347859,
+      "random_std": 1.2138198836730267,
+      "difference_pct": -0.64100538455299,
+      "ks_pvalue": 0.9999999996703703,
+      "mw_pvalue": 0.9777804570560505
+    },
+    "distancia_media": {
+      "real_mean": 8.725888999667664,
+      "random_mean": 8.723212,
+      "real_std": 1.8025491759487422,
+      "random_std": 1.8377260957650898,
+      "difference_pct": 0.030688233504624646,
+      "ks_pvalue": 0.9191933676277373,
+      "mw_pvalue": 0.877845662752774
+    }
+  },
+  "mutual_information": {
+    "soma_bins": {
+      "mi": 0.013691774629882279,
+      "mi_normalized": 0.005949410997383383
+    },
+    "pares": {
+      "mi": 0.0072990726309782265,
+      "mi_normalized": 0.00456760751462102
+    },
+    "primos": {
+      "mi": 0.00665883439999042,
+      "mi_normalized": 0.0045576235919700045
+    },
+    "consecutivas": {
+      "mi": 0.0032793121628542005,
+      "mi_normalized": 0.0035382166568356317
+    },
+    "moldura": {
+      "mi": 0.00490510955385182,
+      "mi_normalized": 0.003191443066318717
+    }
+  },
+  "spectral_peaks": {
+    "soma": 63,
+    "pares": 56,
+    "primos": 61,
+    "consecutivas": 52,
+    "amplitude": 59
+  }
+}
