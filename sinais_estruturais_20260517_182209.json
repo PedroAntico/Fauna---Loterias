@@ -1,0 +1,162 @@
+[
+  {
+    "index": 0,
+    "profile": "cobertura",
+    "scores": {
+      "conservador": 3.3531733376964237,
+      "caotico": 1.1234591836734693,
+      "cobertura": 3.76865306122449,
+      "balanceado": 2.686346675392847
+    },
+    "signals": {
+      "pair_coverage": 1.0,
+      "johnson_min": 0.2,
+      "covering_radius": 0.5,
+      "avg_distance": 0.5373061224489796,
+      "entropy": 0.9863466753928471,
+      "compressibility": 1.055,
+      "n_unique": 50.0,
+      "n_duplicates": 0.0
+    }
+  },
+  {
+    "index": 1,
+    "profile": "cobertura",
+    "scores": {
+      "conservador": 3.3545951668592338,
+      "caotico": 1.1431734693877549,
+      "cobertura": 3.775224489795918,
+      "balanceado": 2.6891903337184675
+    },
+    "signals": {
+      "pair_coverage": 1.0,
+      "johnson_min": 0.2,
+      "covering_radius": 0.5,
+      "avg_distance": 0.5504489795918367,
+      "entropy": 0.9891903337184677,
+      "compressibility": 1.055,
+      "n_unique": 50.0,
+      "n_duplicates": 0.0
+    }
+  },
+  {
+    "index": 2,
+    "profile": "cobertura",
+    "scores": {
+      "conservador": 3.3594830986084023,
+      "caotico": 1.2266836734693878,
+      "cobertura": 3.803061224489796,
+      "balanceado": 2.698966197216805
+    },
+    "signals": {
+      "pair_coverage": 1.0,
+      "johnson_min": 0.2,
+      "covering_radius": 0.5,
+      "avg_distance": 0.6061224489795919,
+      "entropy": 0.9989661972168052,
+      "compressibility": 1.055,
+      "n_unique": 50.0,
+      "n_duplicates": 0.0
+    }
+  },
+  {
+    "index": 3,
+    "profile": "cobertura",
+    "scores": {
+      "conservador": 3.5091812253775467,
+      "caotico": 1.0214183673469388,
+      "cobertura": 4.001306122448979,
+      "balanceado": 2.698362450755094
+    },
+    "signals": {
+      "pair_coverage": 1.0,
+      "johnson_min": 0.1,
+      "covering_radius": 0.4,
+      "avg_distance": 0.6026122448979592,
+      "entropy": 0.998362450755094,
+      "compressibility": 1.055,
+      "n_unique": 50.0,
+      "n_duplicates": 0.0
+    }
+  },
+  {
+    "index": 4,
+    "profile": "cobertura",
+    "scores": {
+      "conservador": 3.1990552997905817,
+      "caotico": 0.8561122448979593,
+      "cobertura": 3.546204081632653,
+      "balanceado": 2.478110599581163
+    },
+    "signals": {
+      "pair_coverage": 1.0,
+      "johnson_min": 0.1,
+      "covering_radius": 0.6,
+      "avg_distance": 0.4924081632653062,
+      "entropy": 0.9781105995811631,
+      "compressibility": 1.055,
+      "n_unique": 50.0,
+      "n_duplicates": 0.0
+    }
+  },
+  {
+    "index": 5,
+    "profile": "cobertura",
+    "scores": {
+      "conservador": 3.1997767875526746,
+      "caotico": 0.866887755102041,
+      "cobertura": 3.5497959183673466,
+      "balanceado": 2.4795535751053492
+    },
+    "signals": {
+      "pair_coverage": 1.0,
+      "johnson_min": 0.1,
+      "covering_radius": 0.6,
+      "avg_distance": 0.49959183673469393,
+      "entropy": 0.979553575105349,
+      "compressibility": 1.055,
+      "n_unique": 50.0,
+      "n_duplicates": 0.0
+    }
+  },
+  {
+    "index": 6,
+    "profile": "cobertura",
+    "scores": {
+      "conservador": 3.3506808965743433,
+      "caotico": 0.8852551020408165,
+      "cobertura": 3.755918367346939,
+      "balanceado": 2.5813617931486874
+    },
+    "signals": {
+      "pair_coverage": 1.0,
+      "johnson_min": 0.1,
+      "covering_radius": 0.5,
+      "avg_distance": 0.5118367346938776,
+      "entropy": 0.9813617931486871,
+      "compressibility": 1.055,
+      "n_unique": 50.0,
+      "n_duplicates": 0.0
+    }
+  },
+  {
+    "index": 7,
+    "profile": "cobertura",
+    "scores": {
+      "conservador": 3.3596917222332734,
+      "caotico": 1.2303571428571427,
+      "cobertura": 3.8042857142857143,
+      "balanceado": 2.699383444466547
+    },
+    "signals": {
+      "pair_coverage": 1.0,
+      "johnson_min": 0.2,
+      "covering_radius": 0.5,
+      "avg_distance": 0.6085714285714285,
+      "entropy": 0.9993834444665473,
+      "compressibility": 1.055,
+      "n_unique": 50.0,
+      "n_duplicates": 0.0
+    }
+  }
+]
