@@ -2,15 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-GERADOR PARAMÉTRICO DE CARTEIRA - LOTOFÁCIL v9
-===============================================
+GERADOR PARAMÉTRICO DE CARTEIRA - LOTOFÁCIL v10
+=================================================
 CORREÇÕES BASEADAS EM EVIDÊNCIA EMPÍRICA:
-✅ Cobertura moderada (alvo 0.82-0.90, não 0.99)
-✅ Penalidades estruturais HARD-SOFT (primos, pares, moldura, repetição)
-✅ Greedy coverage equilibrado: 50% pares inéditos + 50% structural score
-✅ Dispersão geométrica moderada (diversidade ótima, não máxima)
-✅ Ensemble como estratégia principal (naturalmente recentraliza)
-✅ Densidade topológica preservada
+✅ Teto de pair coverage (alvo 0.86, penalidade se >0.90)
+✅ Limite de diversidade geométrica (alvo 0.45-0.70)
+✅ Soft-hard gate: rejeitar jogos com penalidade > threshold
+✅ Ensemble como estratégia PRINCIPAL
+✅ Cobertura moderada + estrutura preservada
 ✅ Scores normalizados (z-score) mantidos
 ✅ Bootstrap histórico mantido
 """
@@ -46,21 +45,20 @@ MOLDURA = {1,2,3,4,5, 6,10, 11,15, 16,20, 21,22,23,24,25}
 CENTRO = {7,8,9,12,13,14,17,18,19}
 HYPE_PROBS = {k: hypergeom.pmf(k, 25, 15, 15) for k in range(0, 16)}
 
-# Features topológicas v9 (17 dimensões)
-FEATURE_NAMES_V9 = [
+# Features topológicas v10 (17 dimensões)
+FEATURE_NAMES_V10 = [
     "gap_medio", "gap_var", "gap_max", "gap_min",
     "energia_jogo", "entropia_transicao",
     "quadrantes", "consecutivos", "densidade_local",
     "assimetria", "clusterizacao", "repeticoes",
     "pares", "primos", "moldura", "soma", "amplitude",
 ]
-IDX = {name: i for i, name in enumerate(FEATURE_NAMES_V9)}
+IDX = {name: i for i, name in enumerate(FEATURE_NAMES_V10)}
 
 # Pesos para penalidade estrutural HARD-SOFT
-# Valores baseados no regime histórico médio (v37)
 STRUCTURAL_TARGETS = {
-    'pares': (7.5, 1.5, 2.0),       # (média, tolerância, peso)
-    'primos': (5.0, 1.5, 2.5),      # primos têm peso maior
+    'pares': (7.5, 1.5, 2.0),
+    'primos': (5.0, 1.5, 2.5),
     'moldura': (9.5, 1.5, 1.5),
     'repeticoes': (9.0, 1.5, 1.5),
     'soma': (195.0, 20.0, 1.0),
@@ -68,7 +66,15 @@ STRUCTURAL_TARGETS = {
     'amplitude': (22.0, 3.0, 1.0),
 }
 
-# Features com sinal temporal (mantidas para 20% temporal)
+# Threshold para rejeitar jogos estruturalmente ruins
+STRUCTURAL_REJECT_THRESHOLD = 15.0
+
+# Alvos de cobertura moderada
+TARGET_PAIR_COVERAGE = 0.86
+TARGET_GEO_DIVERSITY_MIN = 0.45
+TARGET_GEO_DIVERSITY_MAX = 0.70
+
+# Features com sinal temporal (mantidas para 15% temporal)
 TEMPORAL_FEATURES = {
     'moldura': 0.30,
     'amplitude': 0.25,
@@ -117,9 +123,9 @@ def load_all_contests(csv_file='resultados_lotofacil.csv'):
 
 
 # ============================================================
-# EXTRATOR DE FEATURES v9 (com z-score)
+# EXTRATOR DE FEATURES v10 (com z-score)
 # ============================================================
-class TopologicalFeatureExtractorV9:
+class TopologicalFeatureExtractorV10:
     def __init__(self, contests):
         self.contests = contests
         self._repeat_history = []
@@ -197,10 +203,7 @@ class TopologicalFeatureExtractorV9:
         return (raw - self.feature_means) / self.feature_stds
 
     def compute_structural_penalty(self, game):
-        """
-        Penalidade HARD-SOFT: penaliza jogos fora do regime histórico médio.
-        Retorna valor entre 0 (perfeito) e ~10 (muito fora).
-        """
+        """Penalidade HARD-SOFT: penaliza jogos fora do regime histórico médio."""
         d = sorted(game)
         penalty = 0.0
 
@@ -222,6 +225,10 @@ class TopologicalFeatureExtractorV9:
                     penalty += excess * weight
 
         return penalty
+
+    def is_structurally_valid(self, game):
+        """Soft-hard gate: rejeita jogos com penalidade acima do threshold."""
+        return self.compute_structural_penalty(game) < STRUCTURAL_REJECT_THRESHOLD
 
     def compute_structural_score(self, game):
         """Score estrutural (0-1, maior = mais típico)"""
@@ -259,7 +266,7 @@ class TopologicalFeatureExtractorV9:
 # ============================================================
 # MODELO DE DISTRIBUIÇÃO (GMM com features padronizadas)
 # ============================================================
-class DistributionModelV9:
+class DistributionModelV10:
     def __init__(self, feature_matrix):
         self.feature_matrix = feature_matrix
         self._build_gmm()
@@ -304,11 +311,24 @@ class DistributionModelV9:
 # ============================================================
 # GERADOR LIVRE
 # ============================================================
-class FreeGeneratorV9:
-    def __init__(self, last_contest=None):
+class FreeGeneratorV10:
+    def __init__(self, last_contest=None, extractor=None):
         self.last = set(last_contest) if last_contest else None
+        self.extractor = extractor
 
     def generate_one(self):
+        max_attempts = 50
+        for _ in range(max_attempts):
+            game = self._generate_raw()
+            # Soft-hard gate: rejeitar jogos com penalidade estrutural alta
+            if self.extractor is not None:
+                if not self.extractor.is_structurally_valid(game):
+                    continue
+            return game
+        # Fallback: retornar o último gerado mesmo que inválido
+        return self._generate_raw()
+
+    def _generate_raw(self):
         game = set()
         available = set(range(1, 26))
         if self.last and random.random() < 0.3:
@@ -345,25 +365,25 @@ class FreeGeneratorV9:
 
 
 # ============================================================
-# OTIMIZADOR DE CARTEIRA HÍBRIDA v9
+# OTIMIZADOR DE CARTEIRA HÍBRIDA v10
 # ============================================================
-class HybridPortfolioOptimizerV9:
+class HybridPortfolioOptimizerV10:
     """
-    Otimizador de carteira v9: COBERTURA MODERADA + ESTRUTURA.
+    Otimizador de carteira v10: COBERTURA MODERADA + TETOS.
     
     Mudanças:
-    - Greedy coverage equilibrado (50% pares + 50% structural)
-    - Penalidades estruturais fortes
-    - Dispersão geométrica moderada
-    - Ensemble como estratégia principal
+    - Teto de pair coverage (penalidade se >0.90)
+    - Limite de diversidade geométrica (alvo 0.45-0.70)
+    - Soft-hard gate (rejeitar jogos com penalidade > threshold)
+    - Ensemble como estratégia PRINCIPAL
     """
     def __init__(self, contests):
         self.contests = contests
-        self.extractor = TopologicalFeatureExtractorV9(contests)
+        self.extractor = TopologicalFeatureExtractorV10(contests)
         self.feature_matrix = self.extractor.build_feature_matrix()
-        self.dist_model = DistributionModelV9(self.feature_matrix)
+        self.dist_model = DistributionModelV10(self.feature_matrix)
         self.last = contests[-1]['dezenas'] if contests else None
-        self.generator = FreeGeneratorV9(self.last)
+        self.generator = FreeGeneratorV10(self.last, self.extractor)
         self._mc_cache = {}
 
     def _score_game_central(self, game):
@@ -383,10 +403,7 @@ class HybridPortfolioOptimizerV9:
 
     def _greedy_marginal_coverage_balanced(self, pool, existing_portfolio,
                                             n_select, max_intersection=7):
-        """
-        GREEDY COVERAGE EQUILIBRADO:
-        50% pares inéditos + 50% structural score.
-        """
+        """Greedy coverage EQUILIBRADO com teto de pair coverage."""
         covered_pairs = set()
         for g in existing_portfolio:
             for pair in combinations(sorted(g), 2):
@@ -398,6 +415,16 @@ class HybridPortfolioOptimizerV9:
         for _ in range(n_select):
             if not remaining:
                 break
+
+            # Verificar se já atingiu o teto de cobertura
+            current_coverage = len(covered_pairs) / comb(25, 2)
+            if current_coverage >= TARGET_PAIR_COVERAGE:
+                # Já atingiu cobertura moderada, focar apenas em estrutura
+                coverage_weight = 0.1
+                structural_weight = 0.9
+            else:
+                coverage_weight = 0.5
+                structural_weight = 0.5
 
             best_game = None
             best_score = -float('inf')
@@ -411,15 +438,20 @@ class HybridPortfolioOptimizerV9:
                     if max_inter > max_intersection:
                         continue
 
+                # Penalidade estrutural forte (soft-hard gate)
+                penalty = self.extractor.compute_structural_penalty(game)
+                if penalty > STRUCTURAL_REJECT_THRESHOLD:
+                    continue
+
                 new_pairs = set()
                 for pair in combinations(sorted(game), 2):
                     if pair not in covered_pairs:
                         new_pairs.add(pair)
 
-                # 50% cobertura + 50% estrutura
-                coverage_score = len(new_pairs) / 105.0  # normalizar (max ~105)
+                coverage_score = len(new_pairs) / 105.0
                 structural_score = self.extractor.compute_structural_score(game)
-                combined = coverage_score * 0.5 + structural_score * 0.5
+                combined = (coverage_score * coverage_weight +
+                           structural_score * structural_weight)
 
                 if combined > best_score:
                     best_score = combined
@@ -457,23 +489,37 @@ class HybridPortfolioOptimizerV9:
         return 1.0 - np.mean(sims) / 15.0
 
     def _geometric_diversity(self, portfolio):
+        """
+        Diversidade geométrica MODERADA.
+        Penaliza tanto excesso (>0.70) quanto falta (<0.45).
+        """
         if len(portfolio) < 2:
             return 0.5
+
         feature_vectors = []
         for g in portfolio:
             feats = self.extractor.extract_features(g, self.last)
             feature_vectors.append(feats)
         feature_vectors = np.array(feature_vectors)
+
         distances = []
         for i in range(len(feature_vectors)):
             for j in range(i+1, len(feature_vectors)):
                 dist = np.linalg.norm(feature_vectors[i] - feature_vectors[j])
                 distances.append(dist)
+
         avg_dist = np.mean(distances) if distances else 0
-        max_expected = 2 * np.sqrt(len(FEATURE_NAMES_V9))
+        max_expected = 2 * np.sqrt(len(FEATURE_NAMES_V10))
         raw = avg_dist / max_expected
-        # Moderado: penalizar tanto excesso quanto falta
-        return 1.0 - abs(raw - 0.4) * 2.0  # ótimo em 0.4
+
+        # Penalizar se estiver fora da faixa alvo
+        if raw < TARGET_GEO_DIVERSITY_MIN:
+            return raw / TARGET_GEO_DIVERSITY_MIN
+        elif raw > TARGET_GEO_DIVERSITY_MAX:
+            excess = raw - TARGET_GEO_DIVERSITY_MAX
+            return max(0.1, 1.0 - excess * 3.0)
+        else:
+            return 1.0
 
     def _average_structural_score(self, portfolio):
         scores = [self.extractor.compute_structural_score(g) for g in portfolio]
@@ -508,12 +554,16 @@ class HybridPortfolioOptimizerV9:
         return prob
 
     def _portfolio_score(self, portfolio):
-        """Score equilibrado: cobertura moderada + estrutura + diversidade"""
+        """Score equilibrado com tetos de cobertura e diversidade"""
         p11 = self._monte_carlo_p11(portfolio, n_simulations=1000)
         pair_cov = self._pair_coverage(portfolio)
-        # Penalizar cobertura extrema (>0.90)
+
+        # TETO: penalizar cobertura excessiva
         if pair_cov > 0.90:
-            pair_cov = 0.90 - (pair_cov - 0.90) * 2
+            pair_cov = 0.90 - (pair_cov - 0.90) * 3.0
+        elif pair_cov > TARGET_PAIR_COVERAGE:
+            pair_cov = TARGET_PAIR_COVERAGE + (pair_cov - TARGET_PAIR_COVERAGE) * 0.3
+
         structural = self._average_structural_score(portfolio)
         entropy_val = self._portfolio_entropy(portfolio)
         diversity = self._portfolio_diversity(portfolio)
@@ -523,39 +573,56 @@ class HybridPortfolioOptimizerV9:
                 entropy_val * 0.10 + diversity * 0.10 + geo_div * 0.10)
 
     def _mutate_game(self, game):
-        mutated = list(game)
-        n_changes = random.randint(1, 3)
-        for _ in range(n_changes):
-            pos = random.randint(0, 14)
-            available = [d for d in range(1, 26) if d not in mutated]
-            if available:
-                mutated[pos] = random.choice(available)
-        return sorted(mutated)[:15]
+        max_attempts = 20
+        for _ in range(max_attempts):
+            mutated = list(game)
+            n_changes = random.randint(1, 3)
+            for _ in range(n_changes):
+                pos = random.randint(0, 14)
+                available = [d for d in range(1, 26) if d not in mutated]
+                if available:
+                    mutated[pos] = random.choice(available)
+            mutated = sorted(mutated)[:15]
+            # Soft-hard gate
+            if self.extractor.is_structurally_valid(mutated):
+                return mutated
+        return sorted(game)[:15]
 
     def optimize_hybrid(self, n_games=10, n_candidates=200000, iterations=100):
-        print(f"\n🎯 OTIMIZANDO CARTEIRA v9 ({n_games} jogos)...")
+        print(f"\n🎯 OTIMIZANDO CARTEIRA v10 ({n_games} jogos)...")
 
         n_central = max(1, int(n_games * 0.40))
         n_coverage = max(1, int(n_games * 0.35))
         n_temporal = n_games - n_central - n_coverage
 
         print(f"   Composição: {n_central} centrais + {n_coverage} cobertura + {n_temporal} temporais")
+        print(f"   Teto pair coverage: {TARGET_PAIR_COVERAGE}")
+        print(f"   Alvo geo diversidade: {TARGET_GEO_DIVERSITY_MIN}-{TARGET_GEO_DIVERSITY_MAX}")
+        print(f"   Threshold estrutural: {STRUCTURAL_REJECT_THRESHOLD}")
 
         print(f"   Gerando {n_candidates:,} candidatos...")
         pool_central = []
         pool_temporal = []
         pool_all = []
         seen = set()
+        n_rejected = 0
         for _ in tqdm(range(n_candidates), desc="Candidatos"):
             game = self.generator.generate_one()
             key = tuple(game)
             if key not in seen:
                 seen.add(key)
+                # Soft-hard gate
+                if not self.extractor.is_structurally_valid(game):
+                    n_rejected += 1
+                    continue
                 sc, feats, cluster = self._score_game_central(game)
                 pool_central.append((sc, game, feats, cluster))
                 st, feats2, cluster2 = self._score_game_temporal(game)
                 pool_temporal.append((st, game, feats2, cluster2))
                 pool_all.append(game)
+
+        if n_rejected > 0:
+            print(f"   🚫 {n_rejected} jogos rejeitados por penalidade estrutural")
 
         pool_central.sort(key=lambda x: x[0], reverse=True)
         pool_temporal.sort(key=lambda x: x[0], reverse=True)
@@ -571,30 +638,23 @@ class HybridPortfolioOptimizerV9:
                 continue
             if any(len(set(game) & set(sg)) > 8 for sg in central_games):
                 continue
-            # Penalidade estrutural
-            penalty = self.extractor.compute_structural_penalty(game)
-            if penalty > 8:
-                continue
             central_games.append(game)
             cluster_counts[cluster] += 1
 
-        # Cobertura via greedy EQUILIBRADO
+        # Cobertura via greedy EQUILIBRADO com teto
         coverage_games = self._greedy_marginal_coverage_balanced(
             [g for g in pool_all if g not in central_games],
             central_games, n_coverage, max_intersection=7
         )
         coverage_games = coverage_games[len(central_games):]
 
-        # Temporais (com penalidade estrutural)
+        # Temporais
         temporal_games = []
         for st, game, feats, cluster in pool_temporal:
             if game in central_games or game in coverage_games:
                 continue
             if len(temporal_games) >= n_temporal:
                 break
-            penalty = self.extractor.compute_structural_penalty(game)
-            if penalty > 10:
-                continue
             if any(len(set(game) & set(sg)) > 8 for sg in temporal_games):
                 continue
             if any(len(set(game) & set(sg)) > 9
@@ -638,11 +698,6 @@ class HybridPortfolioOptimizerV9:
             else:
                 new_game = self.generator.generate_one()
 
-            # Verificar penalidade estrutural
-            penalty = self.extractor.compute_structural_penalty(new_game)
-            if penalty > 12:
-                continue
-
             # Verificar interseção
             too_similar = False
             for j, sg in enumerate(new_portfolio):
@@ -667,8 +722,7 @@ class HybridPortfolioOptimizerV9:
 
     def generate_ensemble_consensus(self, n_strategies=3, n_games_per_strategy=5):
         """
-        Ensemble PONDERADO - estratégia PRINCIPAL da v9.
-        Naturalmente recentraliza e reduz extremos.
+        Ensemble PONDERADO - estratégia PRINCIPAL da v10.
         """
         print(f"\n🤝 ENSEMBLE PONDERADO (estratégia principal)...")
         strategy_results = []
@@ -682,20 +736,24 @@ class HybridPortfolioOptimizerV9:
             theo_prob = 1 - p_none
             lift = p11 / theo_prob if theo_prob > 0 else 1.0
 
-            # Score estrutural médio
             avg_structural = self._average_structural_score(portfolio)
+            pair_cov = self._pair_coverage(portfolio)
 
             strategy_results.append({
                 'portfolio': portfolio,
                 'lift': lift,
                 'structural': avg_structural,
+                'pair_cov': pair_cov,
                 'dezenas': [d for g in portfolio for d in g],
             })
 
         # Votação ponderada por lift E structural score
         weighted_freq = Counter()
         for sr in strategy_results:
-            weight = sr['lift'] * 0.6 + sr['structural'] * 0.4
+            # Penalizar cobertura excessiva no peso
+            cov_penalty = max(0, sr['pair_cov'] - TARGET_PAIR_COVERAGE) * 2
+            weight = sr['lift'] * 0.5 + sr['structural'] * 0.5 - cov_penalty
+            weight = max(0.1, weight)
             for d in sr['dezenas']:
                 weighted_freq[d] += weight
 
@@ -709,10 +767,6 @@ class HybridPortfolioOptimizerV9:
             key = tuple(game)
             if key not in seen:
                 seen.add(key)
-                # Penalidade estrutural forte
-                penalty = self.extractor.compute_structural_penalty(game)
-                if penalty > 8:
-                    continue
                 consensus_count = len(set(game) & set(top_dezenas[:15]))
                 if consensus_count >= 9:
                     consensus_games.append(game)
@@ -780,7 +834,7 @@ def walk_forward_validation(contests, n_windows=10, train_size=500,
         if len(train_data) < 100 or len(test_data) < 5:
             continue
 
-        optimizer = HybridPortfolioOptimizerV9(train_data)
+        optimizer = HybridPortfolioOptimizerV10(train_data)
         portfolio, _ = optimizer.optimize_hybrid(
             n_games, n_candidates=50000, iterations=50)
         random_portfolio = optimizer.generate_pure_random_portfolio(n_games)
@@ -831,7 +885,7 @@ def walk_forward_validation(contests, n_windows=10, train_size=500,
 # ============================================================
 def main():
     print("="*70)
-    print("🧬 GERADOR DE CARTEIRA v9 - COBERTURA MODERADA + ESTRUTURA")
+    print("🧬 GERADOR DE CARTEIRA v10 - COBERTURA MODERADA + TETOS")
     print("="*70)
 
     contests = load_all_contests('resultados_lotofacil.csv')
@@ -845,6 +899,10 @@ def main():
     print("\n📊 REGIME ESTRUTURAL ALVO:")
     for name, (target, tol, weight) in STRUCTURAL_TARGETS.items():
         print(f"   {name}: alvo={target:.1f} ±{tol:.1f} (peso={weight:.1f})")
+    print(f"\n📊 TETOS:")
+    print(f"   Pair coverage alvo: {TARGET_PAIR_COVERAGE}")
+    print(f"   Geo diversidade: {TARGET_GEO_DIVERSITY_MIN}-{TARGET_GEO_DIVERSITY_MAX}")
+    print(f"   Threshold estrutural: {STRUCTURAL_REJECT_THRESHOLD}")
 
     print("\nOpções:")
     print("1. Gerar carteira otimizada (cobertura moderada)")
@@ -856,7 +914,7 @@ def main():
     if op in ("1", "4"):
         print(f"\n🔧 INICIALIZANDO...")
         t0 = time.time()
-        optimizer = HybridPortfolioOptimizerV9(contests)
+        optimizer = HybridPortfolioOptimizerV10(contests)
         print(f"   ✅ Inicializado em {time.time()-t0:.1f}s")
         print(f"   GMM: {optimizer.dist_model.n_components} componentes")
 
@@ -879,9 +937,9 @@ def main():
         structural_avg = optimizer._average_structural_score(portfolio)
         geo_div = optimizer._geometric_diversity(portfolio)
         print(f"\n📊 Cobertura dezenas: {len(all_d)}/25")
-        print(f"📊 Cobertura pares: {pair_cov:.3f} (alvo: 0.82-0.90)")
+        print(f"📊 Cobertura pares: {pair_cov:.3f} (alvo: {TARGET_PAIR_COVERAGE})")
         print(f"📊 Score estrutural: {structural_avg:.3f}")
-        print(f"📊 Diversidade geométrica: {geo_div:.3f}")
+        print(f"📊 Diversidade geométrica: {geo_div:.3f} (alvo: {TARGET_GEO_DIVERSITY_MIN}-{TARGET_GEO_DIVERSITY_MAX})")
         print(f"📊 Entropia: {optimizer._portfolio_entropy(portfolio):.3f}")
         p11_est = optimizer._monte_carlo_p11(portfolio, n_simulations=5000)
         print(f"📊 P(≥1 acerto 11+) estimada: {p11_est:.3f}")
@@ -896,7 +954,7 @@ def main():
             print(f"   Lift: {bt['lift']:.2f}x")
 
     if op in ("2", "4"):
-        optimizer = HybridPortfolioOptimizerV9(contests)
+        optimizer = HybridPortfolioOptimizerV10(contests)
         consensus = optimizer.generate_ensemble_consensus(
             n_strategies=3, n_games_per_strategy=5)
         print(f"\n🤝 CARTEIRA CONSENSO ({len(consensus)} jogos):")
