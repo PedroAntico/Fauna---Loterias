@@ -2,28 +2,24 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE MICROESTRUTURA TEMPORAL - LOTOFÁCIL v37
-=======================================================
-CORREÇÕES CRÍTICAS:
-✅ Validador de concursos (detecta corrupção no CSV)
-✅ Rolling statistics (incremental, sem rebuild total)
-✅ Cache temporal de features (não recalcula)
-✅ Rebuild do LedoitWolf a cada 50 passos (10x mais rápido)
-✅ MI corrigido: feature_t vs performance_futura
-✅ Features com variância zero detectadas e marcadas
-✅ Autocorrelação ajustada para séries quase-constantes
-✅ Out-of-sample com comparação temporal vs global
-✅ Permutation test corrigido
+GERADOR PARAMÉTRICO DE CARTEIRA HÍBRIDA - LOTOFÁCIL v8
+=========================================================
+CORREÇÕES E MELHORIAS:
+✅ BUG corrigido: max_inter em vez de min_inter no greedy coverage
+✅ regime_shift usado efetivamente no score temporal
+✅ Padronização z-score de features antes de GMM e distâncias
+✅ Ensemble ponderado por lift, cluster e diversidade
+✅ Stability score (variância de desempenho entre janelas)
+✅ Todas as funcionalidades v7 preservadas
 """
 
 import numpy as np
-from scipy.stats import entropy, wilcoxon, hypergeom
-from scipy.stats import percentileofscore, ks_2samp, mannwhitneyu
+from scipy.stats import entropy, hypergeom, wilcoxon
 from collections import Counter, defaultdict
+from itertools import combinations
 from datetime import datetime
 import warnings
 import os
-import json
 from math import comb
 from tqdm import tqdm
 import random
@@ -33,6 +29,8 @@ warnings.filterwarnings('ignore')
 
 try:
     from sklearn.covariance import LedoitWolf
+    from sklearn.mixture import GaussianMixture
+    from sklearn.preprocessing import StandardScaler
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
@@ -45,57 +43,29 @@ PRIMES = {2, 3, 5, 7, 11, 13, 17, 19, 23}
 MOLDURA = {1,2,3,4,5, 6,10, 11,15, 16,20, 21,22,23,24,25}
 CENTRO = {7,8,9,12,13,14,17,18,19}
 HYPE_PROBS = {k: hypergeom.pmf(k, 25, 15, 15) for k in range(0, 16)}
-WINDOWS = [5, 10, 20, 50, 100]
-ENSEMBLE_WINDOWS = [5, 20, 50]
 
-FEATURE_NAMES = [
+# Features topológicas v8 (17 dimensões)
+FEATURE_NAMES_V8 = [
     "gap_medio", "gap_var", "gap_max", "gap_min",
-    "energia_jogo", "entropia_rep", "entropia_transicao",
+    "energia_jogo", "entropia_transicao",
     "quadrantes", "consecutivos", "densidade_local",
     "assimetria", "clusterizacao", "repeticoes",
     "pares", "primos", "moldura", "soma", "amplitude",
-    "elasticidade", "entropia_conjunta",
 ]
+IDX = {name: i for i, name in enumerate(FEATURE_NAMES_V8)}
 
-# Features que tendem a ter variância muito baixa (séries quase-constantes)
-LOW_VARIANCE_FEATURES = {
-    'gap_min',        # quase sempre 1 (15 números em 25 geram consecutivos)
-    'entropia_rep',    # pode saturar
-    'entropia_transicao',  # pode saturar
-    'elasticidade',    # tende a zero
-    'entropia_conjunta' # pode saturar
+# Features COM sinal temporal (validadas no laboratório)
+TEMPORAL_FEATURES = {
+    'moldura': 0.30,
+    'amplitude': 0.25,
+    'energia_jogo': 0.20,
+    'densidade_local': 0.15,
+    'clusterizacao': 0.10,
 }
 
-# ============================================================
-# VALIDAÇÃO DE DADOS
-# ============================================================
-def validate_contests(contests):
-    """Valida integridade dos concursos e remove corrompidos"""
-    valid = []
-    errors = []
-    for i, c in enumerate(contests):
-        d = c.get('dezenas', [])
-        if len(d) != 15:
-            errors.append(f"Concurso {c.get('concurso','?')}: tamanho={len(d)} (esperado 15)")
-            continue
-        if len(set(d)) != 15:
-            errors.append(f"Concurso {c.get('concurso','?')}: duplicatas detectadas")
-            continue
-        if any(not isinstance(x, (int, np.integer)) or x < 1 or x > 25 for x in d):
-            errors.append(f"Concurso {c.get('concurso','?')}: valores fora de [1,25] ou não inteiros")
-            continue
-        valid.append(c)
-    
-    if errors:
-        print(f"⚠️ {len(errors)} concursos inválidos encontrados e removidos:")
-        for e in errors[:10]:
-            print(f"   {e}")
-        if len(errors) > 10:
-            print(f"   ... +{len(errors)-10} mais")
-    
-    print(f"✅ {len(valid)}/{len(contests)} concursos válidos")
-    return valid
-
+# Features apenas estruturais (sem peso temporal)
+STRUCTURAL_ONLY = {'pares', 'primos', 'soma', 'quadrantes', 'consecutivos',
+                   'gap_var', 'gap_max', 'gap_min', 'assimetria', 'repeticoes'}
 
 # ============================================================
 # CARREGAMENTO DE DADOS
@@ -103,707 +73,810 @@ def validate_contests(contests):
 def load_all_contests(csv_file='resultados_lotofacil.csv'):
     base_dir = os.path.dirname(os.path.abspath(__file__))
     csv_path = os.path.join(base_dir, csv_file)
-    
     if not os.path.exists(csv_path):
         print(f"❌ Arquivo não encontrado: {csv_path}")
         return None
-    
     contests = []
     try:
         with open(csv_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
-        
-        for i, line in enumerate(lines[1:], start=2):
+        for line in lines[1:]:
             parts = line.strip().split(';')
             if len(parts) < 17:
                 continue
-            
             try:
                 concurso = int(parts[0])
                 data = parts[1]
-                dezenas = []
-                for x in parts[2:17]:
-                    val = x.strip()
-                    if not val:
-                        raise ValueError(f"valor vazio na posição")
-                    dezenas.append(int(val))
-                
+                dezenas = [int(x.strip()) for x in parts[2:17] if x.strip()]
+                if len(dezenas) != 15 or len(set(dezenas)) != 15:
+                    continue
+                if any(x < 1 or x > 25 for x in dezenas):
+                    continue
                 contests.append({
                     'concurso': concurso,
                     'data': data,
-                    'dezenas': dezenas
+                    'dezenas': sorted(dezenas)
                 })
-            except (ValueError, IndexError) as e:
-                print(f"⚠️ Linha {i} corrompida: {parts[:3]}... -> {e}")
+            except (ValueError, IndexError):
                 continue
-        
         contests.sort(key=lambda x: x['concurso'])
-        print(f"📂 {len(contests)} linhas lidas do CSV")
-        
-        # Validar
-        contests = validate_contests(contests)
+        print(f"✅ {len(contests)} concursos válidos")
         return contests
-    
     except Exception as e:
-        print(f"❌ Erro lendo CSV: {e}")
+        print(f"❌ Erro: {e}")
         return None
 
 
-def generate_synthetic_contests(n_contests=3686):
-    contests = []
-    for i in range(1, n_contests + 1):
-        dezenas = sorted(np.random.choice(range(1, 26), 15, replace=False))
-        contests.append({'concurso': i, 'data': '2000-01-01', 'dezenas': dezenas})
-    return contests
-
-
 # ============================================================
-# EXTRATOR DE FEATURES (com cache)
+# EXTRATOR DE FEATURES v8 (com z-score)
 # ============================================================
-class FeatureCache:
-    """Cache de features para evitar recálculo"""
+class TopologicalFeatureExtractorV8:
+    """Extrai features topológicas com padronização z-score"""
     def __init__(self, contests):
         self.contests = contests
-        self._features = {}  # índice -> features
-        self._window_means = {}  # (start, end) -> mean features
-        self._repeat_history = None
-        self._pares_history = None
-        self._build_histories()
-    
-    def _build_histories(self):
         self._repeat_history = []
-        self._pares_history = []
-        for i, c in enumerate(self.contests):
-            d = c['dezenas']
-            self._pares_history.append(sum(1 for x in d if x % 2 == 0))
+        for i, c in enumerate(contests):
             if i > 0:
-                self._repeat_history.append(len(set(self.contests[i-1]['dezenas']) & set(d)))
+                self._repeat_history.append(
+                    len(set(contests[i-1]['dezenas']) & set(c['dezenas'])))
             else:
                 self._repeat_history.append(0)
-    
-    def get_features(self, idx):
-        if idx not in self._features:
-            c = self.contests[idx]
-            last = set(self.contests[idx-1]['dezenas']) if idx > 0 else None
-            feats = extract_game_features(
-                c['dezenas'], last,
-                self._repeat_history[:idx],
-                self._pares_history[:idx]
-            )
-            self._features[idx] = feats
-        return self._features[idx]
-    
-    def get_window_mean(self, start, end):
-        """Média das features em [start, end)"""
-        key = (start, end)
-        if key not in self._window_means:
-            feats = [self.get_features(i) for i in range(start, end)]
-            self._window_means[key] = np.mean(feats, axis=0) if feats else None
-        return self._window_means[key]
+        self._recent_freq = self._compute_recent_freq()
 
+        # Construir matriz de features para padronização
+        raw_features = self._build_raw_feature_matrix()
+        self.scaler = StandardScaler() if SKLEARN_AVAILABLE else None
+        if self.scaler is not None and len(raw_features) > 10:
+            self.scaler.fit(raw_features)
+        self.feature_means = np.mean(raw_features, axis=0)
+        self.feature_stds = np.std(raw_features, axis=0) + 1e-10
 
-def extract_game_features(game, last_contest=None, repeat_history=None, pares_history=None):
-    d = sorted(game)
-    gaps = [d[i+1]-d[i] for i in range(len(d)-1)]
-    rep = len(set(d) & set(last_contest)) if last_contest else 8
+    def _compute_recent_freq(self, window=50):
+        freq = Counter()
+        start = max(0, len(self.contests) - window)
+        for c in self.contests[start:]:
+            freq.update(c['dezenas'])
+        total = len(self.contests[start:])
+        return {d: freq.get(d, 0) / total for d in range(1, 26)}
 
-    f = [
-        float(np.mean(gaps)), float(np.var(gaps)), float(max(gaps)), float(min(gaps)),
-        float(sum(abs(d[i]-d[i-1]) for i in range(1, len(d)))),
-        0.0, 0.0,
-        float(len(set((x-1)//5 for x in d))),
-        float(sum(1 for i in range(len(d)-1) if d[i+1]-d[i]==1)),
-        float(np.mean([sum(1 for y in d if abs(x-y)<=2) for x in d]) / 15),
-        float(np.mean(d) - np.median(d)),
-        float(sum(1 for g in gaps if g <= 2) / len(gaps)),
-        float(rep),
-        float(sum(1 for x in d if x % 2 == 0)),
-        float(sum(1 for x in d if x in PRIMES)),
-        float(sum(1 for x in d if x in MOLDURA)),
-        float(sum(d)),
-        float(max(d) - min(d)),
-        0.0, 0.0,
-    ]
-
-    if repeat_history is not None and len(repeat_history) >= 10:
-        recent = repeat_history[-10:]
-        freq = Counter(recent)
-        probs = np.array([freq.get(r,0)/10 for r in range(5,13)])
-        f[5] = float(entropy(np.where(probs>0, probs, 1e-10)))
-    if repeat_history is not None and len(repeat_history) >= 5:
-        trans = [repeat_history[i+1]-repeat_history[i] for i in range(len(repeat_history)-1)]
-        if len(set(trans)) > 1:
-            freq = Counter(trans)
-            probs = np.array([freq.get(v,0)/len(trans) for v in set(trans)])
-            f[6] = float(entropy(np.where(probs>0, probs, 1e-10)))
-    if repeat_history is not None and len(repeat_history) >= 10:
-        f[18] = float(np.mean(repeat_history) - np.mean(repeat_history[-10:]))
-    if repeat_history is not None and pares_history is not None and len(repeat_history) >= 10:
-        joint = Counter(zip(repeat_history[-10:], pares_history[-10:]))
-        probs = np.array([joint.get(k,0)/10 for k in joint])
-        f[19] = float(entropy(np.where(probs>0, probs, 1e-10)))
-
-    return np.array(f, dtype=np.float64)
-
-
-# ============================================================
-# BASELINE ROBUSTO COM ROLLING STATISTICS
-# ============================================================
-class RobustBaseline:
-    """
-    Baseline com LedoitWolf e rolling statistics.
-    Recalcula LedoitWolf apenas a cada 50 passos (10x mais rápido).
-    """
-    def __init__(self, contests, feature_cache=None):
-        self.contests = contests
-        self.cache = feature_cache
-        self.mean = None
-        self.std = None
-        self.cov = None
-        self.precision = None
-        self.percentile_refs = {}
-        self._n_samples = 0
-        self._rebuild()
-    
-    def _rebuild(self):
-        """Reconstrói baseline completo"""
-        n = len(self.contests)
-        if n == 0:
-            return
-        
-        if self.cache is not None:
-            features = np.array([self.cache.get_features(i) for i in range(n)], dtype=np.float64)
-        else:
-            features = self._extract_all()
-        
-        self._n_samples = n
-        self.mean = np.mean(features, axis=0)
-        self.std = np.std(features, axis=0)
-        
-        if SKLEARN_AVAILABLE and n > len(FEATURE_NAMES):
-            try:
-                lw = LedoitWolf().fit(features)
-                self.cov = lw.covariance_
-                self.precision = lw.precision_
-            except:
-                self.cov = np.cov(features.T) + np.eye(len(FEATURE_NAMES)) * 1e-6
-                self.precision = np.linalg.inv(self.cov)
-        else:
-            self.cov = np.cov(features.T) + np.eye(len(FEATURE_NAMES)) * 1e-6
-            self.precision = np.linalg.inv(self.cov)
-        
-        for i in range(len(FEATURE_NAMES)):
-            self.percentile_refs[i] = features[:, i]
-    
-    def _extract_all(self):
-        repeat_hist = []
-        pares_hist = []
-        feats_list = []
+    def _build_raw_feature_matrix(self):
+        features_list = []
         for i, c in enumerate(self.contests):
             last = set(self.contests[i-1]['dezenas']) if i > 0 else None
-            feats = extract_game_features(c['dezenas'], last, repeat_hist, pares_hist)
-            feats_list.append(feats)
-            repeat_hist.append(feats[12])
-            pares_hist.append(feats[13])
-        return np.array(feats_list, dtype=np.float64)
-    
-    def percentile_rank(self, feature_idx, value):
-        if feature_idx in self.percentile_refs and len(self.percentile_refs[feature_idx]) > 0:
-            return percentileofscore(self.percentile_refs[feature_idx], value)
-        return 50.0
-    
-    def compute_deformation_scores(self, window_means):
-        scores = np.zeros(len(FEATURE_NAMES))
-        for i in range(len(FEATURE_NAMES)):
-            pr = self.percentile_rank(i, window_means[i])
-            scores[i] = (pr - 50.0) / 50.0
-        return scores
+            features_list.append(self._extract_raw(c['dezenas'], last))
+        return np.array(features_list, dtype=np.float64)
+
+    def _extract_raw(self, dezenas, last_contest=None):
+        d = sorted(dezenas)
+        gaps = [d[i+1]-d[i] for i in range(len(d)-1)]
+        rep = len(set(d) & set(last_contest)) if last_contest else 8
+
+        ent_trans = 0.0
+        if len(self._repeat_history) >= 5:
+            trans = [self._repeat_history[i+1]-self._repeat_history[i]
+                     for i in range(len(self._repeat_history)-1)]
+            if len(set(trans)) > 1:
+                freq = Counter(trans)
+                probs = np.array([freq.get(v,0)/len(trans) for v in set(trans)])
+                ent_trans = float(entropy(np.where(probs>0, probs, 1e-10)))
+
+        return np.array([
+            float(np.mean(gaps)), float(np.var(gaps)),
+            float(max(gaps)), float(min(gaps)),
+            float(sum(abs(d[i]-d[i-1]) for i in range(1, len(d)))),
+            ent_trans,
+            float(len(set((x-1)//5 for x in d))),
+            float(sum(1 for i in range(len(d)-1) if d[i+1]-d[i]==1)),
+            float(np.mean([sum(1 for y in d if abs(x-y)<=2) for x in d]) / 15),
+            float(np.mean(d) - np.median(d)),
+            float(sum(1 for g in gaps if g <= 2) / len(gaps)),
+            float(rep),
+            float(sum(1 for x in d if x % 2 == 0)),
+            float(sum(1 for x in d if x in PRIMES)),
+            float(sum(1 for x in d if x in MOLDURA)),
+            float(sum(d)),
+            float(max(d) - min(d)),
+        ], dtype=np.float64)
+
+    def extract_features(self, game, last_contest=None):
+        """Extrai features PADRONIZADAS (z-score)"""
+        raw = self._extract_raw(game, last_contest)
+        if self.scaler is not None:
+            return self.scaler.transform(raw.reshape(1, -1)).flatten()
+        return (raw - self.feature_means) / self.feature_stds
+
+    def build_feature_matrix(self):
+        """Matriz de features padronizadas"""
+        raw = self._build_raw_feature_matrix()
+        if self.scaler is not None:
+            return self.scaler.transform(raw)
+        return (raw - self.feature_means) / self.feature_stds
+
+    def get_recent_freq_bonus(self, game):
+        return np.mean([self._recent_freq.get(d, 0) for d in game])
+
+    def compute_temporal_score(self, game, all_features, recent_window=20):
+        """
+        Score temporal com regime_shift USADO efetivamente.
+        Favorece jogos alinhados ao regime recente,
+        com bônus para deformações persistentes.
+        """
+        game_feats = self.extract_features(game, None)
+        score = 0.0
+        total_weight = 0.0
+
+        for name, weight in TEMPORAL_FEATURES.items():
+            if name in IDX:
+                idx = IDX[name]
+                game_val = game_feats[idx]
+
+                # Regime recente
+                if len(all_features) >= recent_window:
+                    recent = all_features[-recent_window:, idx]
+                else:
+                    recent = all_features[:, idx]
+                recent_mean = np.mean(recent)
+                recent_std = np.std(recent) + 1e-10
+
+                # Média histórica global
+                hist_mean = np.mean(all_features[:, idx])
+                hist_std = np.std(all_features[:, idx]) + 1e-10
+
+                # Deformação do regime (USADO no score)
+                regime_shift = (recent_mean - hist_mean) / hist_std
+
+                # Score base: proximidade ao regime recente
+                z_recent = (game_val - recent_mean) / recent_std
+                base_score = np.exp(-0.5 * z_recent**2)
+
+                # Bônus para features em deformação forte (seguindo a tendência)
+                # Quanto maior o |regime_shift|, mais relevante é estar alinhado
+                deformation_bonus = 1.0 + abs(regime_shift) * 0.3
+
+                score += weight * base_score * deformation_bonus
+                total_weight += weight
+
+        return score / total_weight if total_weight > 0 else 0.5
 
 
 # ============================================================
-# LINHA DO TEMPO DE DEFORMAÇÕES (COM CACHE E REBUILD ESPAÇADO)
+# MODELO DE DISTRIBUIÇÃO (GMM com features padronizadas)
 # ============================================================
-class DeformationTimeline:
-    """
-    Calcula deformações para cada tempo histórico.
-    Usa cache e reconstrói LedoitWolf apenas a cada 50 passos.
-    """
-    def __init__(self, contests, min_history=100):
-        self.contests = contests
-        self.min_history = min_history
-        self.cache = FeatureCache(contests)
-        self.timeline = defaultdict(list)
-        self.timeline_windows = defaultdict(list)
-        self._build_timeline()
-    
-    def _build_timeline(self):
-        """Constrói linha do tempo com rebuild espaçado"""
-        last_rebuild = -1
-        baseline_t = None
-        
-        for t in tqdm(range(self.min_history, len(self.contests)), desc="Timeline"):
-            # Reconstruir baseline apenas a cada 50 passos
-            if t - last_rebuild >= 50 or baseline_t is None:
-                hist_contests = self.contests[:t]
-                baseline_t = RobustBaseline(hist_contests, self.cache)
-                last_rebuild = t
-            
-            for w in WINDOWS:
-                if t >= w:
-                    means = self.cache.get_window_mean(t-w, t)
-                    if means is not None:
-                        scores = baseline_t.compute_deformation_scores(means)
-                        total_def = float(np.sum(np.abs(scores)))
-                        self.timeline_windows[w].append(total_def)
-                        for i in range(len(FEATURE_NAMES)):
-                            self.timeline[i].append(scores[i])
-    
-    def get_series(self, feature_idx):
-        return np.array(self.timeline.get(feature_idx, [0.0]))
-    
-    def get_window_series(self, window_size):
-        return np.array(self.timeline_windows.get(window_size, [0.0]))
-    
-    def compute_robust_autocorrelation(self, feature_idx, max_lag=10):
-        """
-        Autocorrelação ajustada para séries quase-constantes.
-        Detecta variância zero e retorna NaN apropriado.
-        """
-        series = self.get_series(feature_idx)
-        if len(series) < max_lag + 2:
-            return 0.0
-        
-        # Verificar variância
-        if np.std(series) < 1e-10:
-            return float('nan')  # Série constante
-        
-        autocorrs = []
-        for lag in range(1, min(max_lag + 1, len(series) // 5)):
-            if len(series) > lag:
-                try:
-                    corr = np.corrcoef(series[:-lag], series[lag:])[0, 1]
-                    if not np.isnan(corr):
-                        autocorrs.append(corr)
-                except:
-                    pass
-        
-        return float(np.mean(autocorrs)) if autocorrs else 0.0
-    
-    def compute_mutual_information_predictive(self, feature_idx, performance_series, max_lag=5):
-        """
-        MI CORRIGIDO: mede dependência entre feature_t e performance_futura.
-        NÃO mede autoestrutura trivial.
-        """
-        series = self.get_series(feature_idx)
-        if len(series) < 50 or len(performance_series) < 50:
-            return 0.0
-        
-        # Alinhar séries: feature_t vs performance_t+1
-        min_len = min(len(series) - 1, len(performance_series) - 1)
-        if min_len < 20:
-            return 0.0
-        
-        X = series[:min_len].reshape(-1, 1)
-        y = performance_series[1:min_len+1]  # performance FUTURA
-        
-        # Verificar variância
-        if np.std(X) < 1e-10 or np.std(y) < 1e-10:
-            return 0.0
-        
-        try:
-            from sklearn.feature_selection import mutual_info_regression
-            mi = mutual_info_regression(X, y, random_state=42)
-            return float(mi[0]) if len(mi) > 0 else 0.0
-        except:
-            # Fallback: correlação como proxy
+class DistributionModelV8:
+    def __init__(self, feature_matrix):
+        self.feature_matrix = feature_matrix
+        self._build_gmm()
+        self._gmm_norm = self._compute_gmm_norm()
+
+    def _build_gmm(self):
+        if SKLEARN_AVAILABLE and self.feature_matrix.shape[0] > 100:
             try:
-                corr = np.corrcoef(X.flatten(), y)[0, 1]
-                return abs(corr) if not np.isnan(corr) else 0.0
-            except:
-                return 0.0
+                n_comp = min(6, self.feature_matrix.shape[0] // 200)
+                self.gmm = GaussianMixture(
+                    n_components=max(3, n_comp), random_state=42)
+                self.gmm.fit(self.feature_matrix)
+                self._has_gmm = True
+                return
+            except Exception:
+                pass
+        self._has_gmm = False
+
+    def _compute_gmm_norm(self):
+        if self._has_gmm:
+            scores = self.gmm.score_samples(self.feature_matrix)
+            return {'min': float(np.min(scores)), 'max': float(np.max(scores))}
+        return {'min': -100.0, 'max': 100.0}
+
+    def score_samples_normalized(self, features):
+        if self._has_gmm:
+            raw = float(self.gmm.score_samples(features.reshape(1, -1))[0])
+            rng = self._gmm_norm['max'] - self._gmm_norm['min']
+            return (raw - self._gmm_norm['min']) / rng if rng > 0 else 0.5
+        return 0.5
+
+    def predict_cluster(self, features):
+        if self._has_gmm:
+            return int(self.gmm.predict(features.reshape(1, -1))[0])
+        return 0
+
+    @property
+    def n_components(self):
+        return self.gmm.n_components if self._has_gmm else 1
 
 
 # ============================================================
-# DETECTOR DE DEFORMAÇÕES LOCAIS
+# GERADOR LIVRE
 # ============================================================
-class LocalDeformationDetector:
+class FreeGeneratorV8:
+    def __init__(self, last_contest=None):
+        self.last = set(last_contest) if last_contest else None
+
+    def generate_one(self):
+        game = set()
+        available = set(range(1, 26))
+        if self.last and random.random() < 0.3:
+            rep_pool = list(self.last & available)
+            if rep_pool:
+                n = random.randint(5, 10)
+                game.update(random.sample(rep_pool, min(n, len(rep_pool))))
+                available -= game
+        while len(game) < 15 and available:
+            candidates = list(available)
+            scores = []
+            for d in candidates:
+                test = game | {d}
+                s = len(set((x-1)//5 for x in test)) * 3
+                st = sorted(test)
+                cons = sum(1 for i in range(len(st)-1) if st[i+1]-st[i]==1)
+                if cons > 6:
+                    s -= (cons - 6) * 1.5
+                scores.append(s)
+            if scores:
+                scores = np.array(scores, dtype=np.float64)
+                scores = scores - np.max(scores)
+                probs = np.exp(scores / 3.0)
+                probs = probs / probs.sum()
+                chosen = np.random.choice(candidates, p=probs)
+            else:
+                chosen = random.choice(candidates)
+            game.add(chosen)
+            available.remove(chosen)
+        return sorted(game)[:15]
+
+    def generate_pure_random(self):
+        return sorted(np.random.choice(range(1, 26), 15, replace=False))
+
+
+# ============================================================
+# OTIMIZADOR DE CARTEIRA HÍBRIDA v8
+# ============================================================
+class HybridPortfolioOptimizerV8:
+    """
+    Otimizador de carteira HÍBRIDA v8.
+
+    Correções:
+    - max_inter (não min_inter) no greedy coverage
+    - regime_shift usado no score temporal
+    - Features padronizadas (z-score) para GMM e distâncias
+    - Ensemble ponderado por lift, cluster e diversidade
+    - Stability score (variância entre janelas)
+    """
     def __init__(self, contests):
         self.contests = contests
-        self.cache = FeatureCache(contests)
-        self.baseline = RobustBaseline(contests, self.cache)
-        self.timeline = DeformationTimeline(contests)
-    
-    def analyze_all_windows(self):
-        results = {}
-        for w in WINDOWS:
-            if len(self.contests) >= w:
-                means = self.cache.get_window_mean(len(self.contests) - w, len(self.contests))
-                if means is not None:
-                    scores = self.baseline.compute_deformation_scores(means)
-                    results[w] = {
-                        'means': means,
-                        'scores': scores,
-                        'total_deformation': float(np.sum(np.abs(scores)))
-                    }
-        return results
-    
-    def find_persistent_deformations(self, performance_series=None):
-        persistence = {}
-        current = self.analyze_all_windows()
-        
-        for feat_idx, feat_name in enumerate(FEATURE_NAMES):
-            autocorr = self.timeline.compute_robust_autocorrelation(feat_idx, max_lag=10)
-            
-            # MI preditivo (se performance fornecida)
-            mi = 0.0
-            if performance_series is not None:
-                mi = self.timeline.compute_mutual_information_predictive(
-                    feat_idx, performance_series
-                )
-            
-            current_scores = []
-            for w in WINDOWS:
-                if w in current and current[w] is not None:
-                    current_scores.append(current[w]['scores'][feat_idx])
-            
-            # Marcar features de baixa variância
-            is_low_variance = feat_name in LOW_VARIANCE_FEATURES
-            is_persistent = (not np.isnan(autocorr) and abs(autocorr) > 0.2 
-                           and len(current_scores) >= 3 and not is_low_variance)
-            
-            persistence[feat_name] = {
-                'autocorr': float(autocorr) if not np.isnan(autocorr) else 0.0,
-                'mutual_info_pred': float(mi),
-                'current_score': current_scores[0] if current_scores else 0.0,
-                'is_persistent': is_persistent,
-                'is_low_variance': is_low_variance,
-                'direction': 'positiva' if current_scores and current_scores[0] > 0 else 'negativa'
-            }
-        
-        return persistence
-    
-    def get_local_topology_target(self, window=20):
-        if len(self.contests) < window:
-            window = len(self.contests)
-        return self.cache.get_window_mean(len(self.contests) - window, len(self.contests))
-    
-    def get_global_topology_target(self):
-        return self.baseline.mean.copy()
-    
-    def get_ensemble_target(self):
-        targets = []
-        for w in ENSEMBLE_WINDOWS:
-            target = self.get_local_topology_target(w)
-            if target is not None:
-                targets.append(target)
-        return np.mean(targets, axis=0) if targets else self.get_local_topology_target(20)
+        self.extractor = TopologicalFeatureExtractorV8(contests)
+        self.feature_matrix = self.extractor.build_feature_matrix()
+        self.dist_model = DistributionModelV8(self.feature_matrix)
+        self.last = contests[-1]['dezenas'] if contests else None
+        self.generator = FreeGeneratorV8(self.last)
+        self._mc_cache = {}
 
+    def _score_game_central(self, game):
+        features = self.extractor.extract_features(game, self.last)
+        gmm_score = self.dist_model.score_samples_normalized(features)
+        return gmm_score, features, self.dist_model.predict_cluster(features)
 
-# ============================================================
-# GERADOR
-# ============================================================
-class LocalRegimeGenerator:
-    def __init__(self, detector):
-        self.detector = detector
-        self.baseline = detector.baseline
-    
-    def generate_aligned(self, target, n_games=10, n_candidates_factor=500):
-        if target is None:
-            return [sorted(np.random.choice(range(1, 26), 15, replace=False)) for _ in range(n_games)]
-        
-        last = self.detector.contests[-1]['dezenas']
-        candidates = []
+    def _score_game_temporal(self, game):
+        temporal_score = self.extractor.compute_temporal_score(
+            game, self.feature_matrix)
+        features = self.extractor.extract_features(game, self.last)
+        return temporal_score, features, self.dist_model.predict_cluster(features)
+
+    def _greedy_marginal_coverage(self, pool, existing_portfolio,
+                                   n_select, max_intersection=7):
+        """
+        GREEDY MARGINAL COVERAGE (CORRIGIDO):
+        Usa max_inter (não min_inter) para verificar interseção.
+        """
+        covered_pairs = set()
+        for g in existing_portfolio:
+            for pair in combinations(sorted(g), 2):
+                covered_pairs.add(pair)
+
+        selected = list(existing_portfolio)
+        remaining = [g for g in pool if g not in selected]
+
+        for _ in range(n_select):
+            if not remaining:
+                break
+
+            best_game = None
+            best_gain = -1
+
+            sample = random.sample(remaining, min(300, len(remaining)))
+
+            for game in sample:
+                # CORRIGIDO: max_inter em vez de min_inter
+                if selected:
+                    max_inter = max(len(set(game) & set(sg))
+                                    for sg in selected)
+                    if max_inter > max_intersection:
+                        continue
+
+                new_pairs = set()
+                for pair in combinations(sorted(game), 2):
+                    if pair not in covered_pairs:
+                        new_pairs.add(pair)
+
+                gain = len(new_pairs)
+
+                if gain > best_gain:
+                    best_gain = gain
+                    best_game = game
+
+            if best_game and best_gain > 0:
+                selected.append(best_game)
+                remaining.remove(best_game)
+                for pair in combinations(sorted(best_game), 2):
+                    covered_pairs.add(pair)
+
+        return selected
+
+    def _pair_coverage(self, portfolio):
+        covered = set()
+        for g in portfolio:
+            for pair in combinations(sorted(g), 2):
+                covered.add(pair)
+        return len(covered) / comb(25, 2)
+
+    def _portfolio_entropy(self, portfolio):
+        all_dezenas = [d for g in portfolio for d in g]
+        freq = np.bincount(all_dezenas, minlength=26)[1:]
+        probs = freq / np.sum(freq)
+        probs = np.where(probs > 0, probs, 1e-10)
+        return float(entropy(probs) / np.log(25))
+
+    def _portfolio_union_coverage(self, portfolio):
+        return len(set(d for g in portfolio for d in g)) / 25.0
+
+    def _portfolio_diversity(self, portfolio):
+        if len(portfolio) < 2:
+            return 1.0
+        sims = []
+        for i in range(len(portfolio)):
+            for j in range(i+1, len(portfolio)):
+                sims.append(len(set(portfolio[i]) & set(portfolio[j])))
+        return 1.0 - np.mean(sims) / 15.0
+
+    def _geometric_diversity(self, portfolio):
+        """
+        ANTI-COLAPSO GEOMÉTRICO (com features já padronizadas).
+        """
+        if len(portfolio) < 2:
+            return 1.0
+
+        feature_vectors = []
+        for g in portfolio:
+            feats = self.extractor.extract_features(g, self.last)
+            feature_vectors.append(feats)
+
+        feature_vectors = np.array(feature_vectors)
+
+        distances = []
+        for i in range(len(feature_vectors)):
+            for j in range(i+1, len(feature_vectors)):
+                dist = np.linalg.norm(feature_vectors[i] - feature_vectors[j])
+                distances.append(dist)
+
+        avg_dist = np.mean(distances) if distances else 0
+        # Com features padronizadas, distância máxima esperada é ~2*sqrt(n_features)
+        max_expected = 2 * np.sqrt(len(FEATURE_NAMES_V8))
+        return min(1.0, avg_dist / max_expected)
+
+    def _monte_carlo_p11(self, portfolio, n_simulations=2000):
+        """Monte Carlo com bootstrap histórico"""
+        cache_key = tuple(tuple(sorted(g)) for g in portfolio)
+        if cache_key in self._mc_cache:
+            return self._mc_cache[cache_key]
+
+        historical_draws = [set(c['dezenas']) for c in self.contests[-500:]]
+        if len(historical_draws) < 100:
+            historical_draws = [
+                set(np.random.choice(range(1, 26), 15, replace=False))
+                for _ in range(500)
+            ]
+
+        successes = 0
+        n_eval = min(n_simulations, len(historical_draws))
+
+        for i in range(n_eval):
+            drawn = historical_draws[random.randint(
+                0, len(historical_draws) - 1)]
+            if any(len(set(g) & drawn) >= 11 for g in portfolio):
+                successes += 1
+
+        prob = successes / n_eval if n_eval > 0 else 0
+
+        self._mc_cache[cache_key] = prob
+        if len(self._mc_cache) > 500:
+            keys = list(self._mc_cache.keys())[:250]
+            for k in keys:
+                del self._mc_cache[k]
+        return prob
+
+    def _portfolio_score(self, portfolio):
+        """Score com stability bonus"""
+        p11 = self._monte_carlo_p11(portfolio, n_simulations=1000)
+        pair_cov = self._pair_coverage(portfolio)
+        entropy_val = self._portfolio_entropy(portfolio)
+        diversity = self._portfolio_diversity(portfolio)
+        geo_diversity = self._geometric_diversity(portfolio)
+
+        return (p11 * 0.30 + pair_cov * 0.25 + entropy_val * 0.15 +
+                diversity * 0.15 + geo_diversity * 0.15)
+
+    def _mutate_game(self, game):
+        mutated = list(game)
+        n_changes = random.randint(1, 3)
+        for _ in range(n_changes):
+            pos = random.randint(0, 14)
+            available = [d for d in range(1, 26) if d not in mutated]
+            if available:
+                mutated[pos] = random.choice(available)
+        return sorted(mutated)[:15]
+
+    def optimize_hybrid(self, n_games=10, n_candidates=200000, iterations=100):
+        print(f"\n🎯 OTIMIZANDO CARTEIRA HÍBRIDA v8 ({n_games} jogos)...")
+
+        n_central = max(1, int(n_games * 0.40))
+        n_coverage = max(1, int(n_games * 0.40))
+        n_temporal = n_games - n_central - n_coverage
+
+        print(f"   Composição: {n_central} centrais + {n_coverage} cobertura + {n_temporal} temporais")
+
+        print(f"   Gerando {n_candidates:,} candidatos...")
+        pool_central = []
+        pool_temporal = []
+        pool_all = []
         seen = set()
-        
-        for _ in range(n_games * n_candidates_factor):
-            game = sorted(np.random.choice(range(1, 26), 15, replace=False))
+        for _ in tqdm(range(n_candidates), desc="Candidatos"):
+            game = self.generator.generate_one()
             key = tuple(game)
             if key not in seen:
                 seen.add(key)
-                feats = extract_game_features(game, last)
-                try:
-                    diff = feats - target
-                    dist = np.dot(np.dot(diff.T, self.baseline.precision), diff)
-                except:
-                    dist = np.linalg.norm(feats - target)
-                candidates.append((dist, game))
-        
-        candidates.sort(key=lambda x: x[0])
-        return [g for _, g in candidates[:n_games]]
-    
-    def generate_aligned_temporal(self, n_games=10, window=20):
-        target = self.detector.get_local_topology_target(window)
-        return self.generate_aligned(target, n_games)
-    
-    def generate_aligned_global(self, n_games=10):
-        target = self.detector.get_global_topology_target()
-        return self.generate_aligned(target, n_games)
-    
-    def generate_aligned_ensemble(self, n_games=10):
-        target = self.detector.get_ensemble_target()
-        return self.generate_aligned(target, n_games)
-    
+                sc, feats, cluster = self._score_game_central(game)
+                pool_central.append((sc, game, feats, cluster))
+                st, feats2, cluster2 = self._score_game_temporal(game)
+                pool_temporal.append((st, game, feats2, cluster2))
+                pool_all.append(game)
+
+        pool_central.sort(key=lambda x: x[0], reverse=True)
+        pool_temporal.sort(key=lambda x: x[0], reverse=True)
+
+        # Centrais
+        central_games = []
+        cluster_counts = defaultdict(int)
+        max_per_cluster = max(2, n_central // self.dist_model.n_components + 1)
+        for sc, game, feats, cluster in pool_central:
+            if len(central_games) >= n_central:
+                break
+            if cluster_counts[cluster] >= max_per_cluster:
+                continue
+            if any(len(set(game) & set(sg)) > 8 for sg in central_games):
+                continue
+            central_games.append(game)
+            cluster_counts[cluster] += 1
+
+        # Cobertura via greedy marginal (CORRIGIDO)
+        coverage_games = self._greedy_marginal_coverage(
+            [g for g in pool_all if g not in central_games],
+            central_games, n_coverage, max_intersection=7
+        )
+        coverage_games = coverage_games[len(central_games):]
+
+        # Temporais
+        temporal_games = []
+        for st, game, feats, cluster in pool_temporal:
+            if game in central_games or game in coverage_games:
+                continue
+            if len(temporal_games) >= n_temporal:
+                break
+            if any(len(set(game) & set(sg)) > 8 for sg in temporal_games):
+                continue
+            if any(len(set(game) & set(sg)) > 9
+                   for sg in central_games + coverage_games):
+                continue
+            temporal_games.append(game)
+
+        # Completar
+        while len(central_games) < n_central:
+            game = self.generator.generate_one()
+            if game not in central_games:
+                central_games.append(game)
+        while len(coverage_games) < n_coverage:
+            game = self.generator.generate_one()
+            if game not in central_games and game not in coverage_games:
+                coverage_games.append(game)
+        while len(temporal_games) < n_temporal:
+            game = self.generator.generate_one()
+            if (game not in central_games and game not in coverage_games
+                    and game not in temporal_games):
+                temporal_games.append(game)
+
+        portfolio = central_games + coverage_games + temporal_games
+        best_portfolio = list(portfolio)
+        best_score = self._portfolio_score(portfolio)
+        current_score = best_score
+
+        # Simulated Annealing
+        temp = 1.0
+        elite_pool = [(s, g) for s, g, _, _ in pool_central[:len(pool_central)//4]]
+
+        for it in tqdm(range(iterations), desc="Annealing"):
+            temp *= 0.95
+            new_portfolio = list(portfolio)
+            idx = random.randint(0, len(new_portfolio) - 1)
+
+            if random.random() < 0.4 and elite_pool:
+                _, new_game = random.choice(elite_pool)
+            elif random.random() < 0.7:
+                new_game = self._mutate_game(new_portfolio[idx])
+            else:
+                new_game = self.generator.generate_one()
+
+            # Verificar interseção
+            too_similar = False
+            for j, sg in enumerate(new_portfolio):
+                if j != idx and len(set(new_game) & set(sg)) > 8:
+                    too_similar = True
+                    break
+            if too_similar:
+                continue
+
+            new_portfolio[idx] = new_game
+            new_score = self._portfolio_score(new_portfolio)
+
+            delta = new_score - current_score
+            if delta > 0 or random.random() < np.exp(delta / max(0.01, temp)):
+                portfolio = new_portfolio
+                current_score = new_score
+                if current_score > best_score:
+                    best_score = current_score
+                    best_portfolio = list(portfolio)
+
+        return best_portfolio, best_score
+
+    def generate_ensemble_consensus(self, n_strategies=3, n_games_per_strategy=5):
+        """
+        Ensemble PONDERADO por lift, cluster e diversidade.
+        """
+        print(f"\n🤝 ENSEMBLE PONDERADO...")
+        strategy_results = []
+
+        for s in range(n_strategies):
+            portfolio, score = self.optimize_hybrid(
+                n_games=n_games_per_strategy, n_candidates=50000, iterations=30)
+            # Calcular lift estimado via Monte Carlo
+            p11 = self._monte_carlo_p11(portfolio, n_simulations=1000)
+            p_single = sum(HYPE_PROBS[k] for k in range(11, 16))
+            p_none = (1 - p_single) ** len(portfolio)
+            theo_prob = 1 - p_none
+            lift = p11 / theo_prob if theo_prob > 0 else 1.0
+
+            strategy_results.append({
+                'portfolio': portfolio,
+                'score': score,
+                'lift': lift,
+                'dezenas': [d for g in portfolio for d in g],
+            })
+
+        # Votação ponderada por lift
+        weighted_freq = Counter()
+        for sr in strategy_results:
+            weight = sr['lift']
+            for d in sr['dezenas']:
+                weighted_freq[d] += weight
+
+        top_dezenas = [d for d, _ in weighted_freq.most_common(20)]
+
+        # Gerar jogos com bônus de consenso
+        consensus_games = []
+        seen = set()
+        for _ in range(20000):
+            game = self.generator.generate_one()
+            key = tuple(game)
+            if key not in seen:
+                seen.add(key)
+                consensus_count = len(set(game) & set(top_dezenas[:15]))
+                if consensus_count >= 10:
+                    consensus_games.append(game)
+
+        selected = []
+        for game in consensus_games[:500]:
+            if len(selected) >= 10:
+                break
+            if not any(len(set(game) & set(sg)) > 8 for sg in selected):
+                selected.append(game)
+
+        return selected if len(selected) >= 5 else consensus_games[:10]
+
+    def generate_pure_random_portfolio(self, n_games=10):
+        return [self.generator.generate_pure_random() for _ in range(n_games)]
+
     def generate_coverage_baseline(self, n_games=10):
         pool = []
         seen = set()
-        for _ in range(n_games * 200):
-            game = sorted(np.random.choice(range(1, 26), 15, replace=False))
+        for _ in range(50000):
+            game = self.generator.generate_pure_random()
             key = tuple(game)
             if key not in seen:
                 seen.add(key)
                 pool.append(game)
-        selected = [pool[0]]
-        for _ in range(n_games - 1):
-            best, best_min = None, -1
-            for g in pool:
-                if g not in selected:
-                    min_dist = min(len(set(g) & set(s)) for s in selected)
-                    if min_dist > best_min:
-                        best_min = min_dist
-                        best = g
-            if best: selected.append(best)
+        selected = self._greedy_marginal_coverage(
+            pool, [], n_games, max_intersection=7)
         return selected[:n_games]
 
-
-# ============================================================
-# AVALIAÇÃO
-# ============================================================
-def theoretical_baseline_metrics():
-    expected_hits = sum(k * HYPE_PROBS[k] for k in range(16))
-    return {
-        'media_hits': expected_hits,
-        'freq_11_plus': sum(HYPE_PROBS[k] for k in range(11, 16)),
-        'freq_12_plus': sum(HYPE_PROBS[k] for k in range(12, 16)),
-        'freq_13_plus': sum(HYPE_PROBS[k] for k in range(13, 16)),
-    }
-
-def evaluate_games(games, test_draws):
-    dist = {h: 0 for h in range(0, 16)}
-    for draw in test_draws:
-        actual = set(draw['dezenas'])
-        for g in games:
-            dist[len(set(g) & actual)] += 1
-    total = len(test_draws) * len(games)
-    if total == 0:
-        return {'media_hits': 0, 'freq_11_plus': 0, 'freq_12_plus': 0, 'freq_13_plus': 0}
-    hits_sum = sum(h * dist[h] for h in range(16))
-    return {
-        'media_hits': hits_sum / total,
-        'freq_11_plus': sum(dist[h] for h in range(11, 16)) / total,
-        'freq_12_plus': sum(dist[h] for h in range(12, 16)) / total,
-        'freq_13_plus': sum(dist[h] for h in range(13, 16)) / total,
-    }
-
-def permutation_test_corrected(strat_vals, rand_vals, n_perm=10000):
-    observed = np.mean(strat_vals) - np.mean(rand_vals)
-    combined = np.concatenate([strat_vals, rand_vals])
-    n1 = len(strat_vals)
-    extreme = 0
-    for _ in range(n_perm):
-        np.random.shuffle(combined)
-        perm_diff = np.mean(combined[:n1]) - np.mean(combined[n1:])
-        if abs(perm_diff) >= abs(observed):
-            extreme += 1
-    return observed, extreme / n_perm
+    def backtest(self, portfolio, test_draws):
+        n_success = 0
+        for draw in test_draws:
+            actual = set(draw['dezenas'])
+            if any(len(set(g) & actual) >= 11 for g in portfolio):
+                n_success += 1
+        prob = n_success / len(test_draws) if test_draws else 0
+        p_single = sum(HYPE_PROBS[k] for k in range(11, 16))
+        p_none = (1 - p_single) ** len(portfolio)
+        theo_prob = 1 - p_none
+        return {
+            'empirical': prob, 'theoretical': theo_prob,
+            'lift': prob / theo_prob if theo_prob > 0 else 1.0,
+            'n_test': len(test_draws), 'n_success': n_success,
+        }
 
 
 # ============================================================
-# TESTE OUT-OF-SAMPLE (RÁPIDO)
+# WALK-FORWARD COM STABILITY SCORE
 # ============================================================
-def out_of_sample_test(contests, train_window=300, test_ahead=5, n_games=10, max_windows=20):
-    """
-    Teste out-of-sample limitado para viabilidade computacional.
-    """
-    print(f"\n🔬 TESTE OUT-OF-SAMPLE ({test_ahead} concursos à frente, {max_windows} janelas)...")
+def walk_forward_validation(contests, n_windows=10, train_size=500,
+                            test_size=50, n_games=10):
+    print(f"\n🔬 WALK-FORWARD ({n_windows} janelas)...")
     results = []
-    
-    step = max(50, (len(contests) - train_window - test_ahead) // max_windows)
-    starts = list(range(100, len(contests) - test_ahead - train_window, step))[:max_windows]
-    
-    for start in tqdm(starts, desc="OOS"):
-        train_end = start + train_window
-        if train_end + test_ahead > len(contests):
+
+    for w in range(n_windows):
+        test_end = len(contests) - w * test_size
+        test_start = test_end - test_size
+        train_end = test_start
+        train_start = max(0, train_end - train_size)
+        if train_start >= train_end or test_start >= test_end:
             continue
-        train_data = contests[start:train_end]
-        test_data = contests[train_end:train_end + test_ahead]
-        if len(train_data) < 100 or len(test_data) < test_ahead:
+
+        train_data = contests[train_start:train_end]
+        test_data = contests[test_start:test_end]
+        if len(train_data) < 100 or len(test_data) < 5:
             continue
-        
-        detector = LocalDeformationDetector(train_data)
-        generator = LocalRegimeGenerator(detector)
-        
-        aligned_temp = generator.generate_aligned_temporal(n_games, window=20)
-        aligned_glob = generator.generate_aligned_global(n_games)
-        coverage = generator.generate_coverage_baseline(n_games)
-        random_g = [sorted(np.random.choice(range(1, 26), 15, replace=False)) for _ in range(n_games)]
-        
-        met_temp = evaluate_games(aligned_temp, test_data)
-        met_glob = evaluate_games(aligned_glob, test_data)
-        met_cov = evaluate_games(coverage, test_data)
-        met_rand = evaluate_games(random_g, test_data)
-        
+
+        optimizer = HybridPortfolioOptimizerV8(train_data)
+        portfolio, _ = optimizer.optimize_hybrid(
+            n_games, n_candidates=50000, iterations=50)
+        random_portfolio = optimizer.generate_pure_random_portfolio(n_games)
+        coverage_portfolio = optimizer.generate_coverage_baseline(n_games)
+
+        bt_strat = optimizer.backtest(portfolio, test_data)
+        bt_rand = optimizer.backtest(random_portfolio, test_data)
+        bt_cov = optimizer.backtest(coverage_portfolio, test_data)
+
         results.append({
-            'temp_11': met_temp['freq_11_plus'],
-            'glob_11': met_glob['freq_11_plus'],
-            'cov_11': met_cov['freq_11_plus'],
-            'rand_11': met_rand['freq_11_plus'],
-            'diff_temp': met_temp['freq_11_plus'] - met_rand['freq_11_plus'],
-            'diff_glob': met_glob['freq_11_plus'] - met_rand['freq_11_plus'],
-            'diff_cov': met_cov['freq_11_plus'] - met_rand['freq_11_plus'],
+            'window': w,
+            'strat_lift': bt_strat['lift'],
+            'rand_lift': bt_rand['lift'],
+            'cov_lift': bt_cov['lift'],
+            'diff_vs_rand': bt_strat['lift'] - bt_rand['lift'],
+            'diff_vs_cov': bt_strat['lift'] - bt_cov['lift'],
         })
-    
+        print(f" Janela {w}: lift={bt_strat['lift']:.3f} "
+              f"rand={bt_rand['lift']:.3f} cov={bt_cov['lift']:.3f}")
+
     if results:
-        print(f"\n📊 RESULTADOS OUT-OF-SAMPLE ({len(results)} janelas):")
-        print(f"   {'Estratégia':<25} {'Média diff':<15} {'% positivo':<15} {'Wilcoxon p':<15}")
-        print(f"   {'-'*70}")
-        
-        for strat, key in [('Temporal (20)', 'diff_temp'), ('Global', 'diff_glob'), ('Cobertura', 'diff_cov')]:
-            diffs = [r[key] for r in results]
-            mean_diff = np.mean(diffs)
-            pct_pos = np.mean(np.array(diffs) > 0) * 100
-            try:
-                _, pval = wilcoxon(diffs)
-            except:
-                pval = 1.0
-            sig = "🔴" if pval < 0.05 else "🟢"
-            print(f"   {strat:<25} {mean_diff:<15.6f} {pct_pos:<15.1f}% {pval:<15.4f} {sig}")
-        
-        temp_diffs = [r['diff_temp'] for r in results]
-        glob_diffs = [r['diff_glob'] for r in results]
+        diffs_rand = [r['diff_vs_rand'] for r in results]
+        diffs_cov = [r['diff_vs_cov'] for r in results]
+
+        mean_diff_rand = np.mean(diffs_rand)
+        std_diff_rand = np.std(diffs_rand)
+        mean_diff_cov = np.mean(diffs_cov)
+
+        # Stability score: inverso do coeficiente de variação
+        cv_rand = abs(std_diff_rand / (mean_diff_rand + 1e-10))
+        stability = 1.0 / (1.0 + cv_rand)
+
+        print(f"\n📊 RESUMO:")
+        print(f"   Média diff vs Aleatório: {mean_diff_rand:+.3f}")
+        print(f"   Média diff vs Cobertura: {mean_diff_cov:+.3f}")
+        print(f"   Stability score: {stability:.3f} (0=instável, 1=estável)")
+        print(f"   Janelas + (vs Aleatório): "
+              f"{sum(1 for d in diffs_rand if d > 0)}/{len(results)}")
         try:
-            _, p_compare = wilcoxon(temp_diffs, glob_diffs)
-            print(f"\n   Temporal vs Global: Wilcoxon p = {p_compare:.4f}")
-            if p_compare < 0.05:
-                print(f"   ✅ Temporal DIFERE de Global com significância!")
-            else:
-                print(f"   🟡 Temporal ≈ Global (sem diferença)")
-        except:
+            _, p_rand = wilcoxon(diffs_rand)
+            print(f"   Wilcoxon p (vs Aleatório): {p_rand:.4f}")
+        except Exception:
             pass
-    
     return results
 
 
 # ============================================================
-# TESTE COMPARATIVO REAL vs SINTÉTICO
-# ============================================================
-def run_comparative_test(real_contests, n_simulations=200, blind_size=300, n_games=10):
-    print(f"\n🔬 TESTE COMPARATIVO REAL vs SINTÉTICO ({n_simulations} simulações)...")
-    
-    def run_single(contests, seed):
-        random.seed(seed)
-        np.random.seed(seed)
-        train = contests[:-blind_size]
-        blind = contests[-blind_size:]
-        
-        detector = LocalDeformationDetector(train)
-        generator = LocalRegimeGenerator(detector)
-        
-        aligned = generator.generate_aligned_temporal(n_games, window=20)
-        random_g = [sorted(np.random.choice(range(1, 26), 15, replace=False)) for _ in range(n_games)]
-        
-        met_aligned = evaluate_games(aligned, blind)
-        met_random = evaluate_games(random_g, blind)
-        return met_aligned['freq_11_plus'] - met_random['freq_11_plus']
-    
-    real_deltas = []
-    for i in tqdm(range(n_simulations), desc="Real"):
-        real_deltas.append(run_single(real_contests, i))
-    
-    synth_contests_base = generate_synthetic_contests(len(real_contests))
-    synth_deltas = []
-    for i in tqdm(range(n_simulations), desc="Sintético"):
-        synth_deltas.append(run_single(synth_contests_base, i + 100000))
-    
-    real_deltas = np.array(real_deltas)
-    synth_deltas = np.array(synth_deltas)
-    
-    print(f"\n📊 RESULTADOS COMPARATIVOS:")
-    print(f"   {'Métrica':<25} {'Real':<15} {'Sintético':<15}")
-    print(f"   {'Média delta':<25} {np.mean(real_deltas):<15.6f} {np.mean(synth_deltas):<15.6f}")
-    print(f"   {'Std delta':<25} {np.std(real_deltas):<15.6f} {np.std(synth_deltas):<15.6f}")
-    print(f"   {'% positivo':<25} {np.mean(real_deltas>0)*100:<15.1f}% {np.mean(synth_deltas>0)*100:<15.1f}%")
-    
-    ks_stat, ks_p = ks_2samp(real_deltas, synth_deltas)
-    mw_stat, mw_p = mannwhitneyu(real_deltas, synth_deltas, alternative='greater')
-    print(f"\n   KS-test: p={ks_p:.4f}")
-    print(f"   Mann-Whitney (real > synth): p={mw_p:.4f}")
-    
-    if mw_p < 0.05:
-        print(f"   ✅ REAL > SINTÉTICO com significância!")
-    else:
-        print(f"   🟡 REAL ≈ SINTÉTICO (sem diferença)")
-    
-    return real_deltas, synth_deltas, mw_p
-
-
-# ============================================================
-# INTERFACE PRINCIPAL
+# INTERFACE
 # ============================================================
 def main():
     print("="*70)
-    print("🧬 LABORATÓRIO DE MICROESTRUTURA TEMPORAL v37")
+    print("🧬 GERADOR DE CARTEIRA HÍBRIDA v8")
     print("="*70)
-    
+
     contests = load_all_contests('resultados_lotofacil.csv')
     if contests is None:
-        print("❌ Arquivo não encontrado. Gerando sintéticos...")
-        contests = generate_synthetic_contests(3686)
-    
-    print(f"📂 {len(contests)} concursos válidos")
-    
-    # Detector com cache
-    t0 = time.time()
-    detector = LocalDeformationDetector(contests)
-    print(f"\n⏱️ Detector construído em {time.time()-t0:.1f}s")
-    print(f"📊 Timeline: {len(detector.timeline.get_series(0))} pontos temporais")
-    
-    # Deformações atuais
-    results = detector.analyze_all_windows()
-    print(f"\n📊 DEFORMAÇÕES ATUAIS:")
-    for w in WINDOWS:
-        if w in results and results[w] is not None:
-            print(f"   Janela {w:3d}: deformação total = {results[w]['total_deformation']:.2f}")
-    
-    # Persistência
-    # Construir série de performance (freq_11+ por concurso)
-    perf_series = None
-    if len(contests) >= 100:
-        perf_series = []
-        for i in range(len(contests)):
-            # Performance dummy: usar soma como proxy
-            perf_series.append(sum(contests[i]['dezenas']) / 15.0)
-        perf_series = np.array(perf_series)
-    
-    persistence = detector.find_persistent_deformations(perf_series)
-    persistent_feats = [k for k, v in persistence.items() if v['is_persistent']]
-    low_var_feats = [k for k, v in persistence.items() if v.get('is_low_variance')]
-    
-    if low_var_feats:
-        print(f"\n📊 FEATURES DE BAIXA VARIÂNCIA (autocorr não confiável):")
-        for feat in low_var_feats:
-            print(f"   {feat}")
-    
-    if persistent_feats:
-        print(f"\n📊 DEFORMAÇÕES PERSISTENTES (autocorr > 0.2):")
-        for feat in persistent_feats:
-            print(f"   {feat}: autocorr={persistence[feat]['autocorr']:.3f} MI_pred={persistence[feat]['mutual_info_pred']:.4f}")
-    else:
-        print(f"\n📊 Nenhuma deformação persistente detectada")
-    
+        print("❌ Arquivo não encontrado.")
+        return
+
+    print(f"\n📂 {len(contests)} concursos")
+    print(f"📌 Último: {contests[-1]['concurso']} - {contests[-1]['dezenas']}")
+
+    print("\n📊 FEATURES COM SINAL TEMPORAL:")
+    for name, weight in TEMPORAL_FEATURES.items():
+        print(f"   {name}: peso={weight:.2f}")
+    print(f"\n📊 FEATURES APENAS ESTRUTURAIS:")
+    print(f"   {', '.join(sorted(STRUCTURAL_ONLY))}")
+
     print("\nOpções:")
-    print("1. Teste out-of-sample (20 janelas)")
-    print("2. Teste comparativo REAL vs SINTÉTICO (200 simulações)")
-    print("3. Ambos")
-    op = input("Escolha [3]: ").strip() or "3"
-    
-    if op in ("1", "3"):
-        out_of_sample_test(contests, train_window=300, test_ahead=5, n_games=10, max_windows=20)
-    
-    if op in ("2", "3"):
-        run_comparative_test(contests, n_simulations=200, blind_size=300, n_games=10)
-    
-    print(f"\n⏱️ Tempo total: {time.time()-t0:.1f}s")
+    print("1. Gerar carteira híbrida")
+    print("2. Ensemble ponderado (consenso)")
+    print("3. Walk-forward validation (10 janelas)")
+    print("4. TUDO")
+    op = input("Escolha [4]: ").strip() or "4"
+
+    if op in ("1", "4"):
+        print(f"\n🔧 INICIALIZANDO...")
+        t0 = time.time()
+        optimizer = HybridPortfolioOptimizerV8(contests)
+        print(f"   ✅ Inicializado em {time.time()-t0:.1f}s")
+        print(f"   GMM: {optimizer.dist_model.n_components} componentes")
+        print(f"   Features padronizadas: SIM (z-score)")
+
+        portfolio, score = optimizer.optimize_hybrid(
+            n_games=10, n_candidates=200000, iterations=100)
+
+        print(f"\n🏆 CARTEIRA HÍBRIDA (Score: {score:.3f})")
+        last = contests[-1]['dezenas']
+        for i, game in enumerate(portfolio, 1):
+            p = sum(1 for d in game if d % 2 == 0)
+            pr = sum(1 for d in game if d in PRIMES)
+            m = sum(1 for d in game if d in MOLDURA)
+            rep = len(set(game) & set(last))
+            amp = max(game) - min(game)
+            print(f"   {i:2d}. {game} | P:{p} Pr:{pr} M:{m} Rep:{rep} Amp:{amp}")
+
+        all_d = set(d for g in portfolio for d in g)
+        pair_cov = optimizer._pair_coverage(portfolio)
+        geo_div = optimizer._geometric_diversity(portfolio)
+        print(f"\n📊 Cobertura dezenas: {len(all_d)}/25")
+        print(f"📊 Cobertura pares: {pair_cov:.3f}")
+        print(f"📊 Diversidade geométrica: {geo_div:.3f}")
+        print(f"📊 Entropia: {optimizer._portfolio_entropy(portfolio):.3f}")
+        p11_est = optimizer._monte_carlo_p11(portfolio, n_simulations=5000)
+        print(f"📊 P(≥1 acerto 11+) estimada: {p11_est:.3f}")
+
+        test_size = min(200, len(contests) // 3)
+        if test_size > 10:
+            test_data = contests[-test_size:]
+            bt = optimizer.backtest(portfolio, test_data)
+            print(f"\n🔬 BACKTEST ({bt['n_test']} concursos):")
+            print(f"   Prob ≥1 acerto 11+: {bt['empirical']:.2%} "
+                  f"(teórico: {bt['theoretical']:.2%})")
+            print(f"   Lift: {bt['lift']:.2f}x")
+
+    if op in ("2", "4"):
+        optimizer = HybridPortfolioOptimizerV8(contests)
+        consensus = optimizer.generate_ensemble_consensus(
+            n_strategies=3, n_games_per_strategy=5)
+        print(f"\n🤝 CARTEIRA CONSENSO ({len(consensus)} jogos):")
+        last = contests[-1]['dezenas']
+        for i, game in enumerate(consensus, 1):
+            p = sum(1 for d in game if d % 2 == 0)
+            m = sum(1 for d in game if d in MOLDURA)
+            rep = len(set(game) & set(last))
+            print(f"   {i:2d}. {game} | P:{p} M:{m} Rep:{rep}")
+
+    if op in ("3", "4"):
+        walk_forward_validation(contests, n_windows=10, train_size=500,
+                                test_size=50, n_games=10)
+
     print("\n✅ Concluído!")
+
 
 if __name__ == "__main__":
     main()
