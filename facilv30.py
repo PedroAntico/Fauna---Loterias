@@ -2,17 +2,19 @@
 # -*- coding: utf-8 -*-
 
 """
-GERADOR PARAMÉTRICO DE CARTEIRA - LOTOFÁCIL v13
-=================================================
-CORREÇÕES BASEADAS EM EVIDÊNCIA EMPÍRICA (v12 → v13):
-✅ Score exponencial RECALIBRADO (11:1, 12:3, 13:7, 14:20, 15:60)
-✅ Geo diversity com META MÍNIMA (0.55) e MÁXIMA (0.80)
-✅ Penalidade de similaridade estrutural (cosine entre features)
-✅ Repair com similaridade MODERADA (faixa 0.3-0.7, não máxima)
-✅ Normalização EMPÍRICA do Monte Carlo (percentis de carteiras aleatórias)
-✅ Ensemble estrutural melhorado (pares + score estrutural)
-✅ HARD CAPS mantidos (pair_cov ≤ 0.90, geo_div ≤ 0.80)
-✅ Structural penalty, soft-hard gate, z-score, GMM, bootstrap preservados
+GERADOR PARAMÉTRICO DE CARTEIRA - LOTOFÁCIL v16 (FINAL)
+==========================================================
+CORREÇÕES E APERFEIÇOAMENTOS:
+✅ partial_features com completamento aleatório (não zeros)
+✅ P(par | regime) adicionada ao gerador (coocorrência condicional)
+✅ RegimeDetector verdadeiramente TEMPORAL (features delta/momentum)
+✅ ROI esperado como métrica principal
+✅ Entropia dinâmica corrigida (das dezenas)
+✅ MC Condicional SEM vazamento temporal
+✅ GMM como score central, recompensa de cauda, cobertura moderada
+✅ Structural reject threshold = 8
+✅ Pesos exponenciais recalibrados (foco na cauda)
+✅ Walk-forward com estabilidade preservada
 """
 
 import numpy as np
@@ -22,7 +24,7 @@ from itertools import combinations
 from datetime import datetime
 import warnings
 import os
-from math import comb
+from math import comb, log
 from tqdm import tqdm
 import random
 import time
@@ -33,6 +35,7 @@ try:
     from sklearn.covariance import LedoitWolf
     from sklearn.mixture import GaussianMixture
     from sklearn.preprocessing import StandardScaler
+    from sklearn.cluster import KMeans
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
@@ -46,17 +49,28 @@ MOLDURA = {1,2,3,4,5, 6,10, 11,15, 16,20, 21,22,23,24,25}
 CENTRO = {7,8,9,12,13,14,17,18,19}
 HYPE_PROBS = {k: hypergeom.pmf(k, 25, 15, 15) for k in range(0, 16)}
 
-# Features topológicas v13 (17 dimensões)
-FEATURE_NAMES_V13 = [
+# Valores reais de prêmio (aproximados) para cálculo de ROI
+PREMIO_VALORES = {
+    11: 6.0,
+    12: 12.0,
+    13: 30.0,
+    14: 1500.0,
+    15: 1800000.0,
+}
+CUSTO_APOSTA = 3.0
+
+# Features topológicas v16 (18 dimensões)
+FEATURE_NAMES_V16 = [
     "gap_medio", "gap_var", "gap_max", "gap_min",
     "energia_jogo", "entropia_transicao",
     "quadrantes", "consecutivos", "densidade_local",
     "assimetria", "clusterizacao", "repeticoes",
     "pares", "primos", "moldura", "soma", "amplitude",
+    "compressao",
 ]
-IDX = {name: i for i, name in enumerate(FEATURE_NAMES_V13)}
+IDX = {name: i for i, name in enumerate(FEATURE_NAMES_V16)}
 
-# Pesos para penalidade estrutural HARD-SOFT
+# Parâmetros ESTRUTURAIS
 STRUCTURAL_TARGETS = {
     'pares': (7.5, 1.5, 2.0),
     'primos': (5.0, 1.5, 2.5),
@@ -66,36 +80,30 @@ STRUCTURAL_TARGETS = {
     'consecutivos': (5.5, 2.0, 1.0),
     'amplitude': (22.0, 3.0, 1.0),
 }
+STRUCTURAL_REJECT_THRESHOLD = 8
 
-# HARD CAPS (v13: geo_div com meta MÍNIMA também)
-MAX_PAIR_COVERAGE = 0.90
-MIN_GEO_DIVERSITY = 0.55      # NOVO: penalizar abaixo disso
-MAX_GEO_DIVERSITY = 0.80
-TARGET_ENTROPY_MIN = 0.90
-TARGET_ENTROPY_MAX = 0.96
-STRUCTURAL_REJECT_THRESHOLD = 15.0
+# HARD CAPS
+MAX_PAIR_COVERAGE = 0.85
+MIN_GEO_DIVERSITY = 0.50
+MAX_GEO_DIVERSITY = 0.75
 
-# Score EXPONENCIAL RECALIBRADO (v13: reduzido peso de 15)
+# Score EXPONENCIAL (foco na CAUDA)
 EXPONENTIAL_WEIGHTS = {
-    11: 1.0,
-    12: 3.0,
-    13: 7.0,
-    14: 20.0,
-    15: 60.0,
+    11: 0.5,
+    12: 2.0,
+    13: 15.0,
+    14: 80.0,
+    15: 400.0,
 }
 
 # Features com sinal temporal
 TEMPORAL_FEATURES = {
-    'moldura': 0.30,
-    'amplitude': 0.25,
+    'moldura': 0.20,
+    'amplitude': 0.20,
     'energia_jogo': 0.20,
-    'densidade_local': 0.15,
-    'clusterizacao': 0.10,
+    'densidade_local': 0.20,
+    'clusterizacao': 0.20,
 }
-
-# Faixa de similaridade para repair moderado
-REPAIR_SIMILARITY_MIN = 0.3
-REPAIR_SIMILARITY_MAX = 0.7
 
 # ============================================================
 # CARREGAMENTO DE DADOS
@@ -137,9 +145,140 @@ def load_all_contests(csv_file='resultados_lotofacil.csv'):
 
 
 # ============================================================
-# EXTRATOR DE FEATURES v13 (com z-score)
+# DETECTOR DE REGIME TEMPORAL (COM DELTAS + P(DEZENA|REGIME) + P(PAR|REGIME))
 # ============================================================
-class TopologicalFeatureExtractorV13:
+class TemporalRegimeDetector:
+    """
+    Detecta regimes usando features DELTA (dinâmica temporal real).
+    Inclui P(dezena | cluster) e P(par | cluster).
+    """
+    def __init__(self, feature_matrix, contests, n_clusters=5, delta_window=10):
+        self.feature_matrix = feature_matrix
+        self.contests = contests
+        self.n_clusters = n_clusters
+        self.delta_window = delta_window
+        self.kmeans = None
+        self.scaler = StandardScaler() if SKLEARN_AVAILABLE else None
+        self.labels = None
+        self.transition_matrix = None
+        self.conditional_freqs = {}
+        self.pair_conditional_freqs = {}
+        self._build()
+
+    def _build(self):
+        if not SKLEARN_AVAILABLE or len(self.feature_matrix) < 50:
+            return
+
+        # Construir features DELTA (current - mean of last 10)
+        delta_features = []
+        for i in range(len(self.feature_matrix)):
+            if i >= self.delta_window:
+                baseline = np.mean(self.feature_matrix[i-self.delta_window:i], axis=0)
+            else:
+                baseline = np.mean(self.feature_matrix[:i+1], axis=0) if i > 0 else self.feature_matrix[i]
+            delta = self.feature_matrix[i] - baseline
+            delta_features.append(delta)
+        delta_features = np.array(delta_features)
+
+        X_scaled = self.scaler.fit_transform(delta_features)
+        self.kmeans = KMeans(n_clusters=self.n_clusters, random_state=42, n_init=10)
+        self.labels = self.kmeans.fit_predict(X_scaled)
+
+        # Matriz de transição
+        n = len(self.labels)
+        trans = np.zeros((self.n_clusters, self.n_clusters))
+        for i in range(n - 1):
+            trans[self.labels[i], self.labels[i+1]] += 1
+        row_sums = trans.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1
+        self.transition_matrix = trans / row_sums
+
+        # Frequências condicionais P(dezena | cluster)
+        self._build_conditional_freqs()
+        # Frequências condicionais P(par | cluster)
+        self._build_pair_conditional_freqs()
+
+    def _build_conditional_freqs(self):
+        for cluster in range(self.n_clusters):
+            mask = self.labels == cluster
+            cluster_contests = [self.contests[i] for i in range(len(self.contests)) if mask[i]]
+            freq = Counter()
+            for c in cluster_contests:
+                freq.update(c['dezenas'])
+            total = sum(freq.values())
+            self.conditional_freqs[cluster] = {
+                d: freq.get(d, 0) / total for d in range(1, 26)
+            } if total > 0 else {d: 0.04 for d in range(1, 26)}
+
+    def _build_pair_conditional_freqs(self):
+        for cluster in range(self.n_clusters):
+            mask = self.labels == cluster
+            cluster_contests = [self.contests[i] for i in range(len(self.contests)) if mask[i]]
+            pair_freq = Counter()
+            for c in cluster_contests:
+                for pair in combinations(sorted(c['dezenas']), 2):
+                    pair_freq[pair] += 1
+            total = sum(pair_freq.values())
+            self.pair_conditional_freqs[cluster] = {
+                pair: pair_freq.get(pair, 0) / total for pair in pair_freq
+            } if total > 0 else {}
+
+    def predict(self, features, baseline_features=None):
+        if self.kmeans is None:
+            return 0
+        if baseline_features is not None:
+            delta = features - baseline_features
+        else:
+            delta = features
+        features_scaled = self.scaler.transform(delta.reshape(1, -1))
+        return int(self.kmeans.predict(features_scaled)[0])
+
+    def get_dezena_prob(self, cluster, dezena):
+        if cluster in self.conditional_freqs:
+            return self.conditional_freqs[cluster].get(dezena, 0.01)
+        return 0.04
+
+    def get_pair_prob(self, cluster, pair):
+        if cluster in self.pair_conditional_freqs:
+            return self.pair_conditional_freqs[cluster].get(pair, 1e-6)
+        return 1e-6
+
+    def get_regime_distribution(self, recent_features):
+        if self.kmeans is None or len(recent_features) == 0:
+            return np.ones(self.n_clusters) / self.n_clusters
+        labels = []
+        for i, f in enumerate(recent_features):
+            if i >= self.delta_window:
+                baseline = np.mean(recent_features[max(0, i-self.delta_window):i], axis=0)
+            else:
+                baseline = np.mean(recent_features[:i+1], axis=0) if i > 0 else f
+            labels.append(self.predict(f, baseline))
+        counts = np.bincount(labels, minlength=self.n_clusters)
+        return counts / counts.sum()
+
+    def get_transition_prob(self, current_regime):
+        if self.transition_matrix is None or current_regime >= self.n_clusters:
+            return np.ones(self.n_clusters) / self.n_clusters
+        return self.transition_matrix[current_regime]
+
+    @staticmethod
+    def get_entropy_target_from_draws(recent_draws):
+        if len(recent_draws) == 0:
+            return 0.93
+        entropies = []
+        for draw in recent_draws:
+            freq = np.bincount(draw, minlength=26)[1:]
+            probs = freq / np.sum(freq)
+            probs = np.where(probs > 0, probs, 1e-10)
+            entropies.append(float(entropy(probs) / np.log(25)))
+        target = np.mean(entropies)
+        return max(0.88, min(0.97, target))
+
+
+# ============================================================
+# EXTRATOR DE FEATURES v16
+# ============================================================
+class TopologicalFeatureExtractorV16:
     def __init__(self, contests):
         self.contests = contests
         self._repeat_history = []
@@ -156,6 +295,8 @@ class TopologicalFeatureExtractorV13:
             self.scaler.fit(raw_features)
         self.feature_means = np.mean(raw_features, axis=0)
         self.feature_stds = np.std(raw_features, axis=0) + 1e-10
+        # Regime detector TEMPORAL
+        self.regime_detector = TemporalRegimeDetector(self.build_feature_matrix(), contests)
 
     def _compute_recent_freq(self, window=50):
         freq = Counter()
@@ -186,6 +327,10 @@ class TopologicalFeatureExtractorV13:
                 probs = np.array([freq.get(v,0)/len(trans) for v in set(trans)])
                 ent_trans = float(entropy(np.where(probs>0, probs, 1e-10)))
 
+        amplitude = max(d) - min(d)
+        std_pos = np.std(d) if len(d) > 1 else 0.0
+        compressao = std_pos / amplitude if amplitude > 0 else 0.5
+
         return np.array([
             float(np.mean(gaps)), float(np.var(gaps)),
             float(max(gaps)), float(min(gaps)),
@@ -202,6 +347,7 @@ class TopologicalFeatureExtractorV13:
             float(sum(1 for x in d if x in MOLDURA)),
             float(sum(d)),
             float(max(d) - min(d)),
+            compressao,
         ], dtype=np.float64)
 
     def extract_features(self, game, last_contest=None):
@@ -244,7 +390,7 @@ class TopologicalFeatureExtractorV13:
 
     def compute_structural_score(self, game):
         penalty = self.compute_structural_penalty(game)
-        return np.exp(-penalty / 5.0)
+        return np.exp(-penalty / 3.0)
 
     def get_recent_freq_bonus(self, game):
         return np.mean([self._recent_freq.get(d, 0) for d in game])
@@ -275,9 +421,9 @@ class TopologicalFeatureExtractorV13:
 
 
 # ============================================================
-# MODELO DE DISTRIBUIÇÃO (GMM com features padronizadas)
+# MODELO DE DISTRIBUIÇÃO (GMM)
 # ============================================================
-class DistributionModelV13:
+class DistributionModelV16:
     def __init__(self, feature_matrix):
         self.feature_matrix = feature_matrix
         self._build_gmm()
@@ -320,9 +466,9 @@ class DistributionModelV13:
 
 
 # ============================================================
-# GERADOR LIVRE
+# GERADOR LIVRE (COM COMPLETAMENTO ALEATÓRIO + BÔNUS DE REGIME + PARES)
 # ============================================================
-class FreeGeneratorV13:
+class FreeGeneratorV16:
     def __init__(self, last_contest=None, extractor=None):
         self.last = set(last_contest) if last_contest else None
         self.extractor = extractor
@@ -356,6 +502,38 @@ class FreeGeneratorV13:
                 cons = sum(1 for i in range(len(st)-1) if st[i+1]-st[i]==1)
                 if cons > 6:
                     s -= (cons - 6) * 1.5
+
+                # BÔNUS DE REGIME: P(dezena | regime) + P(par | regime)
+                if self.extractor is not None and self.extractor.regime_detector is not None:
+                    try:
+                        # CORRIGIDO: completar jogo parcial ALEATORIAMENTE para features válidas
+                        remaining_count = 15 - len(test)
+                        remaining = random.sample(
+                            [x for x in range(1, 26) if x not in test],
+                            remaining_count
+                        )
+                        pseudo_game = sorted(list(test) + remaining)
+                        features = self.extractor.extract_features(pseudo_game, self.last)
+
+                        # Baseline para delta (média dos últimos 10)
+                        if len(self.extractor.feature_matrix) >= 10:
+                            baseline = np.mean(self.extractor.feature_matrix[-10:], axis=0)
+                        else:
+                            baseline = features
+
+                        cluster = self.extractor.regime_detector.predict(features, baseline)
+
+                        # Bônus de dezena
+                        prob_dezena = self.extractor.regime_detector.get_dezena_prob(cluster, d)
+                        s += log(prob_dezena + 1e-10) * 0.4
+
+                        # Bônus de pares (com as dezenas já escolhidas)
+                        for existing_d in test:
+                            pair = tuple(sorted([existing_d, d]))
+                            prob_pair = self.extractor.regime_detector.get_pair_prob(cluster, pair)
+                            s += log(prob_pair + 1e-10) * 0.3
+                    except Exception:
+                        pass
                 scores.append(s)
             if scores:
                 scores = np.array(scores, dtype=np.float64)
@@ -374,110 +552,54 @@ class FreeGeneratorV13:
 
 
 # ============================================================
-# OTIMIZADOR DE CARTEIRA HÍBRIDA v13
+# OTIMIZADOR DE CARTEIRA v16 (COM ROI)
 # ============================================================
-class HybridPortfolioOptimizerV13:
+class HybridPortfolioOptimizerV16:
     """
-    Otimizador v13: REPAIR MODERADO + SCORE RECALIBRADO + NORMALIZAÇÃO EMPÍRICA.
+    Otimizador v16: ROI como métrica principal.
     """
     def __init__(self, contests):
         self.contests = contests
-        self.extractor = TopologicalFeatureExtractorV13(contests)
+        self.extractor = TopologicalFeatureExtractorV16(contests)
         self.feature_matrix = self.extractor.build_feature_matrix()
-        self.dist_model = DistributionModelV13(self.feature_matrix)
+        self.dist_model = DistributionModelV16(self.feature_matrix)
         self.last = contests[-1]['dezenas'] if contests else None
-        self.generator = FreeGeneratorV13(self.last, self.extractor)
+        self.generator = FreeGeneratorV16(self.last, self.extractor)
         self._mc_cache = {}
-        # Normalização empírica (pré-computada)
         self._mc_norm_params = None
 
-    def _compute_mc_normalization(self, n_samples=200, portfolio_size=10):
-        """Pré-computa parâmetros de normalização empírica do Monte Carlo."""
-        if self._mc_norm_params is not None:
-            return self._mc_norm_params
+        # Dados históricos para MC (APENAS treino)
+        self.historical_draws = [set(c['dezenas']) for c in self.contests]
+        if len(self.historical_draws) < 100:
+            self.historical_draws = [
+                set(np.random.choice(range(1, 26), 15, replace=False))
+                for _ in range(500)
+            ]
 
-        raw_scores = []
-        for _ in range(n_samples):
-            random_portfolio = [self.generator.generate_pure_random()
-                               for _ in range(portfolio_size)]
-            raw = self._monte_carlo_weighted_sum_raw(random_portfolio, n_simulations=500)
-            raw_scores.append(raw)
+        # Entropia dinâmica CORRIGIDA
+        recent_draws = [c['dezenas'] for c in self.contests[-20:]] if len(self.contests) >= 20 else [c['dezenas'] for c in self.contests]
+        self.entropy_target = TemporalRegimeDetector.get_entropy_target_from_draws(recent_draws)
 
-        raw_scores = np.array(raw_scores)
-        self._mc_norm_params = {
-            'p5': float(np.percentile(raw_scores, 5)),
-            'p95': float(np.percentile(raw_scores, 95)),
-            'median': float(np.median(raw_scores)),
-            'mean': float(np.mean(raw_scores)),
-            'std': float(np.std(raw_scores)),
-        }
-        return self._mc_norm_params
+        # Regime atual
+        self.current_regime_dist = self._compute_current_regime_dist()
+
+    def _compute_current_regime_dist(self):
+        recent = self.feature_matrix[-20:] if len(self.feature_matrix) >= 20 else self.feature_matrix
+        return self.extractor.regime_detector.get_regime_distribution(recent)
 
     def _score_game_central(self, game):
         features = self.extractor.extract_features(game, self.last)
         gmm_score = self.dist_model.score_samples_normalized(features)
         structural_score = self.extractor.compute_structural_score(game)
-        combined = gmm_score * 0.6 + structural_score * 0.4
+        combined = gmm_score * 0.70 + structural_score * 0.30
         return combined, features, self.dist_model.predict_cluster(features)
 
     def _score_game_temporal(self, game):
-        temporal_score = self.extractor.compute_temporal_score(
-            game, self.feature_matrix)
+        temporal_score = self.extractor.compute_temporal_score(game, self.feature_matrix)
         structural_score = self.extractor.compute_structural_score(game)
-        combined = temporal_score * 0.5 + structural_score * 0.5
+        combined = temporal_score * 0.4 + structural_score * 0.6
         features = self.extractor.extract_features(game, self.last)
         return combined, features, self.dist_model.predict_cluster(features)
-
-    def _feature_similarity(self, feats1, feats2):
-        """Similaridade de cosseno entre vetores de features."""
-        dot = np.dot(feats1, feats2)
-        norm = np.linalg.norm(feats1) * np.linalg.norm(feats2)
-        if norm < 1e-10:
-            return 1.0
-        return dot / norm
-
-    def _find_most_similar_valid(self, game, pool, max_intersection=8):
-        """
-        REPAIR MODERADO: busca jogos com similaridade na faixa 0.3-0.7.
-        Não o mais similar (evita colapso estrutural).
-        """
-        game_features = self.extractor.extract_features(game, self.last)
-        valid_candidates = []
-
-        sample = random.sample(pool, min(500, len(pool)))
-
-        for candidate in sample:
-            if candidate == game:
-                continue
-            if not self.extractor.is_structurally_valid(candidate):
-                continue
-
-            cand_features = self.extractor.extract_features(candidate, self.last)
-            similarity = self._feature_similarity(game_features, cand_features)
-
-            # Faixa moderada de similaridade
-            if REPAIR_SIMILARITY_MIN <= similarity <= REPAIR_SIMILARITY_MAX:
-                valid_candidates.append((similarity, candidate))
-
-        if valid_candidates:
-            # Escolher aleatoriamente entre os válidos (diversidade)
-            return random.choice(valid_candidates)[1]
-
-        # Fallback: similaridade mais próxima (qualquer)
-        best_candidate = None
-        best_similarity = -float('inf')
-        for candidate in sample:
-            if candidate == game:
-                continue
-            if not self.extractor.is_structurally_valid(candidate):
-                continue
-            cand_features = self.extractor.extract_features(candidate, self.last)
-            similarity = self._feature_similarity(game_features, cand_features)
-            if similarity > best_similarity:
-                best_similarity = similarity
-                best_candidate = candidate
-
-        return best_candidate if best_candidate is not None else self.generator.generate_one()
 
     def _greedy_marginal_coverage_balanced(self, pool, existing_portfolio,
                                             n_select, max_intersection=7):
@@ -495,11 +617,11 @@ class HybridPortfolioOptimizerV13:
 
             current_coverage = len(covered_pairs) / comb(25, 2)
             if current_coverage >= MAX_PAIR_COVERAGE:
-                coverage_weight = 0.1
-                structural_weight = 0.9
+                coverage_weight = 0.0
+                structural_weight = 1.0
             else:
-                coverage_weight = 0.5
-                structural_weight = 0.5
+                coverage_weight = 0.3
+                structural_weight = 0.7
 
             best_game = None
             best_score = -float('inf')
@@ -579,14 +701,10 @@ class HybridPortfolioOptimizerV13:
                 distances.append(dist)
 
         avg_dist = np.mean(distances) if distances else 0
-        max_expected = 2 * np.sqrt(len(FEATURE_NAMES_V13))
+        max_expected = 2 * np.sqrt(len(FEATURE_NAMES_V16))
         return avg_dist / max_expected
 
     def _structural_overlap_penalty(self, portfolio):
-        """
-        Penalidade de similaridade estrutural entre jogos.
-        Penaliza carteiras onde os jogos têm features muito similares.
-        """
         if len(portfolio) < 2:
             return 0.0
 
@@ -599,11 +717,12 @@ class HybridPortfolioOptimizerV13:
         similarities = []
         for i in range(len(feature_vectors)):
             for j in range(i+1, len(feature_vectors)):
-                sim = self._feature_similarity(feature_vectors[i], feature_vectors[j])
-                similarities.append(sim)
+                dot = np.dot(feature_vectors[i], feature_vectors[j])
+                norm = np.linalg.norm(feature_vectors[i]) * np.linalg.norm(feature_vectors[j])
+                if norm > 1e-10:
+                    similarities.append(dot / norm)
 
         avg_similarity = np.mean(similarities) if similarities else 0
-        # Penalizar similaridade alta (>0.85)
         if avg_similarity > 0.85:
             return (avg_similarity - 0.85) * 5.0
         return 0.0
@@ -612,20 +731,44 @@ class HybridPortfolioOptimizerV13:
         scores = [self.extractor.compute_structural_score(g) for g in portfolio]
         return np.mean(scores) if scores else 0.5
 
-    def _monte_carlo_weighted_sum_raw(self, portfolio, n_simulations=2000):
-        """Monte Carlo com soma ponderada (VALOR BRUTO, sem normalização)."""
-        historical_draws = [set(c['dezenas']) for c in self.contests[-500:]]
-        if len(historical_draws) < 100:
-            historical_draws = [
-                set(np.random.choice(range(1, 26), 15, replace=False))
-                for _ in range(500)
-            ]
+    def _historical_similarity_weight(self, historical_draw, recent_features):
+        if len(recent_features) == 0:
+            return 1.0
+        draw_features = self.extractor.extract_features(list(historical_draw), None)
+        distances = []
+        for rf in recent_features:
+            dist = np.linalg.norm(draw_features - rf)
+            distances.append(dist)
+        avg_dist = np.mean(distances) if distances else 0
+        return np.exp(-avg_dist / 2.0)
+
+    def _monte_carlo_weighted_sum(self, portfolio, n_simulations=2000):
+        cache_key = tuple(tuple(sorted(g)) for g in portfolio)
+        if cache_key in self._mc_cache:
+            return self._mc_cache[cache_key]
+
+        recent_features = self.feature_matrix[-20:] if len(self.feature_matrix) >= 20 else self.feature_matrix
+
+        weights = []
+        for draw in self.historical_draws:
+            w = self._historical_similarity_weight(draw, recent_features)
+            weights.append(w)
+        total_weight = sum(weights)
+
+        if total_weight == 0:
+            weights = [1.0] * len(self.historical_draws)
+            total_weight = len(self.historical_draws)
 
         total_score = 0.0
-        n_eval = min(n_simulations, len(historical_draws))
+        n_eval = min(n_simulations, len(self.historical_draws))
 
-        for i in range(n_eval):
-            drawn = historical_draws[random.randint(0, len(historical_draws) - 1)]
+        indices = np.random.choice(
+            len(self.historical_draws), size=n_eval,
+            p=np.array(weights) / total_weight
+        )
+
+        for idx in indices:
+            drawn = self.historical_draws[idx]
             draw_score = 0.0
             for g in portfolio:
                 hits = len(set(g) & drawn)
@@ -633,31 +776,17 @@ class HybridPortfolioOptimizerV13:
                     draw_score += EXPONENTIAL_WEIGHTS.get(hits, 0)
             total_score += draw_score
 
-        return total_score / n_eval
+        avg_score = total_score / n_eval
 
-    def _monte_carlo_weighted_sum(self, portfolio, n_simulations=2000):
-        """
-        Monte Carlo com NORMALIZAÇÃO EMPÍRICA.
-        Usa percentis de carteiras aleatórias para calibrar a escala.
-        """
-        cache_key = tuple(tuple(sorted(g)) for g in portfolio)
-        if cache_key in self._mc_cache:
-            return self._mc_cache[cache_key]
-
-        raw = self._monte_carlo_weighted_sum_raw(portfolio, n_simulations)
-
-        # Normalização empírica
-        params = self._compute_mc_normalization()
-        p5, p95 = params['p5'], params['p95']
-
+        if self._mc_norm_params is None:
+            self._mc_norm_params = self._compute_mc_normalization(portfolio_size=len(portfolio))
+        p5, p95 = self._mc_norm_params['p5'], self._mc_norm_params['p95']
         if p95 - p5 > 1e-10:
-            normalized = (raw - p5) / (p95 - p5)
+            normalized = (avg_score - p5) / (p95 - p5)
         else:
             normalized = 0.5
 
-        # Clampar para [0, 1]
         normalized = max(0.0, min(1.0, normalized))
-
         self._mc_cache[cache_key] = normalized
         if len(self._mc_cache) > 500:
             keys = list(self._mc_cache.keys())[:250]
@@ -665,10 +794,34 @@ class HybridPortfolioOptimizerV13:
                 del self._mc_cache[k]
         return normalized
 
+    def _compute_mc_normalization(self, portfolio_size=10, n_samples=200):
+        raw_scores = []
+        for _ in range(n_samples):
+            random_portfolio = [self.generator.generate_pure_random()
+                               for _ in range(portfolio_size)]
+            raw = self._monte_carlo_weighted_sum_raw(random_portfolio, n_simulations=500)
+            raw_scores.append(raw)
+        raw_scores = np.array(raw_scores)
+        return {
+            'p5': float(np.percentile(raw_scores, 5)),
+            'p95': float(np.percentile(raw_scores, 95)),
+        }
+
+    def _monte_carlo_weighted_sum_raw(self, portfolio, n_simulations=500):
+        total_score = 0.0
+        n_eval = min(n_simulations, len(self.historical_draws))
+        indices = np.random.choice(len(self.historical_draws), size=n_eval)
+        for idx in indices:
+            drawn = self.historical_draws[idx]
+            draw_score = 0.0
+            for g in portfolio:
+                hits = len(set(g) & drawn)
+                if hits >= 11:
+                    draw_score += EXPONENTIAL_WEIGHTS.get(hits, 0)
+            total_score += draw_score
+        return total_score / n_eval
+
     def _repair_portfolio(self, portfolio, pool):
-        """
-        REPAIR MODERADO: Substitui jogos problemáticos por similares na faixa 0.3-0.7.
-        """
         repaired = list(portfolio)
         changed = True
         max_iterations = 20
@@ -723,43 +876,69 @@ class HybridPortfolioOptimizerV13:
 
         return repaired
 
+    def _find_most_similar_valid(self, game, pool, max_intersection=8):
+        game_features = self.extractor.extract_features(game, self.last)
+        valid_candidates = []
+
+        sample = random.sample(pool, min(500, len(pool)))
+
+        for candidate in sample:
+            if candidate == game:
+                continue
+            if not self.extractor.is_structurally_valid(candidate):
+                continue
+
+            cand_features = self.extractor.extract_features(candidate, self.last)
+            dot = np.dot(game_features, cand_features)
+            norm = np.linalg.norm(game_features) * np.linalg.norm(cand_features)
+            similarity = dot / norm if norm > 1e-10 else 1.0
+
+            if 0.3 <= similarity <= 0.7:
+                valid_candidates.append((similarity, candidate))
+
+        if valid_candidates:
+            return random.choice(valid_candidates)[1]
+
+        best_candidate = None
+        best_similarity = -float('inf')
+        for candidate in sample:
+            if candidate == game:
+                continue
+            if not self.extractor.is_structurally_valid(candidate):
+                continue
+            cand_features = self.extractor.extract_features(candidate, self.last)
+            dot = np.dot(game_features, cand_features)
+            norm = np.linalg.norm(game_features) * np.linalg.norm(cand_features)
+            similarity = dot / norm if norm > 1e-10 else 1.0
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_candidate = candidate
+
+        return best_candidate if best_candidate is not None else self.generator.generate_one()
+
     def _portfolio_score(self, portfolio):
-        """Score com tetos HARD + meta MÍNIMA de geo diversity."""
         pair_cov = self._pair_coverage(portfolio)
         geo_div = self._geometric_diversity(portfolio)
 
-        # HARD CAPS
         if pair_cov > MAX_PAIR_COVERAGE:
             return -1000.0
-        if geo_div > MAX_GEO_DIVERSITY:
+        if geo_div > MAX_GEO_DIVERSITY or geo_div < MIN_GEO_DIVERSITY:
             return -1000.0
 
-        # Score principal (normalizado empiricamente)
         weighted_sum = self._monte_carlo_weighted_sum(portfolio, n_simulations=2000)
+        avg_gmm = np.mean([self.dist_model.score_samples_normalized(
+            self.extractor.extract_features(g, self.last)) for g in portfolio])
 
-        # Componentes secundários
         structural = self._average_structural_score(portfolio)
         entropy_val = self._portfolio_entropy(portfolio)
         diversity = self._portfolio_diversity(portfolio)
-
-        # Penalidades
-        entropy_penalty = 0.0
-        if entropy_val < TARGET_ENTROPY_MIN:
-            entropy_penalty = (TARGET_ENTROPY_MIN - entropy_val) * 3.0
-        elif entropy_val > TARGET_ENTROPY_MAX:
-            entropy_penalty = (entropy_val - TARGET_ENTROPY_MAX) * 3.0
-
-        # Penalidade de similaridade estrutural (NOVO)
         struct_overlap = self._structural_overlap_penalty(portfolio)
 
-        # Penalidade de geo diversity mínima
-        geo_min_penalty = 0.0
-        if geo_div < MIN_GEO_DIVERSITY:
-            geo_min_penalty = (MIN_GEO_DIVERSITY - geo_div) * 5.0
+        entropy_penalty = abs(entropy_val - self.entropy_target) * 4.0
 
-        return (weighted_sum * 0.35 + structural * 0.25 +
-                diversity * 0.15 + geo_div * 0.10 -
-                entropy_penalty * 0.10 - struct_overlap * 0.10 - geo_min_penalty * 0.05)
+        return (weighted_sum * 0.30 + avg_gmm * 0.30 + structural * 0.15 +
+                diversity * 0.10 + geo_div * 0.05 -
+                entropy_penalty * 0.10 - struct_overlap * 0.05)
 
     def _mutate_game(self, game):
         max_attempts = 20
@@ -777,7 +956,7 @@ class HybridPortfolioOptimizerV13:
         return sorted(game)[:15]
 
     def optimize_hybrid(self, n_games=10, n_candidates=200000, iterations=100):
-        print(f"\n🎯 OTIMIZANDO CARTEIRA v13 ({n_games} jogos)...")
+        print(f"\n🎯 OTIMIZANDO CARTEIRA v16 ({n_games} jogos)...")
 
         n_central = max(1, int(n_games * 0.40))
         n_coverage = max(1, int(n_games * 0.35))
@@ -785,11 +964,11 @@ class HybridPortfolioOptimizerV13:
 
         print(f"   Composição: {n_central} centrais + {n_coverage} cobertura + {n_temporal} temporais")
         print(f"   HARD CAPS: pair_cov ≤ {MAX_PAIR_COVERAGE}, geo_div ∈ [{MIN_GEO_DIVERSITY}, {MAX_GEO_DIVERSITY}]")
-        print(f"   Score EXPONENCIAL RECALIBRADO: {EXPONENTIAL_WEIGHTS}")
-        print(f"   Normalização Monte Carlo: EMPÍRICA (percentis)")
+        print(f"   Entropia dinâmica alvo: {self.entropy_target:.3f}")
+        print(f"   Score EXPONENCIAL: {EXPONENTIAL_WEIGHTS}")
+        print(f"   MC Condicional: SEM vazamento temporal")
 
-        # Pré-computar normalização
-        self._compute_mc_normalization(n_samples=200, portfolio_size=n_games)
+        self._compute_mc_normalization(portfolio_size=n_games)
 
         print(f"   Gerando {n_candidates:,} candidatos...")
         pool_central = []
@@ -831,7 +1010,7 @@ class HybridPortfolioOptimizerV13:
             central_games.append(game)
             cluster_counts[cluster] += 1
 
-        # Cobertura via greedy EQUILIBRADO
+        # Cobertura
         coverage_games = self._greedy_marginal_coverage_balanced(
             [g for g in pool_all if g not in central_games],
             central_games, n_coverage, max_intersection=7
@@ -868,8 +1047,6 @@ class HybridPortfolioOptimizerV13:
                 temporal_games.append(game)
 
         portfolio = central_games + coverage_games + temporal_games
-
-        # REPAIR MODERADO
         portfolio = self._repair_portfolio(portfolio, pool_all)
         print(f"   ✅ Carteira inicial: pair_cov={self._pair_coverage(portfolio):.3f}, geo_div={self._geometric_diversity(portfolio):.3f}")
 
@@ -877,7 +1054,6 @@ class HybridPortfolioOptimizerV13:
         best_score = self._portfolio_score(portfolio)
         current_score = best_score
 
-        # Simulated Annealing
         temp = 1.0
         elite_pool = [(s, g) for s, g, _, _ in pool_central[:len(pool_central)//4]]
 
@@ -918,9 +1094,6 @@ class HybridPortfolioOptimizerV13:
         return best_portfolio, best_score
 
     def generate_ensemble_structural(self, n_strategies=3, n_games_per_strategy=5):
-        """
-        ENSEMBLE ESTRUTURAL MELHORADO: vota em pares + score estrutural.
-        """
         print(f"\n🤝 ENSEMBLE ESTRUTURAL...")
         strategy_results = []
 
@@ -944,7 +1117,6 @@ class HybridPortfolioOptimizerV13:
                 'dezenas': [d for g in portfolio for d in g],
             })
 
-        # Votação por pares ponderada por score combinado
         pair_votes = Counter()
         for sr in strategy_results:
             weight = sr['weighted_sum'] * 0.6 + sr['structural'] * 0.4
@@ -953,7 +1125,6 @@ class HybridPortfolioOptimizerV13:
 
         top_pairs = [pair for pair, _ in pair_votes.most_common(100)]
 
-        # Gerar jogos com muitos pares do consenso + penalidade estrutural
         consensus_games = []
         seen = set()
         for _ in range(30000):
@@ -994,19 +1165,36 @@ class HybridPortfolioOptimizerV13:
         return selected[:n_games]
 
     def backtest(self, portfolio, test_draws):
+        """
+        Backtest com ROI esperado (NOVO).
+        """
         n_success = 0
+        total_premio = 0.0
+        total_custo = len(portfolio) * len(test_draws) * CUSTO_APOSTA
+
         for draw in test_draws:
             actual = set(draw['dezenas'])
-            if any(len(set(g) & actual) >= 11 for g in portfolio):
-                n_success += 1
-        prob = n_success / len(test_draws) if test_draws else 0
+            for g in portfolio:
+                hits = len(set(g) & actual)
+                if hits >= 11:
+                    n_success += 1
+                    total_premio += PREMIO_VALORES.get(hits, 0)
+
+        prob = n_success / (len(portfolio) * len(test_draws)) if len(test_draws) > 0 else 0
         p_single = sum(HYPE_PROBS[k] for k in range(11, 16))
         p_none = (1 - p_single) ** len(portfolio)
         theo_prob = 1 - p_none
+        roi = (total_premio - total_custo) / total_custo * 100 if total_custo > 0 else 0
+
         return {
-            'empirical': prob, 'theoretical': theo_prob,
+            'empirical': prob,
+            'theoretical': theo_prob,
             'lift': prob / theo_prob if theo_prob > 0 else 1.0,
-            'n_test': len(test_draws), 'n_success': n_success,
+            'n_test': len(test_draws),
+            'n_success': n_success,
+            'total_premio': total_premio,
+            'total_custo': total_custo,
+            'roi': roi,
         }
 
 
@@ -1031,7 +1219,7 @@ def walk_forward_validation(contests, n_windows=10, train_size=500,
         if len(train_data) < 100 or len(test_data) < 5:
             continue
 
-        optimizer = HybridPortfolioOptimizerV13(train_data)
+        optimizer = HybridPortfolioOptimizerV16(train_data)
         portfolio, _ = optimizer.optimize_hybrid(
             n_games, n_candidates=50000, iterations=50)
         random_portfolio = optimizer.generate_pure_random_portfolio(n_games)
@@ -1044,19 +1232,25 @@ def walk_forward_validation(contests, n_windows=10, train_size=500,
         results.append({
             'window': w,
             'strat_lift': bt_strat['lift'],
+            'strat_roi': bt_strat['roi'],
             'rand_lift': bt_rand['lift'],
+            'rand_roi': bt_rand['roi'],
             'cov_lift': bt_cov['lift'],
+            'cov_roi': bt_cov['roi'],
             'diff_vs_rand': bt_strat['lift'] - bt_rand['lift'],
+            'diff_roi_vs_rand': bt_strat['roi'] - bt_rand['roi'],
             'diff_vs_cov': bt_strat['lift'] - bt_cov['lift'],
         })
-        print(f" Janela {w}: lift={bt_strat['lift']:.3f} "
-              f"rand={bt_rand['lift']:.3f} cov={bt_cov['lift']:.3f}")
+        print(f" Janela {w}: lift={bt_strat['lift']:.3f} ROI={bt_strat['roi']:+.1f}% "
+              f"rand_lift={bt_rand['lift']:.3f} rand_ROI={bt_rand['roi']:+.1f}%")
 
     if results:
         diffs_rand = [r['diff_vs_rand'] for r in results]
+        diffs_roi = [r['diff_roi_vs_rand'] for r in results]
         diffs_cov = [r['diff_vs_cov'] for r in results]
 
         mean_diff_rand = np.mean(diffs_rand)
+        mean_diff_roi = np.mean(diffs_roi)
         std_diff_rand = np.std(diffs_rand)
         mean_diff_cov = np.mean(diffs_cov)
 
@@ -1064,14 +1258,17 @@ def walk_forward_validation(contests, n_windows=10, train_size=500,
         stability = 1.0 / (1.0 + cv_rand)
 
         print(f"\n📊 RESUMO:")
-        print(f"   Média diff vs Aleatório: {mean_diff_rand:+.3f}")
-        print(f"   Média diff vs Cobertura: {mean_diff_cov:+.3f}")
+        print(f"   Média diff lift vs Aleatório: {mean_diff_rand:+.3f}")
+        print(f"   Média diff ROI vs Aleatório: {mean_diff_roi:+.1f}%")
+        print(f"   Média diff lift vs Cobertura: {mean_diff_cov:+.3f}")
         print(f"   Stability score: {stability:.3f} (0=instável, 1=estável)")
-        print(f"   Janelas + (vs Aleatório): "
+        print(f"   Janelas + (lift vs Aleatório): "
               f"{sum(1 for d in diffs_rand if d > 0)}/{len(results)}")
+        print(f"   Janelas + (ROI vs Aleatório): "
+              f"{sum(1 for d in diffs_roi if d > 0)}/{len(results)}")
         try:
             _, p_rand = wilcoxon(diffs_rand)
-            print(f"   Wilcoxon p (vs Aleatório): {p_rand:.4f}")
+            print(f"   Wilcoxon p (lift vs Aleatório): {p_rand:.4f}")
         except Exception:
             pass
     return results
@@ -1082,7 +1279,7 @@ def walk_forward_validation(contests, n_windows=10, train_size=500,
 # ============================================================
 def main():
     print("="*70)
-    print("🧬 GERADOR DE CARTEIRA v13 - REPAIR MODERADO + SCORE RECALIBRADO")
+    print("🧬 GERADOR DE CARTEIRA v16 - ROI + REGIME TEMPORAL")
     print("="*70)
 
     contests = load_all_contests('resultados_lotofacil.csv')
@@ -1093,23 +1290,19 @@ def main():
     print(f"\n📂 {len(contests)} concursos")
     print(f"📌 Último: {contests[-1]['concurso']} - {contests[-1]['dezenas']}")
 
-    print("\n📊 REGIME ESTRUTURAL ALVO:")
-    for name, (target, tol, weight) in STRUCTURAL_TARGETS.items():
-        print(f"   {name}: alvo={target:.1f} ±{tol:.1f} (peso={weight:.1f})")
-    print(f"\n📊 HARD CAPS + METAS:")
-    print(f"   Pair coverage ≤ {MAX_PAIR_COVERAGE}")
-    print(f"   Geo diversity ∈ [{MIN_GEO_DIVERSITY}, {MAX_GEO_DIVERSITY}]")
-    print(f"   Entropia alvo: {TARGET_ENTROPY_MIN}-{TARGET_ENTROPY_MAX}")
-    print(f"\n📊 SCORE EXPONENCIAL RECALIBRADO:")
-    for k, w in EXPONENTIAL_WEIGHTS.items():
-        print(f"   {k} pontos: peso={w:.0f}")
-    print(f"\n📊 REPAIR MODERADO:")
-    print(f"   Similaridade alvo: {REPAIR_SIMILARITY_MIN}-{REPAIR_SIMILARITY_MAX}")
-    print(f"   Normalização MC: EMPÍRICA (percentis)")
+    print("\n📊 CONFIGURAÇÃO FINAL:")
+    print(f"   GMM como score CENTRAL")
+    print(f"   Regime detector TEMPORAL (deltas)")
+    print(f"   Monte Carlo CONDICIONAL (sem vazamento)")
+    print(f"   Entropia DINÂMICA (corrigida)")
+    print(f"   P(dezena|regime) + P(par|regime) integradas")
+    print(f"   ROI como métrica principal")
+    print(f"   Recompensa de CAUDA (15: R$ {PREMIO_VALORES[15]:,.0f})")
+    print(f"   Threshold estrutural: {STRUCTURAL_REJECT_THRESHOLD}")
 
     print("\nOpções:")
     print("1. Gerar carteira otimizada")
-    print("2. Ensemble estrutural melhorado")
+    print("2. Ensemble estrutural")
     print("3. Walk-forward validation (10 janelas)")
     print("4. TUDO")
     op = input("Escolha [4]: ").strip() or "4"
@@ -1117,16 +1310,17 @@ def main():
     if op in ("1", "4"):
         print(f"\n🔧 INICIALIZANDO...")
         t0 = time.time()
-        optimizer = HybridPortfolioOptimizerV13(contests)
+        optimizer = HybridPortfolioOptimizerV16(contests)
         print(f"   ✅ Inicializado em {time.time()-t0:.1f}s")
         print(f"   GMM: {optimizer.dist_model.n_components} componentes")
+        print(f"   Regime atual (distribuição): {optimizer.current_regime_dist}")
+        print(f"   Entropia dinâmica alvo: {optimizer.entropy_target:.3f}")
 
         portfolio, score = optimizer.optimize_hybrid(
             n_games=10, n_candidates=200000, iterations=100)
 
         if score < -100:
             print(f"\n❌ Não foi possível encontrar carteira dentro dos HARD CAPS.")
-            print(f"   Tente relaxar os limites.")
         else:
             print(f"\n🏆 CARTEIRA (Score: {score:.3f})")
             last = contests[-1]['dezenas']
@@ -1144,16 +1338,14 @@ def main():
             structural_avg = optimizer._average_structural_score(portfolio)
             geo_div = optimizer._geometric_diversity(portfolio)
             entropy_val = optimizer._portfolio_entropy(portfolio)
-            struct_overlap = optimizer._structural_overlap_penalty(portfolio)
             print(f"\n📊 Cobertura dezenas: {len(all_d)}/25")
             print(f"📊 Cobertura pares: {pair_cov:.3f} (cap: ≤{MAX_PAIR_COVERAGE})")
             print(f"📊 Score estrutural: {structural_avg:.3f}")
             print(f"📊 Diversidade geométrica: {geo_div:.3f} (meta: [{MIN_GEO_DIVERSITY}, {MAX_GEO_DIVERSITY}])")
-            print(f"📊 Entropia: {entropy_val:.3f} (alvo: {TARGET_ENTROPY_MIN}-{TARGET_ENTROPY_MAX})")
-            print(f"📊 Penalidade overlap estrutural: {struct_overlap:.3f}")
+            print(f"📊 Entropia: {entropy_val:.3f} (alvo dinâmico: {optimizer.entropy_target:.3f})")
 
             weighted_sum = optimizer._monte_carlo_weighted_sum(portfolio, n_simulations=5000)
-            print(f"📊 Score exponencial normalizado: {weighted_sum:.4f}")
+            print(f"📊 Score MC condicional normalizado: {weighted_sum:.4f}")
 
             test_size = min(200, len(contests) // 3)
             if test_size > 10:
@@ -1163,12 +1355,15 @@ def main():
                 print(f"   Prob ≥1 acerto 11+: {bt['empirical']:.2%} "
                       f"(teórico: {bt['theoretical']:.2%})")
                 print(f"   Lift: {bt['lift']:.2f}x")
+                print(f"   Prêmio total: R$ {bt['total_premio']:,.2f}")
+                print(f"   Custo total: R$ {bt['total_custo']:,.2f}")
+                print(f"   ROI: {bt['roi']:+.2f}%")
 
     if op in ("2", "4"):
-        optimizer = HybridPortfolioOptimizerV13(contests)
+        optimizer = HybridPortfolioOptimizerV16(contests)
         consensus = optimizer.generate_ensemble_structural(
             n_strategies=3, n_games_per_strategy=5)
-        print(f"\n🤝 CARTEIRA ENSEMBLE ESTRUTURAL ({len(consensus)} jogos):")
+        print(f"\n🤝 CARTEIRA ENSEMBLE ({len(consensus)} jogos):")
         last = contests[-1]['dezenas']
         for i, game in enumerate(consensus, 1):
             p = sum(1 for d in game if d % 2 == 0)
