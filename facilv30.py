@@ -1,17 +1,19 @@
+```python
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 """
-GERADOR PARAMÉTRICO DE CARTEIRA - LOTOFÁCIL v12
+GERADOR PARAMÉTRICO DE CARTEIRA - LOTOFÁCIL v13
 =================================================
-EVOLUÇÕES:
-✅ Repair portfolio (substitui jogo problemático, não remove)
-✅ Score exponencial (11:1, 12:3, 13:9, 14:30, 15:150)
-✅ Monte Carlo com soma ponderada de TODOS os hits
-✅ HARD CAPS ajustados (geo_div ≤ 0.80)
-✅ Ensemble estrutural por pares
-✅ Multi-hit score preservado
-✅ Structural penalty, soft-hard gate, z-score, GMM, bootstrap mantidos
+CORREÇÕES BASEADAS EM EVIDÊNCIA EMPÍRICA (v12 → v13):
+✅ Score exponencial RECALIBRADO (11:1, 12:3, 13:7, 14:20, 15:60)
+✅ Geo diversity com META MÍNIMA (0.55) e MÁXIMA (0.80)
+✅ Penalidade de similaridade estrutural (cosine entre features)
+✅ Repair com similaridade MODERADA (faixa 0.3-0.7, não máxima)
+✅ Normalização EMPÍRICA do Monte Carlo (percentis de carteiras aleatórias)
+✅ Ensemble estrutural melhorado (pares + score estrutural)
+✅ HARD CAPS mantidos (pair_cov ≤ 0.90, geo_div ≤ 0.80)
+✅ Structural penalty, soft-hard gate, z-score, GMM, bootstrap preservados
 """
 
 import numpy as np
@@ -45,15 +47,15 @@ MOLDURA = {1,2,3,4,5, 6,10, 11,15, 16,20, 21,22,23,24,25}
 CENTRO = {7,8,9,12,13,14,17,18,19}
 HYPE_PROBS = {k: hypergeom.pmf(k, 25, 15, 15) for k in range(0, 16)}
 
-# Features topológicas v12 (17 dimensões)
-FEATURE_NAMES_V12 = [
+# Features topológicas v13 (17 dimensões)
+FEATURE_NAMES_V13 = [
     "gap_medio", "gap_var", "gap_max", "gap_min",
     "energia_jogo", "entropia_transicao",
     "quadrantes", "consecutivos", "densidade_local",
     "assimetria", "clusterizacao", "repeticoes",
     "pares", "primos", "moldura", "soma", "amplitude",
 ]
-IDX = {name: i for i, name in enumerate(FEATURE_NAMES_V12)}
+IDX = {name: i for i, name in enumerate(FEATURE_NAMES_V13)}
 
 # Pesos para penalidade estrutural HARD-SOFT
 STRUCTURAL_TARGETS = {
@@ -66,20 +68,21 @@ STRUCTURAL_TARGETS = {
     'amplitude': (22.0, 3.0, 1.0),
 }
 
-# HARD CAPS (v12: geo_div ajustado para 0.80)
+# HARD CAPS (v13: geo_div com meta MÍNIMA também)
 MAX_PAIR_COVERAGE = 0.90
+MIN_GEO_DIVERSITY = 0.55      # NOVO: penalizar abaixo disso
 MAX_GEO_DIVERSITY = 0.80
 TARGET_ENTROPY_MIN = 0.90
 TARGET_ENTROPY_MAX = 0.96
 STRUCTURAL_REJECT_THRESHOLD = 15.0
 
-# Score EXPONENCIAL (valoriza hits altos explosivamente)
+# Score EXPONENCIAL RECALIBRADO (v13: reduzido peso de 15)
 EXPONENTIAL_WEIGHTS = {
     11: 1.0,
     12: 3.0,
-    13: 9.0,
-    14: 30.0,
-    15: 150.0,
+    13: 7.0,
+    14: 20.0,
+    15: 60.0,
 }
 
 # Features com sinal temporal
@@ -90,6 +93,10 @@ TEMPORAL_FEATURES = {
     'densidade_local': 0.15,
     'clusterizacao': 0.10,
 }
+
+# Faixa de similaridade para repair moderado
+REPAIR_SIMILARITY_MIN = 0.3
+REPAIR_SIMILARITY_MAX = 0.7
 
 # ============================================================
 # CARREGAMENTO DE DADOS
@@ -131,9 +138,9 @@ def load_all_contests(csv_file='resultados_lotofacil.csv'):
 
 
 # ============================================================
-# EXTRATOR DE FEATURES v12 (com z-score)
+# EXTRATOR DE FEATURES v13 (com z-score)
 # ============================================================
-class TopologicalFeatureExtractorV12:
+class TopologicalFeatureExtractorV13:
     def __init__(self, contests):
         self.contests = contests
         self._repeat_history = []
@@ -271,7 +278,7 @@ class TopologicalFeatureExtractorV12:
 # ============================================================
 # MODELO DE DISTRIBUIÇÃO (GMM com features padronizadas)
 # ============================================================
-class DistributionModelV12:
+class DistributionModelV13:
     def __init__(self, feature_matrix):
         self.feature_matrix = feature_matrix
         self._build_gmm()
@@ -316,7 +323,7 @@ class DistributionModelV12:
 # ============================================================
 # GERADOR LIVRE
 # ============================================================
-class FreeGeneratorV12:
+class FreeGeneratorV13:
     def __init__(self, last_contest=None, extractor=None):
         self.last = set(last_contest) if last_contest else None
         self.extractor = extractor
@@ -368,20 +375,44 @@ class FreeGeneratorV12:
 
 
 # ============================================================
-# OTIMIZADOR DE CARTEIRA HÍBRIDA v12
+# OTIMIZADOR DE CARTEIRA HÍBRIDA v13
 # ============================================================
-class HybridPortfolioOptimizerV12:
+class HybridPortfolioOptimizerV13:
     """
-    Otimizador v12: REPAIR + SCORE EXPONENCIAL + SOMA PONDERADA.
+    Otimizador v13: REPAIR MODERADO + SCORE RECALIBRADO + NORMALIZAÇÃO EMPÍRICA.
     """
     def __init__(self, contests):
         self.contests = contests
-        self.extractor = TopologicalFeatureExtractorV12(contests)
+        self.extractor = TopologicalFeatureExtractorV13(contests)
         self.feature_matrix = self.extractor.build_feature_matrix()
-        self.dist_model = DistributionModelV12(self.feature_matrix)
+        self.dist_model = DistributionModelV13(self.feature_matrix)
         self.last = contests[-1]['dezenas'] if contests else None
-        self.generator = FreeGeneratorV12(self.last, self.extractor)
+        self.generator = FreeGeneratorV13(self.last, self.extractor)
         self._mc_cache = {}
+        # Normalização empírica (pré-computada)
+        self._mc_norm_params = None
+
+    def _compute_mc_normalization(self, n_samples=200, portfolio_size=10):
+        """Pré-computa parâmetros de normalização empírica do Monte Carlo."""
+        if self._mc_norm_params is not None:
+            return self._mc_norm_params
+
+        raw_scores = []
+        for _ in range(n_samples):
+            random_portfolio = [self.generator.generate_pure_random()
+                               for _ in range(portfolio_size)]
+            raw = self._monte_carlo_weighted_sum_raw(random_portfolio, n_simulations=500)
+            raw_scores.append(raw)
+
+        raw_scores = np.array(raw_scores)
+        self._mc_norm_params = {
+            'p5': float(np.percentile(raw_scores, 5)),
+            'p95': float(np.percentile(raw_scores, 95)),
+            'median': float(np.median(raw_scores)),
+            'mean': float(np.mean(raw_scores)),
+            'std': float(np.std(raw_scores)),
+        }
+        return self._mc_norm_params
 
     def _score_game_central(self, game):
         features = self.extractor.extract_features(game, self.last)
@@ -398,14 +429,21 @@ class HybridPortfolioOptimizerV12:
         features = self.extractor.extract_features(game, self.last)
         return combined, features, self.dist_model.predict_cluster(features)
 
+    def _feature_similarity(self, feats1, feats2):
+        """Similaridade de cosseno entre vetores de features."""
+        dot = np.dot(feats1, feats2)
+        norm = np.linalg.norm(feats1) * np.linalg.norm(feats2)
+        if norm < 1e-10:
+            return 1.0
+        return dot / norm
+
     def _find_most_similar_valid(self, game, pool, max_intersection=8):
         """
-        Encontra o jogo mais similar estruturalmente que seja válido.
-        Usado para REPAIR em vez de simplesmente remover.
+        REPAIR MODERADO: busca jogos com similaridade na faixa 0.3-0.7.
+        Não o mais similar (evita colapso estrutural).
         """
         game_features = self.extractor.extract_features(game, self.last)
-        best_candidate = None
-        best_similarity = -float('inf')
+        valid_candidates = []
 
         sample = random.sample(pool, min(500, len(pool)))
 
@@ -416,19 +454,31 @@ class HybridPortfolioOptimizerV12:
                 continue
 
             cand_features = self.extractor.extract_features(candidate, self.last)
-            # Similaridade: correlação negativa da distância
-            dist = np.linalg.norm(game_features - cand_features)
-            similarity = -dist
+            similarity = self._feature_similarity(game_features, cand_features)
 
+            # Faixa moderada de similaridade
+            if REPAIR_SIMILARITY_MIN <= similarity <= REPAIR_SIMILARITY_MAX:
+                valid_candidates.append((similarity, candidate))
+
+        if valid_candidates:
+            # Escolher aleatoriamente entre os válidos (diversidade)
+            return random.choice(valid_candidates)[1]
+
+        # Fallback: similaridade mais próxima (qualquer)
+        best_candidate = None
+        best_similarity = -float('inf')
+        for candidate in sample:
+            if candidate == game:
+                continue
+            if not self.extractor.is_structurally_valid(candidate):
+                continue
+            cand_features = self.extractor.extract_features(candidate, self.last)
+            similarity = self._feature_similarity(game_features, cand_features)
             if similarity > best_similarity:
                 best_similarity = similarity
                 best_candidate = candidate
 
-        if best_candidate is not None:
-            return best_candidate
-
-        # Fallback: gerar novo
-        return self.generator.generate_one()
+        return best_candidate if best_candidate is not None else self.generator.generate_one()
 
     def _greedy_marginal_coverage_balanced(self, pool, existing_portfolio,
                                             n_select, max_intersection=7):
@@ -530,22 +580,41 @@ class HybridPortfolioOptimizerV12:
                 distances.append(dist)
 
         avg_dist = np.mean(distances) if distances else 0
-        max_expected = 2 * np.sqrt(len(FEATURE_NAMES_V12))
+        max_expected = 2 * np.sqrt(len(FEATURE_NAMES_V13))
         return avg_dist / max_expected
+
+    def _structural_overlap_penalty(self, portfolio):
+        """
+        Penalidade de similaridade estrutural entre jogos.
+        Penaliza carteiras onde os jogos têm features muito similares.
+        """
+        if len(portfolio) < 2:
+            return 0.0
+
+        feature_vectors = []
+        for g in portfolio:
+            feats = self.extractor.extract_features(g, self.last)
+            feature_vectors.append(feats)
+        feature_vectors = np.array(feature_vectors)
+
+        similarities = []
+        for i in range(len(feature_vectors)):
+            for j in range(i+1, len(feature_vectors)):
+                sim = self._feature_similarity(feature_vectors[i], feature_vectors[j])
+                similarities.append(sim)
+
+        avg_similarity = np.mean(similarities) if similarities else 0
+        # Penalizar similaridade alta (>0.85)
+        if avg_similarity > 0.85:
+            return (avg_similarity - 0.85) * 5.0
+        return 0.0
 
     def _average_structural_score(self, portfolio):
         scores = [self.extractor.compute_structural_score(g) for g in portfolio]
         return np.mean(scores) if scores else 0.5
 
-    def _monte_carlo_weighted_sum(self, portfolio, n_simulations=3000):
-        """
-        Monte Carlo com SOMA PONDERADA de TODOS os hits.
-        Valoriza múltiplos acertos simultâneos na carteira.
-        """
-        cache_key = tuple(tuple(sorted(g)) for g in portfolio)
-        if cache_key in self._mc_cache:
-            return self._mc_cache[cache_key]
-
+    def _monte_carlo_weighted_sum_raw(self, portfolio, n_simulations=2000):
+        """Monte Carlo com soma ponderada (VALOR BRUTO, sem normalização)."""
         historical_draws = [set(c['dezenas']) for c in self.contests[-500:]]
         if len(historical_draws) < 100:
             historical_draws = [
@@ -554,7 +623,6 @@ class HybridPortfolioOptimizerV12:
             ]
 
         total_score = 0.0
-        total_weight = sum(EXPONENTIAL_WEIGHTS.values())
         n_eval = min(n_simulations, len(historical_draws))
 
         for i in range(n_eval):
@@ -566,10 +634,30 @@ class HybridPortfolioOptimizerV12:
                     draw_score += EXPONENTIAL_WEIGHTS.get(hits, 0)
             total_score += draw_score
 
-        avg_score = total_score / n_eval
-        # Normalizar para escala 0-1
-        max_possible = EXPONENTIAL_WEIGHTS.get(15, 150) * len(portfolio)
-        normalized = avg_score / max_possible if max_possible > 0 else 0
+        return total_score / n_eval
+
+    def _monte_carlo_weighted_sum(self, portfolio, n_simulations=2000):
+        """
+        Monte Carlo com NORMALIZAÇÃO EMPÍRICA.
+        Usa percentis de carteiras aleatórias para calibrar a escala.
+        """
+        cache_key = tuple(tuple(sorted(g)) for g in portfolio)
+        if cache_key in self._mc_cache:
+            return self._mc_cache[cache_key]
+
+        raw = self._monte_carlo_weighted_sum_raw(portfolio, n_simulations)
+
+        # Normalização empírica
+        params = self._compute_mc_normalization()
+        p5, p95 = params['p5'], params['p95']
+
+        if p95 - p5 > 1e-10:
+            normalized = (raw - p5) / (p95 - p5)
+        else:
+            normalized = 0.5
+
+        # Clampar para [0, 1]
+        normalized = max(0.0, min(1.0, normalized))
 
         self._mc_cache[cache_key] = normalized
         if len(self._mc_cache) > 500:
@@ -580,8 +668,7 @@ class HybridPortfolioOptimizerV12:
 
     def _repair_portfolio(self, portfolio, pool):
         """
-        REPAIR: Substitui jogos problemáticos por similares válidos.
-        Preserva topologia e equilíbrio.
+        REPAIR MODERADO: Substitui jogos problemáticos por similares na faixa 0.3-0.7.
         """
         repaired = list(portfolio)
         changed = True
@@ -596,11 +683,9 @@ class HybridPortfolioOptimizerV12:
             geo_div = self._geometric_diversity(repaired)
 
             if pair_cov > MAX_PAIR_COVERAGE:
-                # Encontrar o jogo que mais contribui para pair coverage
                 best_idx = None
                 best_contribution = -1
                 for idx, game in enumerate(repaired):
-                    # Contribuição marginal: quantos pares este jogo adiciona
                     other_pairs = set()
                     for j, g2 in enumerate(repaired):
                         if j != idx:
@@ -618,8 +703,7 @@ class HybridPortfolioOptimizerV12:
                     repaired[best_idx] = new_game
                     changed = True
 
-            elif geo_div > MAX_GEO_DIVERSITY:
-                # Encontrar o jogo mais distante do centroide
+            elif geo_div > MAX_GEO_DIVERSITY or geo_div < MIN_GEO_DIVERSITY:
                 feature_vectors = []
                 for g in repaired:
                     feats = self.extractor.extract_features(g, self.last)
@@ -627,7 +711,11 @@ class HybridPortfolioOptimizerV12:
                 feature_vectors = np.array(feature_vectors)
                 centroid = np.mean(feature_vectors, axis=0)
                 distances = [np.linalg.norm(fv - centroid) for fv in feature_vectors]
-                best_idx = np.argmax(distances)
+
+                if geo_div > MAX_GEO_DIVERSITY:
+                    best_idx = np.argmax(distances)
+                else:
+                    best_idx = np.argmin(distances)
 
                 old_game = repaired[best_idx]
                 new_game = self._find_most_similar_valid(old_game, pool)
@@ -637,29 +725,42 @@ class HybridPortfolioOptimizerV12:
         return repaired
 
     def _portfolio_score(self, portfolio):
-        """Score exponencial + tetos HARD"""
+        """Score com tetos HARD + meta MÍNIMA de geo diversity."""
         pair_cov = self._pair_coverage(portfolio)
         geo_div = self._geometric_diversity(portfolio)
 
+        # HARD CAPS
         if pair_cov > MAX_PAIR_COVERAGE:
             return -1000.0
         if geo_div > MAX_GEO_DIVERSITY:
             return -1000.0
 
+        # Score principal (normalizado empiricamente)
         weighted_sum = self._monte_carlo_weighted_sum(portfolio, n_simulations=2000)
+
+        # Componentes secundários
         structural = self._average_structural_score(portfolio)
         entropy_val = self._portfolio_entropy(portfolio)
         diversity = self._portfolio_diversity(portfolio)
 
+        # Penalidades
+        entropy_penalty = 0.0
         if entropy_val < TARGET_ENTROPY_MIN:
             entropy_penalty = (TARGET_ENTROPY_MIN - entropy_val) * 3.0
         elif entropy_val > TARGET_ENTROPY_MAX:
             entropy_penalty = (entropy_val - TARGET_ENTROPY_MAX) * 3.0
-        else:
-            entropy_penalty = 0.0
 
-        return (weighted_sum * 0.40 + structural * 0.25 +
-                diversity * 0.15 + geo_div * 0.10 - entropy_penalty * 0.10)
+        # Penalidade de similaridade estrutural (NOVO)
+        struct_overlap = self._structural_overlap_penalty(portfolio)
+
+        # Penalidade de geo diversity mínima
+        geo_min_penalty = 0.0
+        if geo_div < MIN_GEO_DIVERSITY:
+            geo_min_penalty = (MIN_GEO_DIVERSITY - geo_div) * 5.0
+
+        return (weighted_sum * 0.35 + structural * 0.25 +
+                diversity * 0.15 + geo_div * 0.10 -
+                entropy_penalty * 0.10 - struct_overlap * 0.10 - geo_min_penalty * 0.05)
 
     def _mutate_game(self, game):
         max_attempts = 20
@@ -677,16 +778,19 @@ class HybridPortfolioOptimizerV12:
         return sorted(game)[:15]
 
     def optimize_hybrid(self, n_games=10, n_candidates=200000, iterations=100):
-        print(f"\n🎯 OTIMIZANDO CARTEIRA v12 ({n_games} jogos)...")
+        print(f"\n🎯 OTIMIZANDO CARTEIRA v13 ({n_games} jogos)...")
 
         n_central = max(1, int(n_games * 0.40))
         n_coverage = max(1, int(n_games * 0.35))
         n_temporal = n_games - n_central - n_coverage
 
         print(f"   Composição: {n_central} centrais + {n_coverage} cobertura + {n_temporal} temporais")
-        print(f"   HARD CAPS: pair_cov ≤ {MAX_PAIR_COVERAGE}, geo_div ≤ {MAX_GEO_DIVERSITY}")
-        print(f"   Score EXPONENCIAL: {EXPONENTIAL_WEIGHTS}")
-        print(f"   Monte Carlo: SOMA PONDERADA de todos os hits")
+        print(f"   HARD CAPS: pair_cov ≤ {MAX_PAIR_COVERAGE}, geo_div ∈ [{MIN_GEO_DIVERSITY}, {MAX_GEO_DIVERSITY}]")
+        print(f"   Score EXPONENCIAL RECALIBRADO: {EXPONENTIAL_WEIGHTS}")
+        print(f"   Normalização Monte Carlo: EMPÍRICA (percentis)")
+
+        # Pré-computar normalização
+        self._compute_mc_normalization(n_samples=200, portfolio_size=n_games)
 
         print(f"   Gerando {n_candidates:,} candidatos...")
         pool_central = []
@@ -766,7 +870,7 @@ class HybridPortfolioOptimizerV12:
 
         portfolio = central_games + coverage_games + temporal_games
 
-        # REPAIR em vez de remover
+        # REPAIR MODERADO
         portfolio = self._repair_portfolio(portfolio, pool_all)
         print(f"   ✅ Carteira inicial: pair_cov={self._pair_coverage(portfolio):.3f}, geo_div={self._geometric_diversity(portfolio):.3f}")
 
@@ -815,6 +919,9 @@ class HybridPortfolioOptimizerV12:
         return best_portfolio, best_score
 
     def generate_ensemble_structural(self, n_strategies=3, n_games_per_strategy=5):
+        """
+        ENSEMBLE ESTRUTURAL MELHORADO: vota em pares + score estrutural.
+        """
         print(f"\n🤝 ENSEMBLE ESTRUTURAL...")
         strategy_results = []
 
@@ -828,22 +935,26 @@ class HybridPortfolioOptimizerV12:
                     pair_counter[pair] += 1
 
             weighted_sum = self._monte_carlo_weighted_sum(portfolio, n_simulations=1000)
+            structural_avg = self._average_structural_score(portfolio)
 
             strategy_results.append({
                 'portfolio': portfolio,
                 'weighted_sum': weighted_sum,
+                'structural': structural_avg,
                 'pairs': pair_counter,
                 'dezenas': [d for g in portfolio for d in g],
             })
 
+        # Votação por pares ponderada por score combinado
         pair_votes = Counter()
         for sr in strategy_results:
-            weight = sr['weighted_sum']
+            weight = sr['weighted_sum'] * 0.6 + sr['structural'] * 0.4
             for pair, count in sr['pairs'].items():
                 pair_votes[pair] += weight * count
 
         top_pairs = [pair for pair, _ in pair_votes.most_common(100)]
 
+        # Gerar jogos com muitos pares do consenso + penalidade estrutural
         consensus_games = []
         seen = set()
         for _ in range(30000):
@@ -851,6 +962,8 @@ class HybridPortfolioOptimizerV12:
             key = tuple(game)
             if key not in seen:
                 seen.add(key)
+                if not self.extractor.is_structurally_valid(game):
+                    continue
                 game_pairs = set(combinations(sorted(game), 2))
                 consensus_count = len(game_pairs & set(top_pairs[:100]))
                 if consensus_count >= 20:
@@ -919,7 +1032,7 @@ def walk_forward_validation(contests, n_windows=10, train_size=500,
         if len(train_data) < 100 or len(test_data) < 5:
             continue
 
-        optimizer = HybridPortfolioOptimizerV12(train_data)
+        optimizer = HybridPortfolioOptimizerV13(train_data)
         portfolio, _ = optimizer.optimize_hybrid(
             n_games, n_candidates=50000, iterations=50)
         random_portfolio = optimizer.generate_pure_random_portfolio(n_games)
@@ -970,7 +1083,7 @@ def walk_forward_validation(contests, n_windows=10, train_size=500,
 # ============================================================
 def main():
     print("="*70)
-    print("🧬 GERADOR DE CARTEIRA v12 - REPAIR + SCORE EXPONENCIAL")
+    print("🧬 GERADOR DE CARTEIRA v13 - REPAIR MODERADO + SCORE RECALIBRADO")
     print("="*70)
 
     contests = load_all_contests('resultados_lotofacil.csv')
@@ -984,17 +1097,20 @@ def main():
     print("\n📊 REGIME ESTRUTURAL ALVO:")
     for name, (target, tol, weight) in STRUCTURAL_TARGETS.items():
         print(f"   {name}: alvo={target:.1f} ±{tol:.1f} (peso={weight:.1f})")
-    print(f"\n📊 HARD CAPS:")
+    print(f"\n📊 HARD CAPS + METAS:")
     print(f"   Pair coverage ≤ {MAX_PAIR_COVERAGE}")
-    print(f"   Geo diversity ≤ {MAX_GEO_DIVERSITY}")
+    print(f"   Geo diversity ∈ [{MIN_GEO_DIVERSITY}, {MAX_GEO_DIVERSITY}]")
     print(f"   Entropia alvo: {TARGET_ENTROPY_MIN}-{TARGET_ENTROPY_MAX}")
-    print(f"\n📊 SCORE EXPONENCIAL:")
+    print(f"\n📊 SCORE EXPONENCIAL RECALIBRADO:")
     for k, w in EXPONENTIAL_WEIGHTS.items():
         print(f"   {k} pontos: peso={w:.0f}")
+    print(f"\n📊 REPAIR MODERADO:")
+    print(f"   Similaridade alvo: {REPAIR_SIMILARITY_MIN}-{REPAIR_SIMILARITY_MAX}")
+    print(f"   Normalização MC: EMPÍRICA (percentis)")
 
     print("\nOpções:")
     print("1. Gerar carteira otimizada")
-    print("2. Ensemble estrutural (pares/clusters)")
+    print("2. Ensemble estrutural melhorado")
     print("3. Walk-forward validation (10 janelas)")
     print("4. TUDO")
     op = input("Escolha [4]: ").strip() or "4"
@@ -1002,7 +1118,7 @@ def main():
     if op in ("1", "4"):
         print(f"\n🔧 INICIALIZANDO...")
         t0 = time.time()
-        optimizer = HybridPortfolioOptimizerV12(contests)
+        optimizer = HybridPortfolioOptimizerV13(contests)
         print(f"   ✅ Inicializado em {time.time()-t0:.1f}s")
         print(f"   GMM: {optimizer.dist_model.n_components} componentes")
 
@@ -1029,14 +1145,16 @@ def main():
             structural_avg = optimizer._average_structural_score(portfolio)
             geo_div = optimizer._geometric_diversity(portfolio)
             entropy_val = optimizer._portfolio_entropy(portfolio)
+            struct_overlap = optimizer._structural_overlap_penalty(portfolio)
             print(f"\n📊 Cobertura dezenas: {len(all_d)}/25")
             print(f"📊 Cobertura pares: {pair_cov:.3f} (cap: ≤{MAX_PAIR_COVERAGE})")
             print(f"📊 Score estrutural: {structural_avg:.3f}")
-            print(f"📊 Diversidade geométrica: {geo_div:.3f} (cap: ≤{MAX_GEO_DIVERSITY})")
+            print(f"📊 Diversidade geométrica: {geo_div:.3f} (meta: [{MIN_GEO_DIVERSITY}, {MAX_GEO_DIVERSITY}])")
             print(f"📊 Entropia: {entropy_val:.3f} (alvo: {TARGET_ENTROPY_MIN}-{TARGET_ENTROPY_MAX})")
+            print(f"📊 Penalidade overlap estrutural: {struct_overlap:.3f}")
 
             weighted_sum = optimizer._monte_carlo_weighted_sum(portfolio, n_simulations=5000)
-            print(f"📊 Score exponencial ponderado: {weighted_sum:.6f}")
+            print(f"📊 Score exponencial normalizado: {weighted_sum:.4f}")
 
             test_size = min(200, len(contests) // 3)
             if test_size > 10:
@@ -1048,7 +1166,7 @@ def main():
                 print(f"   Lift: {bt['lift']:.2f}x")
 
     if op in ("2", "4"):
-        optimizer = HybridPortfolioOptimizerV12(contests)
+        optimizer = HybridPortfolioOptimizerV13(contests)
         consensus = optimizer.generate_ensemble_structural(
             n_strategies=3, n_games_per_strategy=5)
         print(f"\n🤝 CARTEIRA ENSEMBLE ESTRUTURAL ({len(consensus)} jogos):")
@@ -1070,3 +1188,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+```
