@@ -2,16 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-GERADOR PARAMÉTRICO DE CARTEIRA - LOTOFÁCIL v29 (SIMPLIFICADO)
+GERADOR PARAMÉTRICO DE CARTEIRA - LOTOFÁCIL v29.1 (AJUSTADO)
 
-Após v28.2: removemos KDE, synthetic draws e regime weighting.
-Apenas Mahalanobis com scoring contínuo (não saturante) + forte penalização estrutural.
-
-✅ Mahalanobis suave: score = exp(-((pct - 0.88)²)/(2*0.08²))
-✅ Penalidade estrutural realista (consecutivos totais, clusterização)
-✅ MC invertido apenas com histórico real (sem sintéticos)
-✅ Diversidade geométrica e cobertura de pares mantidas
-✅ Cache e performance preservados
+Correções e ajustes finos:
+✅ Método build_feature_matrix() recolocado (necessário para centróide e diversidade)
+✅ Target percentil reduzido para 0.75 (evita concentração excessiva)
+✅ Sigma aumentado para 0.12 (distribuição mais suave dos scores)
+✅ Penalidades estruturais mantidas (anti-agrupamento)
+✅ Sem KDE, sem synthetic draws, sem regime weighting
 """
 
 import numpy as np
@@ -55,10 +53,10 @@ FEATURE_NAMES = [
 ]
 N_FEATURES = len(FEATURE_NAMES)
 
-# Constraints estruturais (mais rigorosas)
-MAX_CONSECUTIVOS_RUN = 5          # reduzido
-MAX_TOTAL_CONSECUTIVOS = 7        # penalidade forte se total > 7
-MAX_CLUSTERIZACAO = 0.85          # mais restritivo
+# Constraints estruturais (rigorosas)
+MAX_CONSECUTIVOS_RUN = 5
+MAX_TOTAL_CONSECUTIVOS = 7
+MAX_CLUSTERIZACAO = 0.85
 
 STRUCTURAL_TARGETS = {
     'pares': (7.5, 2.5, 1.0),
@@ -69,7 +67,7 @@ STRUCTURAL_TARGETS = {
     'consecutivos': (5.5, 4.0, 0.2),
     'amplitude': (22.0, 5.0, 0.3),
 }
-STRUCTURAL_REJECT_THRESHOLD = 12   # um pouco mais baixo
+STRUCTURAL_REJECT_THRESHOLD = 12
 
 MAX_PAIR_COVERAGE = 0.75
 MIN_GEO_DIVERSITY = 0.25
@@ -77,12 +75,12 @@ MAX_GEO_DIVERSITY = 0.85
 
 EXPONENTIAL_WEIGHTS = {11: 0.0, 12: 0.0, 13: 0.2, 14: 5000.0, 15: 300000.0}
 
-# Parâmetros do scoring Mahalanobis contínuo
-TARGET_PERCENTILE = 0.88
-SIGMA_PERCENTILE = 0.08
+# Scoring Mahalanobis contínuo (ajustado)
+TARGET_PERCENTILE = 0.75
+SIGMA_PERCENTILE = 0.12
 
 # ============================================================
-# UTILITÁRIOS BITMASK (mantidos)
+# UTILITÁRIOS BITMASK
 # ============================================================
 
 class BitmaskCache:
@@ -102,7 +100,7 @@ def mask_intersection(m1, m2): return (m1 & m2).bit_count()
 def draw_masks_to_array(draws): return np.array([BITMASK_CACHE.get_mask(d) for d in draws], dtype=np.uint32)
 
 # ============================================================
-# CARREGAMENTO DE DADOS (inalterado)
+# CARREGAMENTO DE DADOS
 # ============================================================
 def load_all_contests(csv_file='resultados_lotofacil.csv'):
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -147,10 +145,10 @@ class FeatureExtractor:
             self.scaler.fit(raw_features)
         self.feature_means = np.mean(raw_features, axis=0)
         self.feature_stds = np.std(raw_features, axis=0) + 1e-10
-        self._raw_cache = {}            # cache para features raw (usado no Mahalanobis)
-        self._feature_cache = {}        # cache para features escaladas (diversidade)
+        self._raw_cache = {}
+        self._feature_cache = {}
 
-        # Modelo multivariado apenas Mahalanobis (sem KDE)
+        # Modelo multivariado apenas Mahalanobis
         self._build_mahalanobis_model(raw_features)
 
     def _build_raw_feature_matrix(self):
@@ -179,10 +177,10 @@ class FeatureExtractor:
             float(sum(abs(d[i]-d[i-1]) for i in range(1, len(d)))),
             ent_trans,
             float(len(set((x-1)//5 for x in d))),
-            float(sum(1 for i in range(len(d)-1) if d[i+1]-d[i]==1)),  # total consecutivos
+            float(sum(1 for i in range(len(d)-1) if d[i+1]-d[i]==1)),
             float(np.mean([sum(1 for y in d if abs(x-y)<=2) for x in d]) / 15),
             float(np.mean(d)-np.median(d)),
-            float(sum(1 for g in gaps if g<=2)/len(gaps)),   # clusterização
+            float(sum(1 for g in gaps if g<=2)/len(gaps)),
             float(rep),
             float(sum(1 for x in d if x%2==0)),
             float(sum(1 for x in d if x in PRIMES)),
@@ -223,11 +221,9 @@ class FeatureExtractor:
         raw = self.extract_raw_features(game)
         dist = self.mahalanobis_distance(raw)
         percentile = np.mean(self.historical_mahalanobis <= dist)
-        # Função gaussiana centrada em TARGET_PERCENTILE
         score = np.exp(-((percentile - TARGET_PERCENTILE)**2) / (2 * SIGMA_PERCENTILE**2))
         return float(score), float(percentile), float(dist)
 
-    # Métodos de extração com cache
     def extract_raw_features(self, game):
         key = tuple(sorted(game))
         if key not in self._raw_cache:
@@ -244,20 +240,24 @@ class FeatureExtractor:
                 self._feature_cache[key] = (raw - self.feature_means) / self.feature_stds
         return self._feature_cache[key]
 
-    # Penalidade estrutural reforçada
+    # Método essencial recolocado
+    def build_feature_matrix(self):
+        raw = self._build_raw_feature_matrix()
+        if self.scaler is not None:
+            return self.scaler.transform(raw)
+        return (raw - self.feature_means) / self.feature_stds
+
     def compute_structural_penalty(self, game):
         d = sorted(game)
         penalty = 0.0
-        # Totais
         total_pares = sum(1 for x in d if x%2==0)
         total_primos = sum(1 for x in d if x in PRIMES)
         total_moldura = sum(1 for x in d if x in MOLDURA)
         total_rep = len(set(d) & set(self.contests[-1]['dezenas'])) if self.contests else 8
         total_soma = sum(d)
         total_amplitude = max(d)-min(d)
-        total_consec = sum(1 for i in range(len(d)-1) if d[i+1]-d[i]==1)  # consecutivos totais
+        total_consec = sum(1 for i in range(len(d)-1) if d[i+1]-d[i]==1)
 
-        # Desvios dos alvos (mantidos)
         actuals = {
             'pares': total_pares,
             'primos': total_primos,
@@ -273,11 +273,9 @@ class FeatureExtractor:
                 if dev > tol:
                     penalty += (dev - tol) * w
 
-        # Penalidade específica para total de consecutivos alto
         if total_consec > MAX_TOTAL_CONSECUTIVOS:
-            penalty += (total_consec - MAX_TOTAL_CONSECUTIVOS) * 8.0  # peso pesado
+            penalty += (total_consec - MAX_TOTAL_CONSECUTIVOS) * 8.0
 
-        # Penalidade para sequência muito longa (run)
         max_run = 1
         run = 1
         for i in range(len(d)-1):
@@ -289,7 +287,6 @@ class FeatureExtractor:
         if max_run > MAX_CONSECUTIVOS_RUN:
             penalty += (max_run - MAX_CONSECUTIVOS_RUN) * 5.0
 
-        # Clusterização (evitar aglomerados)
         gaps = [d[i+1]-d[i] for i in range(len(d)-1)]
         clusterizacao = sum(1 for g in gaps if g <= 2) / len(gaps)
         if clusterizacao > MAX_CLUSTERIZACAO:
@@ -319,7 +316,7 @@ class FeatureExtractor:
         return kl_total
 
 # ============================================================
-# GAME CANDIDATE (simplificado: sem KDE)
+# GAME CANDIDATE
 # ============================================================
 class GameCandidate:
     __slots__ = ('game', 'mask', 'features', 'rarity_score', 'rarity_percentile', 'mahalanobis_dist')
@@ -332,7 +329,7 @@ class GameCandidate:
         self.mahalanobis_dist = mahalanobis_dist
 
 # ============================================================
-# GERADOR (com penalização estrutural mais rígida)
+# GERADOR
 # ============================================================
 class LooseGenerator:
     def __init__(self, extractor=None):
@@ -363,7 +360,6 @@ class LooseGenerator:
                         run = 1
                 if max_run > MAX_CONSECUTIVOS_RUN:
                     s -= (max_run - MAX_CONSECUTIVOS_RUN) * 3
-                # Penalização por excesso de consecutivos totais (já parcial)
                 total_consec = sum(1 for i in range(len(st)-1) if st[i+1]-st[i]==1)
                 if total_consec > MAX_TOTAL_CONSECUTIVOS:
                     s -= (total_consec - MAX_TOTAL_CONSECUTIVOS) * 2
@@ -384,20 +380,19 @@ class LooseGenerator:
         return sorted(np.random.choice(range(1, 26), 15, replace=False))
 
 # ============================================================
-# OTIMIZADOR v29 (sem KDE, sem sintéticos, scoring contínuo)
+# OTIMIZADOR v29.1
 # ============================================================
 class PortfolioOptimizerV29:
     def __init__(self, contests):
         self.contests = contests
         self.extractor = FeatureExtractor(contests)
-        self.feature_matrix = self.extractor.build_feature_matrix()
+        self.feature_matrix = self.extractor.build_feature_matrix()  # agora funciona
         self.last = contests[-1]['dezenas'] if contests else None
         self.generator = LooseGenerator(self.extractor)
         self._mc_cache = {}
         self._mc_norm_params = None
         self._score_cache = {}
 
-        # Apenas histórico real (sem sintéticos)
         self.historical_draws = [c['dezenas'] for c in self.contests]
         self.historical_masks = draw_masks_to_array(self.historical_draws)
         if len(self.historical_draws) < 100:
@@ -405,14 +400,13 @@ class PortfolioOptimizerV29:
             self.historical_draws.extend(extra)
             self.historical_masks = draw_masks_to_array(self.historical_draws)
 
-        # Features escaladas para diversidade geométrica (não para Mahalanobis)
         self.historical_features = np.array([self.extractor.extract_features(list(d), None) for d in self.historical_draws])
         recent_f = self.feature_matrix[-20:] if len(self.feature_matrix) >= 20 else self.feature_matrix
         self.recent_centroid = np.mean(recent_f, axis=0)
 
     def _create_candidate(self, game):
         mask = BITMASK_CACHE.get_mask(game)
-        features = self.extractor.extract_features(game, self.last)  # escaladas para diversidade
+        features = self.extractor.extract_features(game, self.last)
         rarity_score, rarity_pct, mahal_dist = self.extractor.compute_rarity_score(game)
         return GameCandidate(game, mask, features, rarity_score, rarity_pct, mahal_dist)
 
@@ -435,7 +429,6 @@ class PortfolioOptimizerV29:
         dists = [np.linalg.norm(fvs[i]-fvs[j]) for i in range(len(fvs)) for j in range(i+1, len(fvs))]
         return np.mean(dists)/(2*np.sqrt(N_FEATURES)) if dists else 0
 
-    # Monte Carlo apenas com histórico real, pesos invertidos
     def _monte_carlo_hybrid(self, portfolio_candidates, n_simulations=500):
         cache_key = tuple(tuple(sorted(c.game)) for c in portfolio_candidates)
         if cache_key in self._mc_cache:
@@ -497,7 +490,6 @@ class PortfolioOptimizerV29:
         else:
             mc_score = self._monte_carlo_hybrid(portfolio)
             avg_rarity = np.mean([c.rarity_score for c in portfolio])
-            # Pesos ajustados: MC tem mais peso, raridade suave, diversidade
             score = (mc_score * 0.5 + avg_rarity * 0.3 +
                      self._portfolio_diversity(portfolio) * 0.1 +
                      self._geometric_diversity(portfolio) * 0.1)
@@ -595,7 +587,7 @@ class PortfolioOptimizerV29:
         }
 
 # ============================================================
-# WALK-FORWARD (v29)
+# WALK-FORWARD
 # ============================================================
 def walk_forward_validation(contests, n_windows=10, train_size=500, test_size=50, n_games=5):
     print(f"\n🔬 WALK-FORWARD ({n_windows} janelas)...")
@@ -634,7 +626,7 @@ def walk_forward_validation(contests, n_windows=10, train_size=500, test_size=50
 # ============================================================
 def main():
     print("="*70)
-    print("🧬 GERADOR DE CARTEIRA v29 - SIMPLIFICADO (Mahalanobis contínuo)")
+    print("🧬 GERADOR DE CARTEIRA v29.1 - SIMPLIFICADO (Mahalanobis contínuo)")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if contests is None: print("❌ Arquivo não encontrado."); return
