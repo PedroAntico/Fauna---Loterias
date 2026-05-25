@@ -2,13 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-GERADOR PARAMÉTRICO DE CARTEIRA - LOTOFÁCIL v29.1 (AJUSTADO)
+GERADOR PARAMÉTRICO DE CARTEIRA - LOTOFÁCIL v30 (ANTICOLAPSO)
 
-Correções e ajustes finos:
-✅ Método build_feature_matrix() recolocado (necessário para centróide e diversidade)
-✅ Target percentil reduzido para 0.75 (evita concentração excessiva)
-✅ Sigma aumentado para 0.12 (distribuição mais suave dos scores)
-✅ Penalidades estruturais mantidas (anti-agrupamento)
+Após v29.1:
+✅ Seleção probabilística no lugar de ranking duro (evita colapso para o pico)
+✅ Raridade com peso reduzido (0.1) e MC dominante (0.7)
+✅ Bônus de dispersão dos percentis de raridade no portfólio
+✅ Penalidades estruturais rigorosas mantidas
 ✅ Sem KDE, sem synthetic draws, sem regime weighting
 """
 
@@ -53,7 +53,7 @@ FEATURE_NAMES = [
 ]
 N_FEATURES = len(FEATURE_NAMES)
 
-# Constraints estruturais (rigorosas)
+# Constraints estruturais
 MAX_CONSECUTIVOS_RUN = 5
 MAX_TOTAL_CONSECUTIVOS = 7
 MAX_CLUSTERIZACAO = 0.85
@@ -75,7 +75,7 @@ MAX_GEO_DIVERSITY = 0.85
 
 EXPONENTIAL_WEIGHTS = {11: 0.0, 12: 0.0, 13: 0.2, 14: 5000.0, 15: 300000.0}
 
-# Scoring Mahalanobis contínuo (ajustado)
+# Scoring Mahalanobis contínuo
 TARGET_PERCENTILE = 0.75
 SIGMA_PERCENTILE = 0.12
 
@@ -127,7 +127,7 @@ def load_all_contests(csv_file='resultados_lotofacil.csv'):
         return None
 
 # ============================================================
-# EXTRATOR DE FEATURES (SEM KDE, APENAS MAHALANOBIS RAW)
+# EXTRATOR DE FEATURES (APENAS MAHALANOBIS RAW)
 # ============================================================
 class FeatureExtractor:
     def __init__(self, contests):
@@ -148,7 +148,6 @@ class FeatureExtractor:
         self._raw_cache = {}
         self._feature_cache = {}
 
-        # Modelo multivariado apenas Mahalanobis
         self._build_mahalanobis_model(raw_features)
 
     def _build_raw_feature_matrix(self):
@@ -217,7 +216,7 @@ class FeatureExtractor:
             return float(np.linalg.norm(diff / (np.std(self.historical_mahalanobis) + 1e-10)))
 
     def compute_rarity_score(self, game):
-        """Score contínuo baseado no percentil de Mahalanobis (função gaussiana)."""
+        """Score contínuo gaussiano no percentil de Mahalanobis."""
         raw = self.extract_raw_features(game)
         dist = self.mahalanobis_distance(raw)
         percentile = np.mean(self.historical_mahalanobis <= dist)
@@ -240,7 +239,6 @@ class FeatureExtractor:
                 self._feature_cache[key] = (raw - self.feature_means) / self.feature_stds
         return self._feature_cache[key]
 
-    # Método essencial recolocado
     def build_feature_matrix(self):
         raw = self._build_raw_feature_matrix()
         if self.scaler is not None:
@@ -380,13 +378,13 @@ class LooseGenerator:
         return sorted(np.random.choice(range(1, 26), 15, replace=False))
 
 # ============================================================
-# OTIMIZADOR v29.1
+# OTIMIZADOR v30 (COM SELEÇÃO PROBABILÍSTICA E DISPERSÃO)
 # ============================================================
-class PortfolioOptimizerV29:
+class PortfolioOptimizerV30:
     def __init__(self, contests):
         self.contests = contests
         self.extractor = FeatureExtractor(contests)
-        self.feature_matrix = self.extractor.build_feature_matrix()  # agora funciona
+        self.feature_matrix = self.extractor.build_feature_matrix()
         self.last = contests[-1]['dezenas'] if contests else None
         self.generator = LooseGenerator(self.extractor)
         self._mc_cache = {}
@@ -478,6 +476,15 @@ class PortfolioOptimizerV29:
         raw_scores = np.array(raw_scores)
         return {'p5': float(np.percentile(raw_scores,5)), 'p95': float(np.percentile(raw_scores,95))}
 
+    def _percentile_dispersion_bonus(self, portfolio):
+        """Bônus para portfólios com maior variabilidade nos percentis de raridade."""
+        pcts = [c.rarity_percentile for c in portfolio]
+        if len(pcts) < 2:
+            return 0.0
+        std_pct = np.std(pcts)
+        # Bônus normalizado, máximo por volta de std~0.15
+        return min(0.1, std_pct * 0.5)
+
     def _portfolio_score(self, portfolio):
         key = tuple(c.mask for c in portfolio)
         if key in self._score_cache:
@@ -490,9 +497,11 @@ class PortfolioOptimizerV29:
         else:
             mc_score = self._monte_carlo_hybrid(portfolio)
             avg_rarity = np.mean([c.rarity_score for c in portfolio])
-            score = (mc_score * 0.5 + avg_rarity * 0.3 +
+            disp_bonus = self._percentile_dispersion_bonus(portfolio)
+            # Pesos ajustados: MC domina, raridade pouco influente, dispersão incentiva diversidade
+            score = (mc_score * 0.7 + avg_rarity * 0.1 +
                      self._portfolio_diversity(portfolio) * 0.1 +
-                     self._geometric_diversity(portfolio) * 0.1)
+                     self._geometric_diversity(portfolio) * 0.1 + disp_bonus)
         self._score_cache[key] = score
         return score
 
@@ -509,6 +518,15 @@ class PortfolioOptimizerV29:
                 return self._create_candidate(mutated)
         return candidate
 
+    def _weighted_sample(self, candidates, k):
+        """Amostra k candidatos sem reposição, com probabilidade proporcional ao rarity_score."""
+        if len(candidates) <= k:
+            return candidates
+        scores = np.array([c.rarity_score for c in candidates])
+        probs = scores / scores.sum()
+        indices = np.random.choice(len(candidates), size=k, replace=False, p=probs)
+        return [candidates[i] for i in indices]
+
     def optimize(self, n_games=5, n_candidates=12000, iterations=100):
         print(f"🎯 Carteira CONCENTRADA: {n_games} jogos")
         print(f"📊 Scoring Mahalanobis contínuo (target pct={TARGET_PERCENTILE}, sigma={SIGMA_PERCENTILE})")
@@ -524,18 +542,23 @@ class PortfolioOptimizerV29:
 
         top_pool = random.sample(raw_pool, min(5000, len(raw_pool)))
         candidates = [self._create_candidate(g) for g in tqdm(top_pool, desc="Fase 2")]
-        candidates.sort(key=lambda c: c.rarity_score, reverse=True)
 
+        # 🔄 NOVA SELEÇÃO PROBABILÍSTICA para portfólio inicial
+        portfolio_candidates = self._weighted_sample(candidates, min(200, len(candidates)))
+        # Ordena apenas para ter um ponto de partida razoável, mas a seleção é probabilística
+        portfolio_candidates.sort(key=lambda c: c.rarity_score, reverse=True)
         portfolio, portfolio_masks = [], []
-        for c in candidates:
+        for c in portfolio_candidates:
             if len(portfolio) >= n_games: break
             if portfolio_masks and max(mask_intersection(c.mask, pm) for pm in portfolio_masks) > 10:
                 continue
             portfolio.append(c)
             portfolio_masks.append(c.mask)
 
+        # Elite pool também por amostragem probabilística (evita top duro)
+        elite_pool = self._weighted_sample(candidates, min(400, len(candidates)))
+
         best_portfolio, best_score = list(portfolio), self._portfolio_score(portfolio)
-        elite_pool = candidates[:len(candidates)//4]
 
         for it in tqdm(range(iterations), desc="Annealing"):
             temp = 1.0 * (0.95 ** it)
@@ -543,7 +566,7 @@ class PortfolioOptimizerV29:
             idx = random.randint(0, len(new_portfolio)-1)
 
             if random.random() < 0.4 and elite_pool:
-                new_candidate = random.choice(elite_pool)
+                new_candidate = random.choice(elite_pool)  # escolhe aleatoriamente do elite pool (já diverso)
             elif random.random() < 0.7:
                 new_candidate = self._mutate_candidate(new_portfolio[idx])
             else:
@@ -598,7 +621,7 @@ def walk_forward_validation(contests, n_windows=10, train_size=500, test_size=50
         if train_start >= train_end or test_start >= test_end: continue
         train_data, test_data = contests[train_start:train_end], contests[test_start:test_end]
         if len(train_data) < 100 or len(test_data) < 5: continue
-        opt = PortfolioOptimizerV29(train_data)
+        opt = PortfolioOptimizerV30(train_data)
         portfolio, _ = opt.optimize(n_games, n_candidates=12000, iterations=50)
         bt = opt.backtest(portfolio, test_data)
         bt_rand = opt.backtest([opt.generator.generate_pure_random() for _ in range(n_games)], test_data)
@@ -626,7 +649,7 @@ def walk_forward_validation(contests, n_windows=10, train_size=500, test_size=50
 # ============================================================
 def main():
     print("="*70)
-    print("🧬 GERADOR DE CARTEIRA v29.1 - SIMPLIFICADO (Mahalanobis contínuo)")
+    print("🧬 GERADOR DE CARTEIRA v30 - ANTICOLAPSO (seleção probabilística)")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if contests is None: print("❌ Arquivo não encontrado."); return
@@ -640,13 +663,13 @@ def main():
 
     if op in ("1", "3"):
         t0 = time.time()
-        opt = PortfolioOptimizerV29(contests)
+        opt = PortfolioOptimizerV30(contests)
         print(f"   ✅ Init {time.time()-t0:.1f}s")
         portfolio, _ = opt.optimize(5, 12000, 100)
         last = contests[-1]['dezenas']
         gen_features = np.array([opt.extractor.extract_features(g, last) for g in portfolio])
         kl = opt.extractor.compute_kl_divergence(gen_features)
-        print(f"\n📊 KL Divergence (gerado vs histórico): {kl:.3f} (0=idêntico, >40=degenerado)")
+        print(f"\n📊 KL Divergence (gerado vs histórico): {kl:.3f} (ideal < 40)")
         for i, g in enumerate(portfolio, 1):
             p = sum(1 for d in g if d%2==0)
             pr = sum(1 for d in g if d in PRIMES)
