@@ -2,23 +2,27 @@
 # -*- coding: utf-8 -*-
 
 """
-GERADOR PARAMÉTRICO DE CARTEIRA - LOTOFÁCIL v27 (RARIDADE MULTIVARIADA)
-==========================================================================
-LIÇÕES DO v25/v26:
-✅ Rarity score MULTIVARIADO (Mahalanobis) - não univariado
-✅ Penalidade de colapso estrutural (consecutivos, clusterização)
-✅ KL Divergence para sanity check (distribuição gerada vs histórica)
-✅ PCA para embeddings temporais (detecção de estados raros)
-✅ MC com pesos INVERTIDOS (favorece draws distantes)
-✅ Gerador mais solto, mas COM limite de consecutivos (6)
+GERADOR PARAMÉTRICO DE CARTEIRA - LOTOFÁCIL v28 (REGIMES LOCAIS)
+==================================================================
+EVOLUÇÃO DO v27:
+
+✅ Mahalanobis BIDIRECIONAL (target percentil 0.80, penaliza >0.99)
+✅ KDE Density Estimation (alternativa não-paramétrica)
+✅ Detecção de Regime Local (change point detection simples)
+✅ UMAP opcional para visualização do manifold
+✅ Anti-colapso estrutural mantido
+✅ MC com pesos INVERTIDOS mantido
+✅ KL Divergence como sanity check
 ✅ Carteira CONCENTRADA (5-6 jogos)
-✅ Pesos ultra-agressivos: 13:0.2, 14:5000, 15:300000
-✅ BitmaskCache + GameCandidate + vetorização mantidos
-✅ Mistura de 3-4 concursos para sintéticos (50% MC)
+
+FILOSOFIA:
+Não buscar "jogos alienígenas", mas sim "micro-desvios persistentes"
+do regime recente — raros o suficiente para ter potencial de cauda,
+mas não tão raros que sejam geometricamente impossíveis.
 """
 
 import numpy as np
-from scipy.stats import entropy, hypergeom, wilcoxon
+from scipy.stats import entropy, hypergeom, wilcoxon, gaussian_kde
 from collections import Counter
 from itertools import combinations
 from datetime import datetime
@@ -39,6 +43,12 @@ try:
 except ImportError:
     SKLEARN_AVAILABLE = False
     print("⚠️ Scikit-learn não instalado. Use: pip install scikit-learn")
+
+try:
+    import umap
+    UMAP_AVAILABLE = True
+except ImportError:
+    UMAP_AVAILABLE = False
 
 # ============================================================
 # CONJUNTOS E CONSTANTES
@@ -62,8 +72,8 @@ FEATURE_NAMES = [
 N_FEATURES = len(FEATURE_NAMES)
 
 # Constraints ESTRUTURAIS (com limites de colapso)
-MAX_CONSECUTIVOS_RUN = 6  # Impede exploits de superclusterização
-MAX_CLUSTERIZACAO = 0.95  # Limite superior para gaps pequenos
+MAX_CONSECUTIVOS_RUN = 6
+MAX_CLUSTERIZACAO = 0.95
 
 STRUCTURAL_TARGETS = {
     'pares': (7.5, 2.5, 1.0),
@@ -80,7 +90,7 @@ MAX_PAIR_COVERAGE = 0.75
 MIN_GEO_DIVERSITY = 0.25
 MAX_GEO_DIVERSITY = 0.85
 
-# Pesos ULTRA-AGRESSIVOS
+# Pesos AGRESSIVOS (mantidos)
 EXPONENTIAL_WEIGHTS = {
     11: 0.0,
     12: 0.0,
@@ -88,6 +98,10 @@ EXPONENTIAL_WEIGHTS = {
     14: 5000.0,
     15: 300000.0,
 }
+
+# Parâmetros do Mahalanobis BIDIRECIONAL
+TARGET_RARITY_PERCENTILE = 0.80  # Alvo: percentil 80 (raro mas plausível)
+RARITY_PENALTY_ABOVE = 0.99     # Penalizar fortemente acima de 99
 
 
 # ============================================================
@@ -139,7 +153,62 @@ def load_all_contests(csv_file='resultados_lotofacil.csv'):
 
 
 # ============================================================
-# EXTRATOR DE FEATURES + MODELO MULTIVARIADO
+# DETECTOR DE REGIME LOCAL (CHANGE POINT SIMPLES)
+# ============================================================
+class LocalRegimeDetector:
+    """
+    Detecta mudanças de regime comparando janelas recentes vs globais.
+    Usa divergência de features para identificar "estados" do sistema.
+    """
+    def __init__(self, feature_matrix, window=20):
+        self.feature_matrix = feature_matrix
+        self.window = window
+        self.global_mean = np.mean(feature_matrix, axis=0)
+        self.global_std = np.std(feature_matrix, axis=0) + 1e-10
+        self._compute_regime_history()
+
+    def _compute_regime_history(self):
+        """Calcula o score de regime para cada ponto histórico."""
+        self.regime_scores = []
+        for i in range(self.window, len(self.feature_matrix)):
+            recent = self.feature_matrix[i-self.window:i]
+            recent_mean = np.mean(recent, axis=0)
+            # Z-score do regime recente vs global
+            z_scores = (recent_mean - self.global_mean) / self.global_std
+            regime_score = np.mean(np.abs(z_scores))
+            self.regime_scores.append(regime_score)
+        self.regime_scores = np.array(self.regime_scores)
+
+    def get_current_regime_score(self):
+        """Retorna o score de regime atual (0 = normal, >1 = anômalo)."""
+        if len(self.feature_matrix) >= self.window:
+            recent = self.feature_matrix[-self.window:]
+            recent_mean = np.mean(recent, axis=0)
+            z_scores = (recent_mean - self.global_mean) / self.global_std
+            return float(np.mean(np.abs(z_scores)))
+        return 0.0
+
+    def get_regime_direction(self):
+        """
+        Retorna a direção do regime atual em relação ao global.
+        Valores positivos = acima da média, negativos = abaixo.
+        """
+        if len(self.feature_matrix) >= self.window:
+            recent = self.feature_matrix[-self.window:]
+            recent_mean = np.mean(recent, axis=0)
+            return (recent_mean - self.global_mean) / self.global_std
+        return np.zeros(N_FEATURES)
+
+    def get_regime_percentile(self):
+        """Percentil do score de regime atual em relação ao histórico."""
+        current = self.get_current_regime_score()
+        if len(self.regime_scores) > 0:
+            return float(np.mean(self.regime_scores <= current))
+        return 0.5
+
+
+# ============================================================
+# EXTRATOR DE FEATURES + MODELOS MULTIVARIADOS
 # ============================================================
 class FeatureExtractor:
     def __init__(self, contests):
@@ -155,8 +224,10 @@ class FeatureExtractor:
         self.feature_stds = np.std(raw_features, axis=0) + 1e-10
         self._feature_cache = {}
 
-        # MODELO MULTIVARIADO (Mahalanobis + PCA)
+        # Modelos multivariados
         self._build_multivariate_model(raw_features)
+        # Detector de regime local
+        self.regime_detector = LocalRegimeDetector(self.build_feature_matrix())
 
     def _build_raw_feature_matrix(self):
         features_list = []
@@ -188,67 +259,105 @@ class FeatureExtractor:
         ], dtype=np.float64)
 
     def _build_multivariate_model(self, raw_features):
-        """Constrói modelo de Mahalanobis (LedoitWolf) e PCA."""
-        # LedoitWolf para matriz de precisão robusta
+        """Constrói LedoitWolf + KDE."""
+        # LedoitWolf
         if SKLEARN_AVAILABLE and len(raw_features) > N_FEATURES:
             try:
                 lw = LedoitWolf().fit(raw_features)
                 self.precision_matrix = lw.precision_
                 self.cov_matrix = lw.covariance_
-                self._has_precision = True
             except:
                 cov = np.cov(raw_features.T) + np.eye(N_FEATURES) * 1e-6
                 self.precision_matrix = np.linalg.inv(cov)
                 self.cov_matrix = cov
-                self._has_precision = True
         else:
             cov = np.cov(raw_features.T) + np.eye(N_FEATURES) * 1e-6
             self.precision_matrix = np.linalg.inv(cov)
             self.cov_matrix = cov
-            self._has_precision = True
         self._mean_vector = np.mean(raw_features, axis=0)
 
-        # PCA para embeddings temporais
-        if SKLEARN_AVAILABLE and len(raw_features) > 10:
-            try:
-                self.pca = PCA(n_components=min(5, N_FEATURES))
-                self.pca.fit(raw_features)
-                self._has_pca = True
-            except:
-                self._has_pca = False
-        else:
-            self._has_pca = False
+        # Pré-computar Mahalanobis histórico
+        self.historical_mahalanobis = np.array([self.mahalanobis_distance(f) for f in raw_features])
 
-        # Pré-computar Mahalanobis de todos os históricos
-        self.historical_mahalanobis = np.array([
-            self.mahalanobis_distance(f) for f in raw_features
-        ])
+        # KDE (apenas nas primeiras 5 PCs para viabilidade)
+        if SKLEARN_AVAILABLE and len(raw_features) > 50:
+            try:
+                pca = PCA(n_components=min(5, N_FEATURES))
+                pca_features = pca.fit_transform(raw_features)
+                self.kde = gaussian_kde(pca_features.T)
+                self._has_kde = True
+                self._kde_pca = pca
+            except:
+                self._has_kde = False
+        else:
+            self._has_kde = False
+
+        # UMAP (opcional)
+        if UMAP_AVAILABLE and len(raw_features) > 50:
+            try:
+                self.umap_model = umap.UMAP(n_components=2, random_state=42)
+                self.umap_embedding = self.umap_model.fit_transform(raw_features)
+                self._has_umap = True
+            except:
+                self._has_umap = False
+        else:
+            self._has_umap = False
 
     def mahalanobis_distance(self, features):
-        """Distância de Mahalanobis multivariada (raridade REAL)."""
         diff = features - self._mean_vector
         try:
-            dist_sq = np.dot(np.dot(diff.T, self.precision_matrix), diff)
-            return float(np.sqrt(max(0, dist_sq)))
+            return float(np.sqrt(max(0, np.dot(np.dot(diff.T, self.precision_matrix), diff))))
         except:
             return float(np.linalg.norm(diff / (np.std(self.historical_mahalanobis) + 1e-10)))
 
-    def compute_rarity_score(self, game, all_features=None):
+    def compute_rarity_score_bidirectional(self, game):
         """
-        RARITY SCORE MULTIVARIADO: baseado na distância de Mahalanobis.
-        Normalizado 0-1 usando percentis históricos.
+        RARITY BIDIRECIONAL: premia percentil ~0.80, penaliza >0.99.
+        Busca o "limite externo do manifold", não hiper-outliers.
         """
         features = self.extract_features(game, None)
         dist = self.mahalanobis_distance(features)
-        # Percentil da distância em relação ao histórico
         percentile = np.mean(self.historical_mahalanobis <= dist)
-        return float(percentile)
 
-    def compute_pca_embedding(self, features):
-        """Embedding PCA para detecção de estados raros."""
-        if self._has_pca:
-            return self.pca.transform(features.reshape(1, -1)).flatten()
-        return features[:5] if len(features) >= 5 else features
+        # Score bidirecional
+        if percentile <= TARGET_RARITY_PERCENTILE:
+            # Abaixo do alvo: score cresce até o target
+            score = percentile / TARGET_RARITY_PERCENTILE
+        elif percentile <= RARITY_PENALTY_ABOVE:
+            # Entre target e 0.99: score máximo (1.0)
+            score = 1.0
+        else:
+            # Acima de 0.99: penalidade forte
+            excess = (percentile - RARITY_PENALTY_ABOVE) / (1.0 - RARITY_PENALTY_ABOVE)
+            score = 1.0 - excess * 5.0  # Penalidade 5x
+
+        return float(max(0.0, score)), float(percentile), float(dist)
+
+    def compute_kde_score(self, game):
+        """Score baseado em KDE (densidade não-paramétrica)."""
+        if not self._has_kde:
+            return 0.5
+        features = self.extract_features(game, None)
+        pca_features = self._kde_pca.transform(features.reshape(1, -1)).flatten()
+        density = float(self.kde.evaluate(pca_features)[0])
+        # Normalizar: densidade mais baixa = mais raro = score mais alto
+        # Usar log para escala mais estável
+        log_density = np.log(max(density, 1e-15))
+        # Queremos densidade MODERADAMENTE baixa (não extremamente baixa)
+        hist_densities = self.kde.evaluate(self._kde_pca.transform(
+            self._build_raw_feature_matrix()[:1000]
+        ).T)
+        log_hist = np.log(np.maximum(hist_densities, 1e-15))
+        percentile = np.mean(log_hist <= log_density)
+        # Bidirecional como Mahalanobis
+        if percentile <= TARGET_RARITY_PERCENTILE:
+            score = percentile / TARGET_RARITY_PERCENTILE
+        elif percentile <= RARITY_PENALTY_ABOVE:
+            score = 1.0
+        else:
+            excess = (percentile - RARITY_PENALTY_ABOVE) / (1.0 - RARITY_PENALTY_ABOVE)
+            score = 1.0 - excess * 5.0
+        return float(max(0.0, score))
 
     def extract_features(self, game, last_contest=None):
         key = (tuple(sorted(game)), tuple(last_contest) if last_contest else None)
@@ -277,7 +386,6 @@ class FeatureExtractor:
             if name in actuals:
                 dev = abs(actuals[name]-target)
                 if dev > tol: penalty += (dev - tol) * w
-        # PENALIDADE DE COLAPSO ESTRUTURAL
         max_run = 1; run = 1
         for i in range(len(d)-1):
             if d[i+1]-d[i]==1: run+=1; max_run=max(max_run,run)
@@ -294,10 +402,6 @@ class FeatureExtractor:
         return self.compute_structural_penalty(game) < STRUCTURAL_REJECT_THRESHOLD
 
     def compute_kl_divergence(self, generated_features, n_bins=10):
-        """
-        KL Divergence entre distribuição gerada e histórica.
-        Sanity check para detectar degeneração.
-        """
         hist_features = self._build_raw_feature_matrix()
         kl_total = 0.0
         for i in range(min(N_FEATURES, generated_features.shape[1])):
@@ -310,8 +414,7 @@ class FeatureExtractor:
                 gen_hist, _ = np.histogram(gen_vals, bins=bins, density=True)
                 hist_hist = np.where(hist_hist>0, hist_hist, 1e-10)
                 gen_hist = np.where(gen_hist>0, gen_hist, 1e-10)
-                kl = np.sum(gen_hist * np.log(gen_hist / hist_hist))
-                kl_total += kl
+                kl_total += np.sum(gen_hist * np.log(gen_hist / hist_hist))
             except:
                 pass
         return kl_total
@@ -321,15 +424,18 @@ class FeatureExtractor:
 # GAMECANDIDATE
 # ============================================================
 class GameCandidate:
-    __slots__ = ('game', 'mask', 'features', 'rarity_score', 'central_score', 'mahalanobis_dist')
-    def __init__(self, game, mask, features, rarity_score=0, central_score=0, mahalanobis_dist=0):
+    __slots__ = ('game', 'mask', 'features', 'rarity_score', 'central_score',
+                 'mahalanobis_dist', 'rarity_percentile', 'kde_score')
+    def __init__(self, game, mask, features, rarity_score=0, central_score=0,
+                 mahalanobis_dist=0, rarity_percentile=0, kde_score=0):
         self.game = game; self.mask = mask; self.features = features
         self.rarity_score = rarity_score; self.central_score = central_score
-        self.mahalanobis_dist = mahalanobis_dist
+        self.mahalanobis_dist = mahalanobis_dist; self.rarity_percentile = rarity_percentile
+        self.kde_score = kde_score
 
 
 # ============================================================
-# GERADOR (MAIS SOLTO, MAS COM LIMITE DE CONSECUTIVOS)
+# GERADOR (COM LIMITES ANTI-COLAPSO)
 # ============================================================
 class LooseGenerator:
     def __init__(self, extractor=None):
@@ -351,7 +457,6 @@ class LooseGenerator:
             for d in candidates:
                 test = game | {d}
                 s = len(set((x-1)//5 for x in test)) * 2
-                # Penalidade LEVE para runs excessivos
                 st = sorted(test)
                 run = 1; max_run = 1
                 for i in range(len(st)-1):
@@ -374,9 +479,9 @@ class LooseGenerator:
 
 
 # ============================================================
-# OTIMIZADOR v27 (RARIDADE MULTIVARIADA)
+# OTIMIZADOR v28 (REGIMES LOCAIS)
 # ============================================================
-class PortfolioOptimizerV27:
+class PortfolioOptimizerV28:
     def __init__(self, contests):
         self.contests = contests
         self.extractor = FeatureExtractor(contests)
@@ -393,12 +498,18 @@ class PortfolioOptimizerV27:
             self.historical_masks = draw_masks_to_array(self.historical_draws)
         self.historical_features = np.array([self.extractor.extract_features(list(d), None) for d in self.historical_draws])
 
+        # Informação do regime atual
+        self.current_regime_score = self.extractor.regime_detector.get_current_regime_score()
+        self.current_regime_percentile = self.extractor.regime_detector.get_regime_percentile()
+
     def _create_candidate(self, game):
         mask = BITMASK_CACHE.get_mask(game)
         features = self.extractor.extract_features(game, self.last)
-        rarity = self.extractor.compute_rarity_score(game)
-        mahalanobis = self.extractor.mahalanobis_distance(features)
-        return GameCandidate(game, mask, features, rarity, rarity, mahalanobis)
+        rarity_score, rarity_pct, mahal_dist = self.extractor.compute_rarity_score_bidirectional(game)
+        kde_score = self.extractor.compute_kde_score(game)
+        # Central score: combinação de rarity bidirecional + KDE
+        central = rarity_score * 0.6 + kde_score * 0.4
+        return GameCandidate(game, mask, features, rarity_score, central, mahal_dist, rarity_pct, kde_score)
 
     def _pair_coverage(self, portfolio):
         covered = set()
@@ -509,8 +620,9 @@ class PortfolioOptimizerV27:
 
     def optimize(self, n_games=5, n_candidates=50000, iterations=100):
         print(f"   Carteira CONCENTRADA: {n_games} jogos")
-        print(f"   Rarity MULTIVARIADO (Mahalanobis)")
-        print(f"   MC com pesos INVERTIDOS | Limites anti-colapso")
+        print(f"   Rarity BIDIRECIONAL (target pct={TARGET_RARITY_PERCENTILE}) + KDE")
+        print(f"   Regime atual: score={self.current_regime_score:.2f} (pct={self.current_regime_percentile:.2f})")
+        print(f"   MC INVERTIDO | Anti-colapso | KL sanity check")
         print(f"   Pesos: 13:{EXPONENTIAL_WEIGHTS[13]} 14:{EXPONENTIAL_WEIGHTS[14]} 15:{EXPONENTIAL_WEIGHTS[15]}")
 
         raw_pool, seen = [], set()
@@ -584,7 +696,7 @@ def walk_forward_validation(contests, n_windows=10, train_size=500, test_size=50
         if train_start >= train_end or test_start >= test_end: continue
         train_data, test_data = contests[train_start:train_end], contests[test_start:test_end]
         if len(train_data) < 100 or len(test_data) < 5: continue
-        opt = PortfolioOptimizerV27(train_data)
+        opt = PortfolioOptimizerV28(train_data)
         portfolio, _ = opt.optimize(n_games, n_candidates=50000, iterations=50)
         bt = opt.backtest(portfolio, test_data)
         bt_rand = opt.backtest([opt.generator.generate_pure_random() for _ in range(n_games)], test_data)
@@ -611,32 +723,32 @@ def walk_forward_validation(contests, n_windows=10, train_size=500, test_size=50
 # ============================================================
 def main():
     print("="*70)
-    print("🧬 GERADOR DE CARTEIRA v27 - RARIDADE MULTIVARIADA (MAHALANOBIS)")
+    print("🧬 GERADOR DE CARTEIRA v28 - REGIMES LOCAIS (BIDIRECIONAL + KDE)")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if contests is None: print("❌ Arquivo não encontrado."); return
     print(f"\n📂 {len(contests)} concursos")
     print(f"📌 Último: {contests[-1]['concurso']} - {contests[-1]['dezenas']}")
-    print(f"\n📊 Mahalanobis + LedoitWolf | MC INVERTIDO | Anti-colapso")
+    print(f"\n📊 Rarity BIDIRECIONAL (target pct={TARGET_RARITY_PERCENTILE}) + KDE")
     print(f"   Pesos: 13:{EXPONENTIAL_WEIGHTS[13]} 14:{EXPONENTIAL_WEIGHTS[14]} 15:{EXPONENTIAL_WEIGHTS[15]}")
     print("Opções: 1. Gerar carteira | 2. Walk-forward | 3. Ambos")
     op = input("Escolha [3]: ").strip() or "3"
     if op in ("1", "3"):
-        t0 = time.time(); opt = PortfolioOptimizerV27(contests)
+        t0 = time.time(); opt = PortfolioOptimizerV28(contests)
         print(f"   ✅ Init {time.time()-t0:.1f}s")
+        print(f"   Regime atual: score={opt.current_regime_score:.2f} (pct={opt.current_regime_percentile:.2f})")
         portfolio, _ = opt.optimize(5, 50000, 100)
         last = contests[-1]['dezenas']
-        # Calcular KL Divergence
         gen_features = np.array([opt.extractor.extract_features(g, last) for g in portfolio])
         kl = opt.extractor.compute_kl_divergence(gen_features)
-        print(f"\n📊 KL Divergence (gerado vs histórico): {kl:.3f} (0=idêntico)")
+        print(f"\n📊 KL Divergence (gerado vs histórico): {kl:.3f} (0=idêntico, >100=degenerado)")
         for i, g in enumerate(portfolio, 1):
             p = sum(1 for d in g if d%2==0); pr = sum(1 for d in g if d in PRIMES)
             m = sum(1 for d in g if d in MOLDURA); rep = len(set(g)&set(last))
             cons = sum(1 for j in range(len(g)-1) if g[j+1]-g[j]==1)
-            rarity = opt.extractor.compute_rarity_score(g)
-            mahal = opt.extractor.mahalanobis_distance(opt.extractor.extract_features(g, last))
-            print(f"   {i:2d}. {g} | P:{p} Pr:{pr} M:{m} Rep:{rep} Cons:{cons} Rarity:{rarity:.2f} Mahal:{mahal:.1f}")
+            rarity, pct, mahal = opt.extractor.compute_rarity_score_bidirectional(g)
+            kde = opt.extractor.compute_kde_score(g)
+            print(f"   {i:2d}. {g} | P:{p} Pr:{pr} M:{m} Rep:{rep} Cons:{cons} Rarity:{rarity:.2f} Pct:{pct:.2f} Mahal:{mahal:.1f} KDE:{kde:.2f}")
         if len(contests) > 200:
             bt = opt.backtest(portfolio, contests[-200:])
             print(f"\n🔬 BACKTEST: Lift={bt['lift']:.2f}x | ROI={bt['roi']:+.1f}%")
