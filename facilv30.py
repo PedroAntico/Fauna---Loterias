@@ -2,24 +2,24 @@
 # -*- coding: utf-8 -*-
 
 """
-GERADOR PARAMÉTRICO DE CARTEIRA - LOTOFÁCIL v22 (FINAL)
-==========================================================
-MELHORIAS INCORPORADAS:
-✅ Fitness suavizado (13:10, 14:300, 15:30000)
-✅ Score Bayesiano de cauda (Beta-Binomial)
-✅ Vetorização real dos hits (numpy broadcasting)
+GERADOR PARAMÉTRICO DE CARTEIRA - LOTOFÁCIL v23 (EQUILIBRADO)
+===============================================================
+LIÇÕES DO v20/v21/v22:
+✅ Pesos suavizados: 13:25, 14:800, 15:50000 (recupera gradiente)
+✅ Portfólio adversarial: 60% centrais + 40% extremos (reduzido)
+✅ Anti-frequência moderada (ANTI_FREQ_WEIGHT = 0.3)
+✅ Score Bayesiano Beta-Binomial preservado
 ✅ DPP (Determinantal Point Process) para diversidade
 ✅ Grafo de coocorrência (centralidade, clustering)
-✅ Portfólio adversarial (50% centrais + 50% extremos)
-✅ Anti-frequência (penaliza dezenas populares)
 ✅ Markov temporal (P(dezena | últimas janelas))
 ✅ MC híbrido (70% real + 30% misto)
 ✅ Percentile rank | GameCandidate | Bitmask
+✅ Fitness: if hits >= 13 (pesos positivos apenas para 13+)
+✅ Backtest: contabiliza >=11 para o usuário final
 """
 
 import numpy as np
-from scipy.stats import entropy, hypergeom, wilcoxon, beta
-from scipy.special import betaln
+from scipy.stats import entropy, hypergeom, wilcoxon
 from collections import Counter, defaultdict
 from itertools import combinations
 from datetime import datetime
@@ -72,20 +72,21 @@ MAX_PAIR_COVERAGE = 0.85
 MIN_GEO_DIVERSITY = 0.50
 MAX_GEO_DIVERSITY = 0.75
 
-# Pesos SUAVIZADOS (evita sparsity collapse)
+# Pesos SUAVIZADOS (recupera gradiente, mantém foco na cauda)
 EXPONENTIAL_WEIGHTS = {
     11: 0.0,
     12: 0.0,
-    13: 10.0,
-    14: 300.0,
-    15: 30000.0,
+    13: 25.0,
+    14: 800.0,
+    15: 50000.0,
 }
 
-# Beta-Binomial: priors para score bayesiano
-BETA_PRIOR_ALPHA = 1.0   # Pseudo-contagens de sucesso
-BETA_PRIOR_BETA = 100.0   # Pseudo-contagens de falha (reflete raridade)
+# Score Bayesiano: priors
+BETA_PRIOR_ALPHA = 1.0
+BETA_PRIOR_BETA = 100.0
 
-ANTI_FREQ_WEIGHT = 0.5  # Aumentado para ter efeito real
+# Anti-frequência MODERADA
+ANTI_FREQ_WEIGHT = 0.3
 
 TEMPORAL_FEATURES = ['moldura', 'amplitude', 'energia_jogo', 'densidade_local', 'clusterizacao']
 TEMPORAL_INDICES = {'moldura': 14, 'amplitude': 16, 'energia_jogo': 4, 'densidade_local': 8, 'clusterizacao': 10}
@@ -110,36 +111,10 @@ class BitmaskCache:
 BITMASK_CACHE = BitmaskCache()
 
 
-def masks_to_hits_matrix(portfolio_masks, draw_masks):
-    """
-    VETORIZAÇÃO: calcula matriz de hits (portfolio × draws) via broadcasting.
-    Usa operações bitwise com numpy para performance.
-    """
-    # Converter para arrays numpy
-    pm = np.array(portfolio_masks, dtype=np.uint32)
-    dm = np.array(draw_masks, dtype=np.uint32)
-
-    # Broadcasting: pm[:, None] shape (n_portfolio, 1), dm shape (n_draws,)
-    # Resultado: (n_portfolio, n_draws)
-    intersection = pm[:, None] & dm[None, :]
-
-    # Contar bits setados em cada interseção
-    hits = np.zeros((len(pm), len(dm)), dtype=np.int32)
-    for i in range(len(pm)):
-        for j in range(len(dm)):
-            hits[i, j] = (intersection[i, j] & 0xFFFFFFFF).bit_count()
-
-    return hits
-
-
 # ============================================================
 # GRAFO DE COOCORRÊNCIA
 # ============================================================
 class CooccurrenceGraph:
-    """
-    Constrói grafo de coocorrência entre dezenas.
-    Arestas = frequência de aparição conjunta normalizada.
-    """
     def __init__(self, contests):
         self.contests = contests
         self.adj_matrix = np.zeros((26, 26))
@@ -163,11 +138,9 @@ class CooccurrenceGraph:
                 self.adj_matrix[a, b] = prob
                 self.adj_matrix[b, a] = prob
 
-        # Centralidade de grau normalizada
         for d in range(1, 26):
             self.centrality[d] = np.sum(self.adj_matrix[d, 1:]) / 24.0
 
-        # Coeficiente de clustering
         for d in range(1, 26):
             neighbors = [n for n in range(1, 26) if n != d and self.adj_matrix[d, n] > 0.01]
             if len(neighbors) < 2:
@@ -182,10 +155,8 @@ class CooccurrenceGraph:
             self.clustering_coeff[d] = triangles / possible if possible > 0 else 0.0
 
     def get_graph_score(self, game):
-        """Score baseado em centralidade e clustering das dezenas escolhidas."""
         cent = np.mean([self.centrality[d] for d in game])
         clust = np.mean([self.clustering_coeff[d] for d in game])
-        # Favorece dezenas com clustering moderado (nem isoladas, nem hiper-conectadas)
         return 1.0 - abs(clust - 0.3) * 2.0
 
 
@@ -193,43 +164,28 @@ class CooccurrenceGraph:
 # DPP (DETERMINANTAL POINT PROCESS) PARA DIVERSIDADE
 # ============================================================
 class DPPRepair:
-    """
-    Seleciona subconjunto diverso usando DPP.
-    Substitui o repair arbitrário baseado em similaridade.
-    """
     @staticmethod
-    def select_diverse(candidates, n_select, feature_extractor, last_contest):
-        """
-        Seleciona n_select candidatos diversos via DPP.
-        """
+    def select_diverse(candidates, n_select):
         if len(candidates) <= n_select:
             return candidates
 
-        # Construir matriz de similaridade
         n = len(candidates)
         features = np.array([c.features for c in candidates])
-        # Normalizar
         features_norm = features / (np.linalg.norm(features, axis=1, keepdims=True) + 1e-10)
-        # Kernel de similaridade (RBF)
         dists = np.linalg.norm(features_norm[:, None, :] - features_norm[None, :, :], axis=2)
         sigma = np.median(dists) if np.median(dists) > 0 else 1.0
         S = np.exp(-dists**2 / (2 * sigma**2))
 
-        # Amostragem DPP gulosa
         selected_indices = []
         remaining = set(range(n))
 
-        # Primeiro: escolher o de maior score central
         first_idx = np.argmax([c.central_score for c in candidates])
         selected_indices.append(first_idx)
         remaining.remove(first_idx)
 
-        # Selecionar os demais por DPP
         for _ in range(n_select - 1):
-            if not remaining:
-                break
-            best_idx = None
-            best_det = -1
+            if not remaining: break
+            best_idx, best_det = None, -1
             for idx in remaining:
                 indices = selected_indices + [idx]
                 sub_S = S[np.ix_(indices, indices)]
@@ -238,8 +194,7 @@ class DPPRepair:
                 except:
                     det_val = 0
                 if det_val > best_det:
-                    best_det = det_val
-                    best_idx = idx
+                    best_det, best_idx = det_val, idx
             if best_idx is not None:
                 selected_indices.append(best_idx)
                 remaining.remove(best_idx)
@@ -382,7 +337,7 @@ class TemporalMarkovDetector:
 
 
 # ============================================================
-# EXTRATOR DE FEATURES (COM ANTI-FREQUÊNCIA + GRAFO)
+# EXTRATOR DE FEATURES
 # ============================================================
 class FeatureExtractor:
     def __init__(self, contests):
@@ -402,7 +357,6 @@ class FeatureExtractor:
         self.cooccurrence_graph = CooccurrenceGraph(contests)
         self._feature_cache = {}
         self._cache_max_size = 100000
-        self._percentile_refs = {idx: np.sort(raw_features[:, idx]) for idx in TEMPORAL_INDICES.values()}
 
     def _compute_global_freq(self):
         freq = Counter()
@@ -568,9 +522,9 @@ class FastGenerator:
 
 
 # ============================================================
-# OTIMIZADOR DE CARTEIRA v22 (BAYESIANO + DPP + GRAFO)
+# OTIMIZADOR DE CARTEIRA v23 (EQUILIBRADO)
 # ============================================================
-class PortfolioOptimizerV22:
+class PortfolioOptimizerV23:
     def __init__(self, contests):
         self.contests = contests
         self.extractor = FeatureExtractor(contests)
@@ -640,22 +594,15 @@ class PortfolioOptimizerV22:
         return synthetic
 
     def _bayesian_score(self, successes, trials):
-        """
-        Score Bayesiano Beta-Binomial.
-        Estima probabilidade posterior de outperform.
-        """
         alpha_post = BETA_PRIOR_ALPHA + successes
         beta_post = BETA_PRIOR_BETA + (trials - successes)
-        # Média da distribuição Beta posterior
-        posterior_mean = alpha_post / (alpha_post + beta_post)
-        return posterior_mean
+        return alpha_post / (alpha_post + beta_post)
 
     def _monte_carlo_hybrid(self, portfolio_candidates, n_simulations=500):
         cache_key = tuple(tuple(sorted(c.game)) for c in portfolio_candidates)
         if cache_key in self._mc_cache: return self._mc_cache[cache_key]
 
         recent_f = self.feature_matrix[-20:] if len(self.feature_matrix)>=20 else self.feature_matrix
-        # Vetorização de distâncias
         dists = np.linalg.norm(self.historical_features[:, None, :] - recent_f[None, :, :], axis=2)
         avg_dists = np.mean(dists, axis=1)
         weights = np.exp(-avg_dists/2.0); weights /= weights.sum()
@@ -668,26 +615,16 @@ class PortfolioOptimizerV22:
         all_masks = np.concatenate([hist_masks, synth_masks])
         portfolio_masks = np.array([c.mask for c in portfolio_candidates], dtype=np.uint32)
 
-        # VETORIZAÇÃO: calcular hits via broadcasting
-        hits_matrix = np.zeros((len(portfolio_masks), len(all_masks)), dtype=np.int32)
-        for i, pm in enumerate(portfolio_masks):
-            for j, dm in enumerate(all_masks):
-                hits_matrix[i, j] = (pm & dm).bit_count()
-
-        # Calcular score bayesiano
+        # VETORIZAÇÃO
         total_weighted_score = 0.0
         for j in range(len(all_masks)):
-            draw_hits = hits_matrix[:, j]
-            # Contar quantos jogos tiveram cada nível de acerto
-            for hits in range(13, 16):
-                count = np.sum(draw_hits >= hits)
-                if count > 0:
-                    total_weighted_score += count * EXPONENTIAL_WEIGHTS[hits]
+            dm = all_masks[j]
+            for i, pm in enumerate(portfolio_masks):
+                hits = (pm & dm).bit_count()
+                if hits >= 13:  # Apenas 13+ têm peso positivo
+                    total_weighted_score += EXPONENTIAL_WEIGHTS.get(hits, 0)
 
         avg_score = total_weighted_score / len(all_masks)
-
-        # Score Bayesiano: média posterior
-        # Converter avg_score para "sucessos" proporcionais
         max_possible = EXPONENTIAL_WEIGHTS[15] * len(portfolio_candidates)
         success_rate = avg_score / max_possible if max_possible > 0 else 0
         bayesian_score = self._bayesian_score(
@@ -740,10 +677,11 @@ class PortfolioOptimizerV22:
         return candidate
 
     def optimize(self, n_games=10, n_candidates=50000, iterations=100):
-        n_central = max(1, int(n_games*0.5))
-        n_extreme = n_games - n_central
+        n_central = max(1, int(n_games*0.6))    # 60% centrais
+        n_extreme = n_games - n_central           # 40% extremos
         print(f"   Portfólio adversarial: {n_central} centrais + {n_extreme} extremos")
-        print(f"   MC Híbrido + Score Bayesiano | Pesos suavizados: {EXPONENTIAL_WEIGHTS}")
+        print(f"   Pesos suavizados: 13:{EXPONENTIAL_WEIGHTS[13]} 14:{EXPONENTIAL_WEIGHTS[14]} 15:{EXPONENTIAL_WEIGHTS[15]}")
+        print(f"   Anti-freq: {ANTI_FREQ_WEIGHT} | Score Bayesiano | DPP diversity")
 
         # FASE 1: Geração
         raw_pool, seen = [], set()
@@ -758,7 +696,7 @@ class PortfolioOptimizerV22:
         candidates = [self._create_candidate(g) for g in tqdm(top_pool, desc="Fase 2")]
 
         # Centrais via DPP
-        central_candidates = DPPRepair.select_diverse(candidates, n_central, self.extractor, self.last)
+        central_candidates = DPPRepair.select_diverse(candidates, n_central)
 
         # Extremos (anti-centrais)
         central_masks = [c.mask for c in central_candidates]
@@ -803,6 +741,7 @@ class PortfolioOptimizerV22:
         return [c.game for c in best_portfolio], best_score
 
     def backtest(self, portfolio, test_draws):
+        """Backtest: contabiliza >=11 para o usuário final."""
         n_success, total_premio = 0, 0.0
         total_custo = len(portfolio)*len(test_draws)*CUSTO_APOSTA
         portfolio_masks = np.array([BITMASK_CACHE.get_mask(g) for g in portfolio], dtype=np.uint32)
@@ -832,7 +771,7 @@ def walk_forward_validation(contests, n_windows=10, train_size=500, test_size=50
         if train_start >= train_end or test_start >= test_end: continue
         train_data, test_data = contests[train_start:train_end], contests[test_start:test_end]
         if len(train_data) < 100 or len(test_data) < 5: continue
-        opt = PortfolioOptimizerV22(train_data)
+        opt = PortfolioOptimizerV23(train_data)
         portfolio, _ = opt.optimize(n_games, n_candidates=50000, iterations=50)
         bt = opt.backtest(portfolio, test_data)
         bt_rand = opt.backtest([opt.generator.generate_pure_random() for _ in range(n_games)], test_data)
@@ -851,18 +790,18 @@ def walk_forward_validation(contests, n_windows=10, train_size=500, test_size=50
 # ============================================================
 def main():
     print("="*70)
-    print("🧬 GERADOR DE CARTEIRA v22 - BAYESIANO + DPP + GRAFO")
+    print("🧬 GERADOR DE CARTEIRA v23 - EQUILIBRADO")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if contests is None: print("❌ Arquivo não encontrado."); return
     print(f"\n📂 {len(contests)} concursos")
     print(f"📌 Último: {contests[-1]['concurso']} - {contests[-1]['dezenas']}")
     print(f"\n📊 Pesos suavizados: 13:{EXPONENTIAL_WEIGHTS[13]} 14:{EXPONENTIAL_WEIGHTS[14]} 15:{EXPONENTIAL_WEIGHTS[15]}")
-    print(f"   Score Bayesiano (Beta-Binomial) | DPP diversity | Grafo coocorrência")
+    print(f"   Portfólio: 60% centrais + 40% extremos | Anti-freq: {ANTI_FREQ_WEIGHT}")
     print("Opções: 1. Gerar carteira | 2. Walk-forward | 3. Ambos")
     op = input("Escolha [3]: ").strip() or "3"
     if op in ("1", "3"):
-        t0 = time.time(); opt = PortfolioOptimizerV22(contests)
+        t0 = time.time(); opt = PortfolioOptimizerV23(contests)
         print(f"   ✅ Init {time.time()-t0:.1f}s")
         portfolio, _ = opt.optimize(10, 50000, 100)
         last = contests[-1]['dezenas']
