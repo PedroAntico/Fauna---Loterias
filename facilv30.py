@@ -107,8 +107,8 @@ class BitmaskCache:
 
 # Cache global de bitmask
 BITMASK_CACHE = BitmaskCache()
-    def mask_intersection(mask1, mask2):
-        return (mask1 & mask2).bit_count()
+def mask_intersection(mask1, mask2):
+    return (mask1 & mask2).bit_count()
 
 # ============================================================
 # CARREGAMENTO DE DADOS
