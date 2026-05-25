@@ -2,20 +2,19 @@
 # -*- coding: utf-8 -*-
 
 """
-GERADOR PARAMÉTRICO DE CARTEIRA - LOTOFÁCIL v26 (CAUDA ALINHADA)
-==================================================================
-ALINHAMENTO FILOSÓFICO COMPLETO:
-
-✅ MC com pesos INVERTIDOS (favorece draws DISTANTES do regime recente)
-✅ Central score = RARITY puro (sem structural score domesticador)
-✅ Métricas de distribuição de hits por faixa (11,12,13,14,15)
-✅ Gerador SOLTO (sem viés de repetição, sem penalizar consecutivos)
+GERADOR PARAMÉTRICO DE CARTEIRA - LOTOFÁCIL v27 (RARIDADE MULTIVARIADA)
+==========================================================================
+LIÇÕES DO v25/v26:
+✅ Rarity score MULTIVARIADO (Mahalanobis) - não univariado
+✅ Penalidade de colapso estrutural (consecutivos, clusterização)
+✅ KL Divergence para sanity check (distribuição gerada vs histórica)
+✅ PCA para embeddings temporais (detecção de estados raros)
+✅ MC com pesos INVERTIDOS (favorece draws distantes)
+✅ Gerador mais solto, mas COM limite de consecutivos (6)
 ✅ Carteira CONCENTRADA (5-6 jogos)
 ✅ Pesos ultra-agressivos: 13:0.2, 14:5000, 15:300000
-✅ SEM repair, SEM anti-frequência, SEM Markov, SEM DPP
-✅ Mistura de 3-4 concursos para sintéticos
-✅ 50% histórico + 50% sintético no MC
 ✅ BitmaskCache + GameCandidate + vetorização mantidos
+✅ Mistura de 3-4 concursos para sintéticos (50% MC)
 """
 
 import numpy as np
@@ -33,7 +32,9 @@ import time
 warnings.filterwarnings('ignore')
 
 try:
+    from sklearn.covariance import LedoitWolf
     from sklearn.preprocessing import StandardScaler
+    from sklearn.decomposition import PCA
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
@@ -58,8 +59,12 @@ FEATURE_NAMES = [
     "pares", "primos", "moldura", "soma", "amplitude",
     "compressao",
 ]
+N_FEATURES = len(FEATURE_NAMES)
 
-# Constraints ESTRUTURAIS bem mais soltas
+# Constraints ESTRUTURAIS (com limites de colapso)
+MAX_CONSECUTIVOS_RUN = 6  # Impede exploits de superclusterização
+MAX_CLUSTERIZACAO = 0.95  # Limite superior para gaps pequenos
+
 STRUCTURAL_TARGETS = {
     'pares': (7.5, 2.5, 1.0),
     'primos': (5.0, 2.5, 1.0),
@@ -69,10 +74,10 @@ STRUCTURAL_TARGETS = {
     'consecutivos': (5.5, 4.0, 0.2),
     'amplitude': (22.0, 5.0, 0.3),
 }
-STRUCTURAL_REJECT_THRESHOLD = 15  # bem mais permissivo
+STRUCTURAL_REJECT_THRESHOLD = 15
 
-MAX_PAIR_COVERAGE = 0.75  # permite mais concentração
-MIN_GEO_DIVERSITY = 0.25  # aceita carteiras concentradas
+MAX_PAIR_COVERAGE = 0.75
+MIN_GEO_DIVERSITY = 0.25
 MAX_GEO_DIVERSITY = 0.85
 
 # Pesos ULTRA-AGRESSIVOS
@@ -84,13 +89,6 @@ EXPONENTIAL_WEIGHTS = {
     15: 300000.0,
 }
 
-# Features temporais (usadas para rarity score)
-TEMPORAL_FEATURES = ['moldura', 'amplitude', 'energia_jogo', 'densidade_local', 'clusterizacao']
-TEMPORAL_INDICES = {
-    'moldura': 14, 'amplitude': 16, 'energia_jogo': 4,
-    'densidade_local': 8, 'clusterizacao': 10
-}
-
 
 # ============================================================
 # UTILITÁRIOS BITMASK
@@ -98,6 +96,7 @@ TEMPORAL_INDICES = {
 class BitmaskCache:
     def __init__(self):
         self._cache = {}
+
     def get_mask(self, game):
         key = tuple(game) if isinstance(game, list) else game
         if key not in self._cache:
@@ -105,6 +104,7 @@ class BitmaskCache:
             for d in key: mask |= (1 << d)
             self._cache[key] = mask
         return self._cache[key]
+
 
 BITMASK_CACHE = BitmaskCache()
 def mask_intersection(m1, m2): return (m1 & m2).bit_count()
@@ -139,7 +139,7 @@ def load_all_contests(csv_file='resultados_lotofacil.csv'):
 
 
 # ============================================================
-# EXTRATOR DE FEATURES (SIMPLIFICADO)
+# EXTRATOR DE FEATURES + MODELO MULTIVARIADO
 # ============================================================
 class FeatureExtractor:
     def __init__(self, contests):
@@ -154,7 +154,9 @@ class FeatureExtractor:
         self.feature_means = np.mean(raw_features, axis=0)
         self.feature_stds = np.std(raw_features, axis=0) + 1e-10
         self._feature_cache = {}
-        self._percentile_refs = {idx: np.sort(raw_features[:, idx]) for idx in TEMPORAL_INDICES.values()}
+
+        # MODELO MULTIVARIADO (Mahalanobis + PCA)
+        self._build_multivariate_model(raw_features)
 
     def _build_raw_feature_matrix(self):
         features_list = []
@@ -185,11 +187,76 @@ class FeatureExtractor:
             float(sum(1 for x in d if x in MOLDURA)), float(sum(d)), float(max(d)-min(d)), compressao,
         ], dtype=np.float64)
 
+    def _build_multivariate_model(self, raw_features):
+        """Constrói modelo de Mahalanobis (LedoitWolf) e PCA."""
+        # LedoitWolf para matriz de precisão robusta
+        if SKLEARN_AVAILABLE and len(raw_features) > N_FEATURES:
+            try:
+                lw = LedoitWolf().fit(raw_features)
+                self.precision_matrix = lw.precision_
+                self.cov_matrix = lw.covariance_
+                self._has_precision = True
+            except:
+                cov = np.cov(raw_features.T) + np.eye(N_FEATURES) * 1e-6
+                self.precision_matrix = np.linalg.inv(cov)
+                self.cov_matrix = cov
+                self._has_precision = True
+        else:
+            cov = np.cov(raw_features.T) + np.eye(N_FEATURES) * 1e-6
+            self.precision_matrix = np.linalg.inv(cov)
+            self.cov_matrix = cov
+            self._has_precision = True
+        self._mean_vector = np.mean(raw_features, axis=0)
+
+        # PCA para embeddings temporais
+        if SKLEARN_AVAILABLE and len(raw_features) > 10:
+            try:
+                self.pca = PCA(n_components=min(5, N_FEATURES))
+                self.pca.fit(raw_features)
+                self._has_pca = True
+            except:
+                self._has_pca = False
+        else:
+            self._has_pca = False
+
+        # Pré-computar Mahalanobis de todos os históricos
+        self.historical_mahalanobis = np.array([
+            self.mahalanobis_distance(f) for f in raw_features
+        ])
+
+    def mahalanobis_distance(self, features):
+        """Distância de Mahalanobis multivariada (raridade REAL)."""
+        diff = features - self._mean_vector
+        try:
+            dist_sq = np.dot(np.dot(diff.T, self.precision_matrix), diff)
+            return float(np.sqrt(max(0, dist_sq)))
+        except:
+            return float(np.linalg.norm(diff / (np.std(self.historical_mahalanobis) + 1e-10)))
+
+    def compute_rarity_score(self, game, all_features=None):
+        """
+        RARITY SCORE MULTIVARIADO: baseado na distância de Mahalanobis.
+        Normalizado 0-1 usando percentis históricos.
+        """
+        features = self.extract_features(game, None)
+        dist = self.mahalanobis_distance(features)
+        # Percentil da distância em relação ao histórico
+        percentile = np.mean(self.historical_mahalanobis <= dist)
+        return float(percentile)
+
+    def compute_pca_embedding(self, features):
+        """Embedding PCA para detecção de estados raros."""
+        if self._has_pca:
+            return self.pca.transform(features.reshape(1, -1)).flatten()
+        return features[:5] if len(features) >= 5 else features
+
     def extract_features(self, game, last_contest=None):
         key = (tuple(sorted(game)), tuple(last_contest) if last_contest else None)
         if key not in self._feature_cache:
             raw = self._extract_raw(game, last_contest)
-            self._feature_cache[key] = (self.scaler.transform(raw.reshape(1, -1)).flatten() if self.scaler is not None else (raw - self.feature_means) / self.feature_stds)
+            self._feature_cache[key] = (self.scaler.transform(raw.reshape(1, -1)).flatten()
+                                        if self.scaler is not None
+                                        else (raw - self.feature_means) / self.feature_stds)
         return self._feature_cache[key]
 
     def build_feature_matrix(self):
@@ -210,40 +277,59 @@ class FeatureExtractor:
             if name in actuals:
                 dev = abs(actuals[name]-target)
                 if dev > tol: penalty += (dev - tol) * w
+        # PENALIDADE DE COLAPSO ESTRUTURAL
+        max_run = 1; run = 1
+        for i in range(len(d)-1):
+            if d[i+1]-d[i]==1: run+=1; max_run=max(max_run,run)
+            else: run=1
+        if max_run > MAX_CONSECUTIVOS_RUN:
+            penalty += (max_run - MAX_CONSECUTIVOS_RUN) * 5.0
+        gaps = [d[i+1]-d[i] for i in range(len(d)-1)]
+        clusterizacao = sum(1 for g in gaps if g <= 2) / len(gaps)
+        if clusterizacao > MAX_CLUSTERIZACAO:
+            penalty += (clusterizacao - MAX_CLUSTERIZACAO) * 10.0
         return penalty
 
     def is_structurally_valid(self, game):
         return self.compute_structural_penalty(game) < STRUCTURAL_REJECT_THRESHOLD
 
-    def compute_rarity_score(self, game, all_features, recent_window=20):
+    def compute_kl_divergence(self, generated_features, n_bins=10):
         """
-        RARITY SCORE: premia jogos nas CAUDAS da distribuição recente.
-        0 = muito típico, 1 = muito raro/extremo.
+        KL Divergence entre distribuição gerada e histórica.
+        Sanity check para detectar degeneração.
         """
-        game_feats = self.extract_features(game, None)
-        rarity = 0.0
-        total = 0.0
-        for name, idx in TEMPORAL_INDICES.items():
-            val = game_feats[idx]
-            recent = all_features[-recent_window:, idx] if len(all_features)>=recent_window else all_features[:, idx]
-            percentile = np.mean(recent <= val)
-            rarity += abs(percentile - 0.5) * 2
-            total += 1.0
-        return rarity / total if total > 0 else 0.5
+        hist_features = self._build_raw_feature_matrix()
+        kl_total = 0.0
+        for i in range(min(N_FEATURES, generated_features.shape[1])):
+            hist_vals = hist_features[:, i]
+            gen_vals = generated_features[:, i]
+            try:
+                bins = np.linspace(min(hist_vals.min(), gen_vals.min()),
+                                   max(hist_vals.max(), gen_vals.max()), n_bins+1)
+                hist_hist, _ = np.histogram(hist_vals, bins=bins, density=True)
+                gen_hist, _ = np.histogram(gen_vals, bins=bins, density=True)
+                hist_hist = np.where(hist_hist>0, hist_hist, 1e-10)
+                gen_hist = np.where(gen_hist>0, gen_hist, 1e-10)
+                kl = np.sum(gen_hist * np.log(gen_hist / hist_hist))
+                kl_total += kl
+            except:
+                pass
+        return kl_total
 
 
 # ============================================================
 # GAMECANDIDATE
 # ============================================================
 class GameCandidate:
-    __slots__ = ('game', 'mask', 'features', 'rarity_score', 'central_score')
-    def __init__(self, game, mask, features, rarity_score=0, central_score=0):
+    __slots__ = ('game', 'mask', 'features', 'rarity_score', 'central_score', 'mahalanobis_dist')
+    def __init__(self, game, mask, features, rarity_score=0, central_score=0, mahalanobis_dist=0):
         self.game = game; self.mask = mask; self.features = features
         self.rarity_score = rarity_score; self.central_score = central_score
+        self.mahalanobis_dist = mahalanobis_dist
 
 
 # ============================================================
-# GERADOR SOLTO
+# GERADOR (MAIS SOLTO, MAS COM LIMITE DE CONSECUTIVOS)
 # ============================================================
 class LooseGenerator:
     def __init__(self, extractor=None):
@@ -257,7 +343,6 @@ class LooseGenerator:
         return self._generate_raw()
 
     def _generate_raw(self):
-        """Geração SOLTA: sem viés de repetição, sem penalizar consecutivos."""
         game = set()
         available = set(range(1, 26))
         while len(game) < 15 and available:
@@ -266,6 +351,14 @@ class LooseGenerator:
             for d in candidates:
                 test = game | {d}
                 s = len(set((x-1)//5 for x in test)) * 2
+                # Penalidade LEVE para runs excessivos
+                st = sorted(test)
+                run = 1; max_run = 1
+                for i in range(len(st)-1):
+                    if st[i+1]-st[i]==1: run+=1; max_run=max(max_run,run)
+                    else: run=1
+                if max_run > MAX_CONSECUTIVOS_RUN:
+                    s -= (max_run - MAX_CONSECUTIVOS_RUN) * 3
                 scores.append(s)
             if scores:
                 scores = np.array(scores, dtype=np.float64); scores -= np.max(scores)
@@ -281,9 +374,9 @@ class LooseGenerator:
 
 
 # ============================================================
-# OTIMIZADOR v26 (CAUDA ALINHADA)
+# OTIMIZADOR v27 (RARIDADE MULTIVARIADA)
 # ============================================================
-class PortfolioOptimizerV26:
+class PortfolioOptimizerV27:
     def __init__(self, contests):
         self.contests = contests
         self.extractor = FeatureExtractor(contests)
@@ -303,9 +396,9 @@ class PortfolioOptimizerV26:
     def _create_candidate(self, game):
         mask = BITMASK_CACHE.get_mask(game)
         features = self.extractor.extract_features(game, self.last)
-        rarity = self.extractor.compute_rarity_score(game, self.feature_matrix)
-        # CENTRAL = RARITY PURO (sem structural score domesticador)
-        return GameCandidate(game, mask, features, rarity, rarity)
+        rarity = self.extractor.compute_rarity_score(game)
+        mahalanobis = self.extractor.mahalanobis_distance(features)
+        return GameCandidate(game, mask, features, rarity, rarity, mahalanobis)
 
     def _pair_coverage(self, portfolio):
         covered = set()
@@ -328,10 +421,9 @@ class PortfolioOptimizerV26:
         if len(portfolio) < 2: return 0.5
         fvs = np.array([c.features for c in portfolio])
         dists = [np.linalg.norm(fvs[i]-fvs[j]) for i in range(len(fvs)) for j in range(i+1, len(fvs))]
-        return np.mean(dists)/(2*np.sqrt(len(FEATURE_NAMES))) if dists else 0
+        return np.mean(dists)/(2*np.sqrt(N_FEATURES)) if dists else 0
 
     def _generate_synthetic_draws(self, n_synthetic):
-        """Mistura AGRESSIVA de 3-4 concursos."""
         synthetic = []
         for _ in range(n_synthetic):
             sources = random.sample(self.historical_draws, random.randint(3, 4))
@@ -346,22 +438,15 @@ class PortfolioOptimizerV26:
         return synthetic
 
     def _monte_carlo_hybrid(self, portfolio_candidates, n_simulations=500):
-        """
-        MC com pesos INVERTIDOS: favorece draws DISTANTES do regime recente.
-        Finalmente alinhado com a filosofia de cauda.
-        """
         cache_key = tuple(tuple(sorted(c.game)) for c in portfolio_candidates)
         if cache_key in self._mc_cache: return self._mc_cache[cache_key]
 
         recent_f = self.feature_matrix[-20:] if len(self.feature_matrix)>=20 else self.feature_matrix
         dists = np.linalg.norm(self.historical_features[:, None, :] - recent_f[None, :, :], axis=2)
         avg_dists = np.mean(dists, axis=1)
-        # INVERTIDO: pesos maiores para draws MAIS DISTANTES
-        weights = avg_dists**2 + 1e-6
-        weights /= weights.sum()
+        weights = avg_dists**2 + 1e-6; weights /= weights.sum()
 
-        n_hist = int(n_simulations*0.5)
-        n_synth = n_simulations - n_hist
+        n_hist = int(n_simulations*0.5); n_synth = n_simulations - n_hist
         hist_indices = np.random.choice(len(self.historical_masks), size=n_hist, p=weights)
         hist_masks = self.historical_masks[hist_indices]
         synthetic_draws = self._generate_synthetic_draws(n_synth)
@@ -424,11 +509,10 @@ class PortfolioOptimizerV26:
 
     def optimize(self, n_games=5, n_candidates=50000, iterations=100):
         print(f"   Carteira CONCENTRADA: {n_games} jogos")
-        print(f"   MC com pesos INVERTIDOS (favorece distantes)")
-        print(f"   Central = RARITY puro (sem structural)")
+        print(f"   Rarity MULTIVARIADO (Mahalanobis)")
+        print(f"   MC com pesos INVERTIDOS | Limites anti-colapso")
         print(f"   Pesos: 13:{EXPONENTIAL_WEIGHTS[13]} 14:{EXPONENTIAL_WEIGHTS[14]} 15:{EXPONENTIAL_WEIGHTS[15]}")
 
-        # FASE 1: Geração
         raw_pool, seen = [], set()
         for _ in tqdm(range(n_candidates), desc="Fase 1"):
             game = self.generator.generate_one()
@@ -436,24 +520,18 @@ class PortfolioOptimizerV26:
             if key not in seen and self.extractor.is_structurally_valid(game):
                 seen.add(key); raw_pool.append(game)
 
-        # FASE 2: Pré-computação
         top_pool = random.sample(raw_pool, min(5000, len(raw_pool)))
         candidates = [self._create_candidate(g) for g in tqdm(top_pool, desc="Fase 2")]
-
-        # Ordenar por central_score (rarity puro)
         candidates.sort(key=lambda c: c.central_score, reverse=True)
 
-        # Selecionar os MELHORES (sem separação, sem repair)
         portfolio, portfolio_masks = [], []
         for c in candidates:
             if len(portfolio) >= n_games: break
-            if portfolio_masks and max(mask_intersection(c.mask, pm) for pm in portfolio_masks) > 10:
-                continue
+            if portfolio_masks and max(mask_intersection(c.mask, pm) for pm in portfolio_masks) > 10: continue
             portfolio.append(c); portfolio_masks.append(c.mask)
 
         best_portfolio, best_score = list(portfolio), self._portfolio_score(portfolio)
 
-        # Simulated Annealing
         elite_pool = candidates[:len(candidates)//4]
         for it in tqdm(range(iterations), desc="Annealing"):
             temp = 1.0 * (0.95**it)
@@ -475,32 +553,23 @@ class PortfolioOptimizerV26:
         return [c.game for c in best_portfolio], best_score
 
     def backtest(self, portfolio, test_draws):
-        """Backtest com distribuição de hits por faixa."""
         n_success, total_premio = 0, 0.0
         total_custo = len(portfolio)*len(test_draws)*CUSTO_APOSTA
         portfolio_masks = np.array([BITMASK_CACHE.get_mask(g) for g in portfolio], dtype=np.uint32)
         hit_counts = {k: 0 for k in range(11, 16)}
-
         for draw in test_draws:
             draw_mask = BITMASK_CACHE.get_mask(draw['dezenas'])
             for pm in portfolio_masks:
                 hits = mask_intersection(pm, draw_mask)
-                if hits >= 11:
-                    n_success += 1
-                    total_premio += PREMIO_VALORES.get(hits, 0)
-                    hit_counts[hits] += 1
-
+                if hits >= 11: n_success += 1; total_premio += PREMIO_VALORES.get(hits, 0); hit_counts[hits] += 1
         prob = n_success/(len(portfolio)*len(test_draws)) if len(test_draws)>0 else 0
         p_single = sum(HYPE_PROBS[k] for k in range(11,16))
         theo_prob = 1 - (1-p_single)**len(portfolio)
-        return {
-            'empirical': prob, 'theoretical': theo_prob,
-            'lift': prob/theo_prob if theo_prob>0 else 1.0,
-            'n_test': len(test_draws), 'n_success': n_success,
-            'total_premio': total_premio, 'total_custo': total_custo,
-            'roi': (total_premio-total_custo)/total_custo*100 if total_custo>0 else 0,
-            'hit_distribution': hit_counts,
-        }
+        return {'empirical': prob, 'theoretical': theo_prob, 'lift': prob/theo_prob if theo_prob>0 else 1.0,
+                'n_test': len(test_draws), 'n_success': n_success,
+                'total_premio': total_premio, 'total_custo': total_custo,
+                'roi': (total_premio-total_custo)/total_custo*100 if total_custo>0 else 0,
+                'hit_distribution': hit_counts}
 
 
 # ============================================================
@@ -515,17 +584,13 @@ def walk_forward_validation(contests, n_windows=10, train_size=500, test_size=50
         if train_start >= train_end or test_start >= test_end: continue
         train_data, test_data = contests[train_start:train_end], contests[test_start:test_end]
         if len(train_data) < 100 or len(test_data) < 5: continue
-        opt = PortfolioOptimizerV26(train_data)
+        opt = PortfolioOptimizerV27(train_data)
         portfolio, _ = opt.optimize(n_games, n_candidates=50000, iterations=50)
         bt = opt.backtest(portfolio, test_data)
         bt_rand = opt.backtest([opt.generator.generate_pure_random() for _ in range(n_games)], test_data)
-        # Comparar distribuição de hits
         results.append({
-            'window': w,
-            'diff_lift': bt['lift']-bt_rand['lift'],
-            'diff_roi': bt['roi']-bt_rand['roi'],
-            'strat_14': bt['hit_distribution'].get(14, 0),
-            'rand_14': bt_rand['hit_distribution'].get(14, 0),
+            'window': w, 'diff_lift': bt['lift']-bt_rand['lift'], 'diff_roi': bt['roi']-bt_rand['roi'],
+            'strat_14': bt['hit_distribution'].get(14,0), 'rand_14': bt_rand['hit_distribution'].get(14,0),
         })
         print(f" Janela {w}: diff_lift={bt['lift']-bt_rand['lift']:+.3f} "
               f"14pts: {bt['hit_distribution'].get(14,0)} vs {bt_rand['hit_distribution'].get(14,0)}")
@@ -546,35 +611,38 @@ def walk_forward_validation(contests, n_windows=10, train_size=500, test_size=50
 # ============================================================
 def main():
     print("="*70)
-    print("🧬 GERADOR DE CARTEIRA v26 - CAUDA ALINHADA")
+    print("🧬 GERADOR DE CARTEIRA v27 - RARIDADE MULTIVARIADA (MAHALANOBIS)")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if contests is None: print("❌ Arquivo não encontrado."); return
     print(f"\n📂 {len(contests)} concursos")
     print(f"📌 Último: {contests[-1]['concurso']} - {contests[-1]['dezenas']}")
-    print(f"\n📊 MC INVERTIDO | Central = RARITY puro | Carteira CONCENTRADA")
+    print(f"\n📊 Mahalanobis + LedoitWolf | MC INVERTIDO | Anti-colapso")
     print(f"   Pesos: 13:{EXPONENTIAL_WEIGHTS[13]} 14:{EXPONENTIAL_WEIGHTS[14]} 15:{EXPONENTIAL_WEIGHTS[15]}")
     print("Opções: 1. Gerar carteira | 2. Walk-forward | 3. Ambos")
     op = input("Escolha [3]: ").strip() or "3"
     if op in ("1", "3"):
-        t0 = time.time(); opt = PortfolioOptimizerV26(contests)
+        t0 = time.time(); opt = PortfolioOptimizerV27(contests)
         print(f"   ✅ Init {time.time()-t0:.1f}s")
         portfolio, _ = opt.optimize(5, 50000, 100)
         last = contests[-1]['dezenas']
+        # Calcular KL Divergence
+        gen_features = np.array([opt.extractor.extract_features(g, last) for g in portfolio])
+        kl = opt.extractor.compute_kl_divergence(gen_features)
+        print(f"\n📊 KL Divergence (gerado vs histórico): {kl:.3f} (0=idêntico)")
         for i, g in enumerate(portfolio, 1):
             p = sum(1 for d in g if d%2==0); pr = sum(1 for d in g if d in PRIMES)
             m = sum(1 for d in g if d in MOLDURA); rep = len(set(g)&set(last))
             cons = sum(1 for j in range(len(g)-1) if g[j+1]-g[j]==1)
-            rarity = opt.extractor.compute_rarity_score(g, opt.feature_matrix)
-            print(f"   {i:2d}. {g} | P:{p} Pr:{pr} M:{m} Rep:{rep} Cons:{cons} Rarity:{rarity:.2f}")
+            rarity = opt.extractor.compute_rarity_score(g)
+            mahal = opt.extractor.mahalanobis_distance(opt.extractor.extract_features(g, last))
+            print(f"   {i:2d}. {g} | P:{p} Pr:{pr} M:{m} Rep:{rep} Cons:{cons} Rarity:{rarity:.2f} Mahal:{mahal:.1f}")
         if len(contests) > 200:
             bt = opt.backtest(portfolio, contests[-200:])
             print(f"\n🔬 BACKTEST: Lift={bt['lift']:.2f}x | ROI={bt['roi']:+.1f}%")
             print(f"   Distribuição: 11pts:{bt['hit_distribution'].get(11,0)} "
-                  f"12pts:{bt['hit_distribution'].get(12,0)} "
-                  f"13pts:{bt['hit_distribution'].get(13,0)} "
-                  f"14pts:{bt['hit_distribution'].get(14,0)} "
-                  f"15pts:{bt['hit_distribution'].get(15,0)}")
+                  f"12pts:{bt['hit_distribution'].get(12,0)} 13pts:{bt['hit_distribution'].get(13,0)} "
+                  f"14pts:{bt['hit_distribution'].get(14,0)} 15pts:{bt['hit_distribution'].get(15,0)}")
     if op in ("2", "3"): walk_forward_validation(contests, 10, 500, 50, 5)
     print("\n✅ Concluído!")
 
