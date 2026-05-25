@@ -2,19 +2,20 @@
 # -*- coding: utf-8 -*-
 
 """
-GERADOR PARAMÉTRICO DE CARTEIRA - LOTOFÁCIL v25 (EXPERIMENTAL - CAUDA EXTREMA)
-================================================================================
-HIPÓTESE: O edge está nas CAUDAS, não na média.
+GERADOR PARAMÉTRICO DE CARTEIRA - LOTOFÁCIL v26 (CAUDA ALINHADA)
+==================================================================
+ALINHAMENTO FILOSÓFICO COMPLETO:
 
-MUDANÇAS RADICAIS:
-✅ Fitness ultra-agressivo: 13:0.2, 14:5000, 15:300000
-✅ Rarity Score (premia extremos, pune medianos)
-✅ Temporal score INVERTIDO (foge da média recente)
-✅ SEM repair portfolio (deixa extremos sobreviverem)
-✅ Gerador mais solto (permite clusters, remove viés de repetição)
-✅ Carteira concentrada (5-6 jogos, não 10)
-✅ MC com 50% sintéticos e misturas agressivas
-✅ SEM anti-frequência, DPP, Markov, Grafo
+✅ MC com pesos INVERTIDOS (favorece draws DISTANTES do regime recente)
+✅ Central score = RARITY puro (sem structural score domesticador)
+✅ Métricas de distribuição de hits por faixa (11,12,13,14,15)
+✅ Gerador SOLTO (sem viés de repetição, sem penalizar consecutivos)
+✅ Carteira CONCENTRADA (5-6 jogos)
+✅ Pesos ultra-agressivos: 13:0.2, 14:5000, 15:300000
+✅ SEM repair, SEM anti-frequência, SEM Markov, SEM DPP
+✅ Mistura de 3-4 concursos para sintéticos
+✅ 50% histórico + 50% sintético no MC
+✅ BitmaskCache + GameCandidate + vetorização mantidos
 """
 
 import numpy as np
@@ -58,20 +59,21 @@ FEATURE_NAMES = [
     "compressao",
 ]
 
+# Constraints ESTRUTURAIS bem mais soltas
 STRUCTURAL_TARGETS = {
-    'pares': (7.5, 2.0, 1.5),      # Tolerância MAIOR, peso MENOR
-    'primos': (5.0, 2.0, 1.5),
-    'moldura': (9.5, 2.0, 1.0),
-    'repeticoes': (9.0, 2.0, 1.0),
-    'soma': (195.0, 25.0, 0.5),     # Mais flexível
-    'consecutivos': (5.5, 3.0, 0.5), # Aceita mais consecutivos
-    'amplitude': (22.0, 4.0, 0.5),
+    'pares': (7.5, 2.5, 1.0),
+    'primos': (5.0, 2.5, 1.0),
+    'moldura': (9.5, 2.5, 0.5),
+    'repeticoes': (9.0, 3.0, 0.5),
+    'soma': (195.0, 30.0, 0.3),
+    'consecutivos': (5.5, 4.0, 0.2),
+    'amplitude': (22.0, 5.0, 0.3),
 }
-STRUCTURAL_REJECT_THRESHOLD = 12  # Mais permissivo
+STRUCTURAL_REJECT_THRESHOLD = 15  # bem mais permissivo
 
-MAX_PAIR_COVERAGE = 0.80  # Permite mais concentração
-MIN_GEO_DIVERSITY = 0.30  # Aceita carteiras mais concentradas
-MAX_GEO_DIVERSITY = 0.80
+MAX_PAIR_COVERAGE = 0.75  # permite mais concentração
+MIN_GEO_DIVERSITY = 0.25  # aceita carteiras concentradas
+MAX_GEO_DIVERSITY = 0.85
 
 # Pesos ULTRA-AGRESSIVOS
 EXPONENTIAL_WEIGHTS = {
@@ -213,10 +215,6 @@ class FeatureExtractor:
     def is_structurally_valid(self, game):
         return self.compute_structural_penalty(game) < STRUCTURAL_REJECT_THRESHOLD
 
-    def compute_structural_score(self, game):
-        penalty = self.compute_structural_penalty(game)
-        return np.exp(-penalty / 4.0)
-
     def compute_rarity_score(self, game, all_features, recent_window=20):
         """
         RARITY SCORE: premia jogos nas CAUDAS da distribuição recente.
@@ -229,7 +227,6 @@ class FeatureExtractor:
             val = game_feats[idx]
             recent = all_features[-recent_window:, idx] if len(all_features)>=recent_window else all_features[:, idx]
             percentile = np.mean(recent <= val)
-            # INVERTIDO: extremos ganham score alto
             rarity += abs(percentile - 0.5) * 2
             total += 1.0
         return rarity / total if total > 0 else 0.5
@@ -239,15 +236,14 @@ class FeatureExtractor:
 # GAMECANDIDATE
 # ============================================================
 class GameCandidate:
-    __slots__ = ('game', 'mask', 'features', 'structural_score', 'central_score', 'rarity_score')
-    def __init__(self, game, mask, features, structural_score, central_score=0, rarity_score=0):
+    __slots__ = ('game', 'mask', 'features', 'rarity_score', 'central_score')
+    def __init__(self, game, mask, features, rarity_score=0, central_score=0):
         self.game = game; self.mask = mask; self.features = features
-        self.structural_score = structural_score; self.central_score = central_score
-        self.rarity_score = rarity_score
+        self.rarity_score = rarity_score; self.central_score = central_score
 
 
 # ============================================================
-# GERADOR SOLTO (SEM VIÉS DE REPETIÇÃO, ACEITA CLUSTERS)
+# GERADOR SOLTO
 # ============================================================
 class LooseGenerator:
     def __init__(self, extractor=None):
@@ -264,13 +260,12 @@ class LooseGenerator:
         """Geração SOLTA: sem viés de repetição, sem penalizar consecutivos."""
         game = set()
         available = set(range(1, 26))
-        # SEM viés de repetição do último concurso
         while len(game) < 15 and available:
             candidates = list(available)
             scores = []
             for d in candidates:
                 test = game | {d}
-                s = len(set((x-1)//5 for x in test)) * 2  # Apenas diversidade espacial leve
+                s = len(set((x-1)//5 for x in test)) * 2
                 scores.append(s)
             if scores:
                 scores = np.array(scores, dtype=np.float64); scores -= np.max(scores)
@@ -286,9 +281,9 @@ class LooseGenerator:
 
 
 # ============================================================
-# OTIMIZADOR v25 (CAUDA EXTREMA)
+# OTIMIZADOR v26 (CAUDA ALINHADA)
 # ============================================================
-class PortfolioOptimizerV25:
+class PortfolioOptimizerV26:
     def __init__(self, contests):
         self.contests = contests
         self.extractor = FeatureExtractor(contests)
@@ -308,11 +303,9 @@ class PortfolioOptimizerV25:
     def _create_candidate(self, game):
         mask = BITMASK_CACHE.get_mask(game)
         features = self.extractor.extract_features(game, self.last)
-        structural = self.extractor.compute_structural_score(game)
         rarity = self.extractor.compute_rarity_score(game, self.feature_matrix)
-        # Centralidade: structural + rarity (premia extremos)
-        central = structural * 0.35 + rarity * 0.65
-        return GameCandidate(game, mask, features, structural, central, rarity)
+        # CENTRAL = RARITY PURO (sem structural score domesticador)
+        return GameCandidate(game, mask, features, rarity, rarity)
 
     def _pair_coverage(self, portfolio):
         covered = set()
@@ -337,9 +330,6 @@ class PortfolioOptimizerV25:
         dists = [np.linalg.norm(fvs[i]-fvs[j]) for i in range(len(fvs)) for j in range(i+1, len(fvs))]
         return np.mean(dists)/(2*np.sqrt(len(FEATURE_NAMES))) if dists else 0
 
-    def _average_structural_score(self, portfolio):
-        return np.mean([c.structural_score for c in portfolio]) if portfolio else 0.5
-
     def _generate_synthetic_draws(self, n_synthetic):
         """Mistura AGRESSIVA de 3-4 concursos."""
         synthetic = []
@@ -356,15 +346,21 @@ class PortfolioOptimizerV25:
         return synthetic
 
     def _monte_carlo_hybrid(self, portfolio_candidates, n_simulations=500):
+        """
+        MC com pesos INVERTIDOS: favorece draws DISTANTES do regime recente.
+        Finalmente alinhado com a filosofia de cauda.
+        """
         cache_key = tuple(tuple(sorted(c.game)) for c in portfolio_candidates)
         if cache_key in self._mc_cache: return self._mc_cache[cache_key]
 
         recent_f = self.feature_matrix[-20:] if len(self.feature_matrix)>=20 else self.feature_matrix
         dists = np.linalg.norm(self.historical_features[:, None, :] - recent_f[None, :, :], axis=2)
         avg_dists = np.mean(dists, axis=1)
-        weights = np.exp(-avg_dists/2.0); weights /= weights.sum()
+        # INVERTIDO: pesos maiores para draws MAIS DISTANTES
+        weights = avg_dists**2 + 1e-6
+        weights /= weights.sum()
 
-        n_hist = int(n_simulations*0.5)  # 50% histórico, 50% sintético
+        n_hist = int(n_simulations*0.5)
         n_synth = n_simulations - n_hist
         hist_indices = np.random.choice(len(self.historical_masks), size=n_hist, p=weights)
         hist_masks = self.historical_masks[hist_indices]
@@ -413,13 +409,13 @@ class PortfolioOptimizerV25:
         if self._pair_coverage(portfolio) > MAX_PAIR_COVERAGE: return -1000.0
         if not (MIN_GEO_DIVERSITY <= self._geometric_diversity(portfolio) <= MAX_GEO_DIVERSITY): return -1000.0
         mc_score = self._monte_carlo_hybrid(portfolio)
-        structural = self._average_structural_score(portfolio)
-        return mc_score*0.60 + structural*0.15 + self._portfolio_diversity(portfolio)*0.15 + self._geometric_diversity(portfolio)*0.10
+        avg_rarity = np.mean([c.rarity_score for c in portfolio])
+        return mc_score*0.55 + avg_rarity*0.25 + self._portfolio_diversity(portfolio)*0.10 + self._geometric_diversity(portfolio)*0.10
 
     def _mutate_candidate(self, candidate):
         for _ in range(20):
             mutated = list(candidate.game)
-            for _ in range(random.randint(1, 4)):  # Mais agressivo
+            for _ in range(random.randint(1, 4)):
                 pos = random.randint(0,14); avail = [d for d in range(1,26) if d not in mutated]
                 if avail: mutated[pos] = random.choice(avail)
             mutated = sorted(mutated)[:15]
@@ -428,8 +424,9 @@ class PortfolioOptimizerV25:
 
     def optimize(self, n_games=5, n_candidates=50000, iterations=100):
         print(f"   Carteira CONCENTRADA: {n_games} jogos")
-        print(f"   Pesos ultra-agressivos: 13:{EXPONENTIAL_WEIGHTS[13]} 14:{EXPONENTIAL_WEIGHTS[14]} 15:{EXPONENTIAL_WEIGHTS[15]}")
-        print(f"   Rarity Score (premia extremos) | SEM repair | Gerador SOLTO")
+        print(f"   MC com pesos INVERTIDOS (favorece distantes)")
+        print(f"   Central = RARITY puro (sem structural)")
+        print(f"   Pesos: 13:{EXPONENTIAL_WEIGHTS[13]} 14:{EXPONENTIAL_WEIGHTS[14]} 15:{EXPONENTIAL_WEIGHTS[15]}")
 
         # FASE 1: Geração
         raw_pool, seen = [], set()
@@ -443,18 +440,16 @@ class PortfolioOptimizerV25:
         top_pool = random.sample(raw_pool, min(5000, len(raw_pool)))
         candidates = [self._create_candidate(g) for g in tqdm(top_pool, desc="Fase 2")]
 
-        # Ordenar por central_score (rarity + structural)
+        # Ordenar por central_score (rarity puro)
         candidates.sort(key=lambda c: c.central_score, reverse=True)
 
-        # Selecionar os MELHORES (sem separação por tipo, sem repair)
-        portfolio = []
-        portfolio_masks = []
+        # Selecionar os MELHORES (sem separação, sem repair)
+        portfolio, portfolio_masks = [], []
         for c in candidates:
             if len(portfolio) >= n_games: break
             if portfolio_masks and max(mask_intersection(c.mask, pm) for pm in portfolio_masks) > 10:
                 continue
-            portfolio.append(c)
-            portfolio_masks.append(c.mask)
+            portfolio.append(c); portfolio_masks.append(c.mask)
 
         best_portfolio, best_score = list(portfolio), self._portfolio_score(portfolio)
 
@@ -480,21 +475,32 @@ class PortfolioOptimizerV25:
         return [c.game for c in best_portfolio], best_score
 
     def backtest(self, portfolio, test_draws):
+        """Backtest com distribuição de hits por faixa."""
         n_success, total_premio = 0, 0.0
         total_custo = len(portfolio)*len(test_draws)*CUSTO_APOSTA
         portfolio_masks = np.array([BITMASK_CACHE.get_mask(g) for g in portfolio], dtype=np.uint32)
+        hit_counts = {k: 0 for k in range(11, 16)}
+
         for draw in test_draws:
             draw_mask = BITMASK_CACHE.get_mask(draw['dezenas'])
             for pm in portfolio_masks:
                 hits = mask_intersection(pm, draw_mask)
-                if hits >= 11: n_success += 1; total_premio += PREMIO_VALORES.get(hits, 0)
+                if hits >= 11:
+                    n_success += 1
+                    total_premio += PREMIO_VALORES.get(hits, 0)
+                    hit_counts[hits] += 1
+
         prob = n_success/(len(portfolio)*len(test_draws)) if len(test_draws)>0 else 0
         p_single = sum(HYPE_PROBS[k] for k in range(11,16))
         theo_prob = 1 - (1-p_single)**len(portfolio)
-        return {'empirical': prob, 'theoretical': theo_prob, 'lift': prob/theo_prob if theo_prob>0 else 1.0,
-                'n_test': len(test_draws), 'n_success': n_success,
-                'total_premio': total_premio, 'total_custo': total_custo,
-                'roi': (total_premio-total_custo)/total_custo*100 if total_custo>0 else 0}
+        return {
+            'empirical': prob, 'theoretical': theo_prob,
+            'lift': prob/theo_prob if theo_prob>0 else 1.0,
+            'n_test': len(test_draws), 'n_success': n_success,
+            'total_premio': total_premio, 'total_custo': total_custo,
+            'roi': (total_premio-total_custo)/total_custo*100 if total_custo>0 else 0,
+            'hit_distribution': hit_counts,
+        }
 
 
 # ============================================================
@@ -509,15 +515,27 @@ def walk_forward_validation(contests, n_windows=10, train_size=500, test_size=50
         if train_start >= train_end or test_start >= test_end: continue
         train_data, test_data = contests[train_start:train_end], contests[test_start:test_end]
         if len(train_data) < 100 or len(test_data) < 5: continue
-        opt = PortfolioOptimizerV25(train_data)
+        opt = PortfolioOptimizerV26(train_data)
         portfolio, _ = opt.optimize(n_games, n_candidates=50000, iterations=50)
         bt = opt.backtest(portfolio, test_data)
         bt_rand = opt.backtest([opt.generator.generate_pure_random() for _ in range(n_games)], test_data)
-        results.append({'window': w, 'diff_lift': bt['lift']-bt_rand['lift'], 'diff_roi': bt['roi']-bt_rand['roi']})
-        print(f" Janela {w}: diff_lift={bt['lift']-bt_rand['lift']:+.3f} diff_ROI={bt['roi']-bt_rand['roi']:+.1f}%")
+        # Comparar distribuição de hits
+        results.append({
+            'window': w,
+            'diff_lift': bt['lift']-bt_rand['lift'],
+            'diff_roi': bt['roi']-bt_rand['roi'],
+            'strat_14': bt['hit_distribution'].get(14, 0),
+            'rand_14': bt_rand['hit_distribution'].get(14, 0),
+        })
+        print(f" Janela {w}: diff_lift={bt['lift']-bt_rand['lift']:+.3f} "
+              f"14pts: {bt['hit_distribution'].get(14,0)} vs {bt_rand['hit_distribution'].get(14,0)}")
     if results:
         diffs = [r['diff_lift'] for r in results]
-        print(f"\n📊 Média diff lift: {np.mean(diffs):+.3f} | Janelas +: {sum(1 for d in diffs if d>0)}/{len(results)}")
+        strat_14_total = sum(r['strat_14'] for r in results)
+        rand_14_total = sum(r['rand_14'] for r in results)
+        print(f"\n📊 RESUMO:")
+        print(f"   Média diff lift: {np.mean(diffs):+.3f} | Janelas +: {sum(1 for d in diffs if d>0)}/{len(results)}")
+        print(f"   14pts total: Estratégia={strat_14_total} vs Aleatório={rand_14_total}")
         try: _, p = wilcoxon(diffs); print(f"   Wilcoxon p: {p:.4f}")
         except: pass
     return results
@@ -528,18 +546,18 @@ def walk_forward_validation(contests, n_windows=10, train_size=500, test_size=50
 # ============================================================
 def main():
     print("="*70)
-    print("🧬 GERADOR DE CARTEIRA v25 - CAUDA EXTREMA (EXPERIMENTAL)")
+    print("🧬 GERADOR DE CARTEIRA v26 - CAUDA ALINHADA")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if contests is None: print("❌ Arquivo não encontrado."); return
     print(f"\n📂 {len(contests)} concursos")
     print(f"📌 Último: {contests[-1]['concurso']} - {contests[-1]['dezenas']}")
-    print(f"\n📊 Pesos: 13:{EXPONENTIAL_WEIGHTS[13]} 14:{EXPONENTIAL_WEIGHTS[14]} 15:{EXPONENTIAL_WEIGHTS[15]}")
-    print(f"   Rarity Score | Gerador SOLTO | SEM repair | Carteira CONCENTRADA")
+    print(f"\n📊 MC INVERTIDO | Central = RARITY puro | Carteira CONCENTRADA")
+    print(f"   Pesos: 13:{EXPONENTIAL_WEIGHTS[13]} 14:{EXPONENTIAL_WEIGHTS[14]} 15:{EXPONENTIAL_WEIGHTS[15]}")
     print("Opções: 1. Gerar carteira | 2. Walk-forward | 3. Ambos")
     op = input("Escolha [3]: ").strip() or "3"
     if op in ("1", "3"):
-        t0 = time.time(); opt = PortfolioOptimizerV25(contests)
+        t0 = time.time(); opt = PortfolioOptimizerV26(contests)
         print(f"   ✅ Init {time.time()-t0:.1f}s")
         portfolio, _ = opt.optimize(5, 50000, 100)
         last = contests[-1]['dezenas']
@@ -547,10 +565,16 @@ def main():
             p = sum(1 for d in g if d%2==0); pr = sum(1 for d in g if d in PRIMES)
             m = sum(1 for d in g if d in MOLDURA); rep = len(set(g)&set(last))
             cons = sum(1 for j in range(len(g)-1) if g[j+1]-g[j]==1)
-            print(f"   {i:2d}. {g} | P:{p} Pr:{pr} M:{m} Rep:{rep} Cons:{cons}")
+            rarity = opt.extractor.compute_rarity_score(g, opt.feature_matrix)
+            print(f"   {i:2d}. {g} | P:{p} Pr:{pr} M:{m} Rep:{rep} Cons:{cons} Rarity:{rarity:.2f}")
         if len(contests) > 200:
             bt = opt.backtest(portfolio, contests[-200:])
             print(f"\n🔬 BACKTEST: Lift={bt['lift']:.2f}x | ROI={bt['roi']:+.1f}%")
+            print(f"   Distribuição: 11pts:{bt['hit_distribution'].get(11,0)} "
+                  f"12pts:{bt['hit_distribution'].get(12,0)} "
+                  f"13pts:{bt['hit_distribution'].get(13,0)} "
+                  f"14pts:{bt['hit_distribution'].get(14,0)} "
+                  f"15pts:{bt['hit_distribution'].get(15,0)}")
     if op in ("2", "3"): walk_forward_validation(contests, 10, 500, 50, 5)
     print("\n✅ Concluído!")
 
