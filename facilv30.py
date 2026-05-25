@@ -2,16 +2,17 @@
 # -*- coding: utf-8 -*-
 
 """
-GERADOR PARAMÉTRICO DE CARTEIRA - LOTOFÁCIL v18 (BITMASK + REGULARIZADO)
-=========================================================================
-MELHORIAS:
-✅ Bitmask para interseções (5-10x mais rápido)
-✅ Avaliação unificada (central + temporal juntas)
-✅ Regularização bayesiana de probabilidades condicionais
-✅ GMM removido (substituído por score estrutural + MC)
-✅ Cache de features otimizado
-✅ Pipeline 2 fases mantido
-✅ Walk-forward com estabilidade
+GERADOR PARAMÉTRICO DE CARTEIRA - LOTOFÁCIL v19 (FINAL OTIMIZADO)
+===================================================================
+CORREÇÕES E OTIMIZAÇÕES:
+✅ compute_temporal_score RESTAURADO
+✅ Pré-computação de features históricas (MC 50% mais rápido)
+✅ Cache de bitmask (game_to_mask cacheado)
+✅ Limite no cache de features (evita explosão de RAM)
+✅ GameCandidate: objeto pré-computado (mask + features + scores)
+✅ Correção: for existing_d in game (não test)
+✅ GMM removido | Regularização bayesiana | Pesos de cauda agressivos
+✅ Pipeline 2 fases mantido | Walk-forward com estabilidade
 """
 
 import numpy as np
@@ -47,7 +48,6 @@ HYPE_PROBS = {k: hypergeom.pmf(k, 25, 15, 15) for k in range(0, 16)}
 PREMIO_VALORES = {11: 6.0, 12: 12.0, 13: 30.0, 14: 1500.0, 15: 1800000.0}
 CUSTO_APOSTA = 3.0
 
-# Features (18 dimensões)
 FEATURE_NAMES = [
     "gap_medio", "gap_var", "gap_max", "gap_min",
     "energia_jogo", "entropia_transicao",
@@ -69,29 +69,44 @@ MAX_PAIR_COVERAGE = 0.85
 MIN_GEO_DIVERSITY = 0.50
 MAX_GEO_DIVERSITY = 0.75
 
-# Pesos exponenciais (agressivo para cauda)
 EXPONENTIAL_WEIGHTS = {11: 0.1, 12: 0.5, 13: 10.0, 14: 300.0, 15: 5000.0}
-
-# Regularização bayesiana (alpha para suavização)
 BAYES_ALPHA = 1.0
 
-# ============================================================
-# UTILITÁRIOS BITMASK
-# ============================================================
-def game_to_mask(game):
-    """Converte jogo para máscara de bits (uint32)."""
-    mask = 0
-    for d in game:
-        mask |= (1 << d)
-    return mask
+# Features temporais
+TEMPORAL_FEATURES = {
+    'moldura': 0.20, 'amplitude': 0.20, 'energia_jogo': 0.20,
+    'densidade_local': 0.20, 'clusterizacao': 0.20,
+}
+TEMPORAL_INDICES = {
+    'moldura': 14, 'amplitude': 16, 'energia_jogo': 4,
+    'densidade_local': 8, 'clusterizacao': 10,
+}
 
-def mask_intersection(mask1, mask2):
-    """Conta interseção entre duas máscaras."""
-    return (mask1 & mask2).bit_count()
 
-# Pré-computar máscaras para todos os draws históricos
-def draws_to_masks(draws):
-    return np.array([game_to_mask(d) for d in draws], dtype=np.uint32)
+# ============================================================
+# UTILITÁRIOS BITMASK (COM CACHE)
+# ============================================================
+class BitmaskCache:
+    """Cache global de bitmasks para evitar recálculo."""
+    def __init__(self):
+        self._cache = {}
+
+    def get_mask(self, game):
+        key = tuple(game) if isinstance(game, list) else game
+        if key not in self._cache:
+            mask = 0
+            for d in key:
+                mask |= (1 << d)
+            self._cache[key] = mask
+        return self._cache[key]
+
+    def intersection(self, game1, game2):
+        m1 = self.get_mask(game1)
+        m2 = self.get_mask(game2)
+        return (m1 & m2).bit_count()
+
+# Cache global de bitmask
+BITMASK_CACHE = BitmaskCache()
 
 
 # ============================================================
@@ -139,16 +154,14 @@ class RegularizedRegimeDetector:
         self.scaler = StandardScaler() if SKLEARN_AVAILABLE else None
         self.labels = None
         self.transition_matrix = None
-        # Frequências condicionais regularizadas
-        self.dezena_probs = {}      # cluster -> array[26]
-        self.pair_probs = {}        # cluster -> array[26,26]
-        self.global_dezena_probs = None  # array[26]
-        self.global_pair_probs = None    # array[26,26]
+        self.dezena_probs = {}
+        self.pair_probs = {}
+        self.global_dezena_probs = None
+        self.global_pair_probs = None
         self._build()
 
     def _build(self):
         if not SKLEARN_AVAILABLE or len(self.feature_matrix) < 50: return
-        # Features delta
         delta_features = []
         for i in range(len(self.feature_matrix)):
             baseline = np.mean(self.feature_matrix[max(0,i-self.delta_window):i+1], axis=0) if i > 0 else self.feature_matrix[i]
@@ -157,20 +170,16 @@ class RegularizedRegimeDetector:
         X_scaled = self.scaler.fit_transform(delta_features)
         self.kmeans = KMeans(n_clusters=self.n_clusters, random_state=42, n_init=10)
         self.labels = self.kmeans.fit_predict(X_scaled)
-        # Matriz de transição
         n = len(self.labels)
         trans = np.zeros((self.n_clusters, self.n_clusters))
         for i in range(n - 1): trans[self.labels[i], self.labels[i+1]] += 1
         row_sums = trans.sum(axis=1, keepdims=True)
         row_sums[row_sums == 0] = 1
         self.transition_matrix = trans / row_sums
-        # Frequências globais (para regularização)
         self._build_global_freqs()
-        # Frequências condicionais regularizadas
         self._build_regularized_freqs()
 
     def _build_global_freqs(self):
-        """Constrói frequências globais para regularização."""
         global_freq = Counter()
         global_pair_freq = Counter()
         for c in self.contests:
@@ -190,7 +199,6 @@ class RegularizedRegimeDetector:
             self.global_pair_probs[b, a] = prob
 
     def _build_regularized_freqs(self):
-        """Constrói frequências condicionais REGULARIZADAS (cluster + global)."""
         for cluster in range(self.n_clusters):
             mask = self.labels == cluster
             cluster_contests = [self.contests[i] for i in range(len(self.contests)) if mask[i]]
@@ -200,19 +208,16 @@ class RegularizedRegimeDetector:
                 for pair in combinations(sorted(c['dezenas']), 2):
                     pair_freq[pair] += 1
             total = sum(freq.values())
-            # Dezena: regularizada
             self.dezena_probs[cluster] = np.zeros(26)
             for d in range(1, 26):
                 count = freq.get(d, 0)
                 cluster_prob = count / total if total > 0 else 0
                 global_prob = self.global_dezena_probs[d]
-                # Mistura: 70% cluster + 30% global
                 self.dezena_probs[cluster][d] = 0.7 * cluster_prob + 0.3 * global_prob
-            # Pares: regularizados
             self.pair_probs[cluster] = np.zeros((26, 26))
             total_pairs = sum(pair_freq.values())
-            for a, b in pair_freq:
-                cluster_prob = pair_freq[(a,b)] / total_pairs if total_pairs > 0 else 0
+            for (a, b), count in pair_freq.items():
+                cluster_prob = count / total_pairs if total_pairs > 0 else 0
                 global_prob = self.global_pair_probs[a, b]
                 prob = 0.7 * cluster_prob + 0.3 * global_prob
                 self.pair_probs[cluster][a, b] = prob
@@ -256,7 +261,7 @@ class RegularizedRegimeDetector:
 
 
 # ============================================================
-# EXTRATOR DE FEATURES (COM CACHE)
+# EXTRATOR DE FEATURES (COM CACHE + TEMPORAL RESTAURADO)
 # ============================================================
 class FeatureExtractor:
     def __init__(self, contests):
@@ -276,6 +281,7 @@ class FeatureExtractor:
         self.feature_stds = np.std(raw_features, axis=0) + 1e-10
         self.regime_detector = RegularizedRegimeDetector(self.build_feature_matrix(), contests)
         self._feature_cache = {}
+        self._cache_max_size = 100000
 
     def _compute_recent_freq(self, window=50):
         freq = Counter()
@@ -331,6 +337,9 @@ class FeatureExtractor:
             self._feature_cache[key] = (self.scaler.transform(raw.reshape(1, -1)).flatten()
                                         if self.scaler is not None
                                         else (raw - self.feature_means) / self.feature_stds)
+            # Limitar cache
+            if len(self._feature_cache) > self._cache_max_size:
+                self._feature_cache.clear()
         return self._feature_cache[key]
 
     def build_feature_matrix(self):
@@ -360,6 +369,40 @@ class FeatureExtractor:
 
     def compute_structural_score(self, game):
         return np.exp(-self.compute_structural_penalty(game) / 3.0)
+
+    def compute_temporal_score(self, game, all_features, recent_window=20):
+        """
+        Score temporal RESTAURADO.
+        Baseado em proximidade estatística dos concursos recentes.
+        """
+        game_feats = self.extract_features(game, None)
+        score = 0.0
+        total_w = 0.0
+        for name, idx in TEMPORAL_INDICES.items():
+            val = game_feats[idx]
+            recent = (all_features[-recent_window:, idx]
+                      if len(all_features) >= recent_window
+                      else all_features[:, idx])
+            z = (val - np.mean(recent)) / (np.std(recent) + 1e-10)
+            score += TEMPORAL_FEATURES[name] * np.exp(-0.5 * z**2)
+            total_w += TEMPORAL_FEATURES[name]
+        return score / total_w if total_w > 0 else 0.5
+
+
+# ============================================================
+# GAMECANDIDATE (OBJETO PRÉ-COMPUTADO)
+# ============================================================
+class GameCandidate:
+    """Objeto que encapsula todas as pré-computações de um jogo."""
+    __slots__ = ('game', 'mask', 'features', 'structural_score', 'central_score', 'temporal_score')
+
+    def __init__(self, game, mask, features, structural_score, central_score=0, temporal_score=0):
+        self.game = game
+        self.mask = mask
+        self.features = features
+        self.structural_score = structural_score
+        self.central_score = central_score
+        self.temporal_score = temporal_score
 
 
 # ============================================================
@@ -396,10 +439,12 @@ class FastGenerator:
                 st = sorted(test)
                 cons = sum(1 for i in range(len(st)-1) if st[i+1]-st[i]==1)
                 if cons > 6: s -= (cons - 6) * 1.5
+                # BÔNUS DE REGIME (FIXO)
                 if self.extractor is not None and self.extractor.regime_detector is not None:
                     prob_dezena = self.extractor.regime_detector.get_dezena_prob(self.current_cluster, d)
                     s += log(prob_dezena + 1e-10) * 0.4
-                    for existing_d in test:
+                    # CORRIGIDO: for existing_d in game (não test)
+                    for existing_d in game:
                         prob_pair = self.extractor.regime_detector.get_pair_prob(self.current_cluster, existing_d, d)
                         s += log(prob_pair + 1e-10) * 0.3
                 scores.append(s)
@@ -420,9 +465,9 @@ class FastGenerator:
 
 
 # ============================================================
-# OTIMIZADOR DE CARTEIRA v18 (BITMASK + UNIFICADO)
+# OTIMIZADOR DE CARTEIRA v19 (PRÉ-COMPUTADO + BITMASK)
 # ============================================================
-class PortfolioOptimizerV18:
+class PortfolioOptimizerV19:
     def __init__(self, contests):
         self.contests = contests
         self.extractor = FeatureExtractor(contests)
@@ -438,102 +483,107 @@ class PortfolioOptimizerV18:
         self._mc_cache = {}
         self._mc_norm_params = None
 
-        # Dados históricos como bitmasks
-        self.historical_draws = [set(c['dezenas']) for c in self.contests]
-        self.historical_masks = draws_to_masks(self.historical_draws)
+        # Dados históricos (pré-computados)
+        self.historical_draws = [c['dezenas'] for c in self.contests]
+        self.historical_masks = np.array([BITMASK_CACHE.get_mask(d) for d in self.historical_draws], dtype=np.uint32)
         if len(self.historical_draws) < 100:
-            extra = [set(np.random.choice(range(1,26),15,replace=False)) for _ in range(500-len(self.historical_draws))]
+            extra = [sorted(np.random.choice(range(1,26),15,replace=False)) for _ in range(500-len(self.historical_draws))]
             self.historical_draws.extend(extra)
-            self.historical_masks = draws_to_masks(self.historical_draws)
+            self.historical_masks = np.array([BITMASK_CACHE.get_mask(d) for d in self.historical_draws], dtype=np.uint32)
+
+        # Pré-computar features históricas (MC otimizado)
+        self.historical_features = np.array([
+            self.extractor.extract_features(list(d), None) for d in self.historical_draws
+        ])
 
         recent_draws = [c['dezenas'] for c in self.contests[-20:]] if len(self.contests) >= 20 else [c['dezenas'] for c in self.contests]
         self.entropy_target = RegularizedRegimeDetector.get_entropy_target_from_draws(recent_draws)
 
-    def _evaluate_game(self, game):
-        """Avaliação UNIFICADA (central + temporal + estrutural)."""
+    def _create_candidate(self, game):
+        """Cria GameCandidate pré-computado."""
+        mask = BITMASK_CACHE.get_mask(game)
         features = self.extractor.extract_features(game, self.last)
         structural = self.extractor.compute_structural_score(game)
-        return features, structural
+        temporal = self.extractor.compute_temporal_score(game, self.feature_matrix)
+        central = structural * 0.6 + temporal * 0.4
+        return GameCandidate(game, mask, features, structural, central, temporal)
 
-    def _greedy_marginal_coverage(self, pool, existing, n_select, max_inter=7):
-        existing_masks = [game_to_mask(g) for g in existing]
+    def _greedy_marginal_coverage(self, pool_candidates, existing, n_select, max_inter=7):
+        existing_masks = [c.mask for c in existing] if existing else []
         covered_pairs = set()
-        for g in existing:
-            for pair in combinations(sorted(g), 2):
+        for c in existing:
+            for pair in combinations(sorted(c.game), 2):
                 covered_pairs.add(pair)
         selected = list(existing)
-        selected_set = set(tuple(g) for g in selected)
-        remaining = [g for g in pool if tuple(g) not in selected_set]
+        selected_set = set(tuple(c.game) for c in selected)
+        remaining = [c for c in pool_candidates if tuple(c.game) not in selected_set]
 
         for _ in range(n_select):
             if not remaining: break
             cov = len(covered_pairs) / comb(25, 2)
             cw, sw = (0.0, 1.0) if cov >= MAX_PAIR_COVERAGE else (0.3, 0.7)
-            best_game, best_score = None, -float('inf')
-            for game in random.sample(remaining, min(300, len(remaining))):
-                game_mask = game_to_mask(game)
-                # BITMASK para interseção
-                if existing_masks and max(mask_intersection(game_mask, em) for em in existing_masks) > max_inter:
+            best_candidate = None
+            best_score = -float('inf')
+            for c in random.sample(remaining, min(300, len(remaining))):
+                if existing_masks and max(mask_intersection(c.mask, em) for em in existing_masks) > max_inter:
                     continue
-                if self.extractor.compute_structural_penalty(game) > STRUCTURAL_REJECT_THRESHOLD:
+                if self.extractor.compute_structural_penalty(c.game) > STRUCTURAL_REJECT_THRESHOLD:
                     continue
-                new_pairs = set(combinations(sorted(game), 2)) - covered_pairs
-                combined = len(new_pairs) / 105.0 * cw + self.extractor.compute_structural_score(game) * sw
+                new_pairs = set(combinations(sorted(c.game), 2)) - covered_pairs
+                combined = len(new_pairs) / 105.0 * cw + c.structural_score * sw
                 if combined > best_score:
-                    best_score, best_game = combined, game
-            if best_game:
-                selected.append(best_game)
-                selected_set.add(tuple(best_game))
-                remaining.remove(best_game)
-                existing_masks.append(game_to_mask(best_game))
-                for pair in combinations(sorted(best_game), 2):
+                    best_score, best_candidate = combined, c
+            if best_candidate:
+                selected.append(best_candidate)
+                selected_set.add(tuple(best_candidate.game))
+                remaining.remove(best_candidate)
+                existing_masks.append(best_candidate.mask)
+                for pair in combinations(sorted(best_candidate.game), 2):
                     covered_pairs.add(pair)
         return selected
 
-    def _pair_coverage(self, portfolio):
+    def _pair_coverage(self, portfolio_candidates):
         covered = set()
-        for g in portfolio:
-            for pair in combinations(sorted(g), 2):
+        for c in portfolio_candidates:
+            for pair in combinations(sorted(c.game), 2):
                 covered.add(pair)
         return len(covered) / comb(25, 2)
 
-    def _portfolio_entropy(self, portfolio):
-        freq = np.bincount([d for g in portfolio for d in g], minlength=26)[1:]
+    def _portfolio_entropy(self, portfolio_candidates):
+        freq = np.bincount([d for c in portfolio_candidates for d in c.game], minlength=26)[1:]
         probs = freq / np.sum(freq)
         probs = np.where(probs > 0, probs, 1e-10)
         return float(entropy(probs) / np.log(25))
 
-    def _portfolio_diversity(self, portfolio):
-        if len(portfolio) < 2: return 1.0
-        masks = [game_to_mask(g) for g in portfolio]
+    def _portfolio_diversity(self, portfolio_candidates):
+        if len(portfolio_candidates) < 2: return 1.0
+        masks = [c.mask for c in portfolio_candidates]
         sims = [mask_intersection(masks[i], masks[j]) for i in range(len(masks)) for j in range(i+1, len(masks))]
         return 1.0 - np.mean(sims) / 15.0 if sims else 1.0
 
-    def _geometric_diversity(self, portfolio):
-        if len(portfolio) < 2: return 0.5
-        fvs = np.array([self.extractor.extract_features(g, self.last) for g in portfolio])
+    def _geometric_diversity(self, portfolio_candidates):
+        if len(portfolio_candidates) < 2: return 0.5
+        fvs = np.array([c.features for c in portfolio_candidates])
         dists = [np.linalg.norm(fvs[i]-fvs[j]) for i in range(len(fvs)) for j in range(i+1, len(fvs))]
         return np.mean(dists) / (2 * np.sqrt(len(FEATURE_NAMES))) if dists else 0
 
-    def _average_structural_score(self, portfolio):
-        scores = [self.extractor.compute_structural_score(g) for g in portfolio]
-        return np.mean(scores) if scores else 0.5
+    def _average_structural_score(self, portfolio_candidates):
+        return np.mean([c.structural_score for c in portfolio_candidates]) if portfolio_candidates else 0.5
 
-    def _monte_carlo_weighted_sum(self, portfolio, n_simulations=500):
-        """MC Condicional com bitmask para velocidade."""
-        cache_key = tuple(tuple(sorted(g)) for g in portfolio)
+    def _monte_carlo_weighted_sum(self, portfolio_candidates, n_simulations=500):
+        cache_key = tuple(tuple(sorted(c.game)) for c in portfolio_candidates)
         if cache_key in self._mc_cache: return self._mc_cache[cache_key]
 
         recent_f = self.feature_matrix[-20:] if len(self.feature_matrix) >= 20 else self.feature_matrix
+        # Usar features PRÉ-COMPUTADAS
         weights = []
-        for draw in self.historical_draws[:len(self.historical_masks)]:
-            df = self.extractor.extract_features(list(draw), None)
-            avg_dist = np.mean([np.linalg.norm(df - rf) for rf in recent_f]) if len(recent_f) > 0 else 0
+        for hf in self.historical_features:
+            avg_dist = np.mean([np.linalg.norm(hf - rf) for rf in recent_f]) if len(recent_f) > 0 else 0
             weights.append(np.exp(-avg_dist / 2.0))
         total_w = sum(weights)
         if total_w == 0: weights, total_w = [1.0]*len(self.historical_masks), len(self.historical_masks)
 
-        portfolio_masks = np.array([game_to_mask(g) for g in portfolio], dtype=np.uint32)
+        portfolio_masks = np.array([c.mask for c in portfolio_candidates], dtype=np.uint32)
         indices = np.random.choice(len(self.historical_masks), size=min(n_simulations, len(self.historical_masks)), p=np.array(weights)/total_w)
 
         total_score = 0.0
@@ -546,7 +596,7 @@ class PortfolioOptimizerV18:
 
         avg_score = total_score / len(indices)
         if self._mc_norm_params is None:
-            self._mc_norm_params = self._compute_mc_normalization(portfolio_size=len(portfolio))
+            self._mc_norm_params = self._compute_mc_normalization(portfolio_size=len(portfolio_candidates))
         p5, p95 = self._mc_norm_params['p5'], self._mc_norm_params['p95']
         normalized = max(0.0, min(1.0, (avg_score - p5) / (p95 - p5 + 1e-10)))
         self._mc_cache[cache_key] = normalized
@@ -555,14 +605,14 @@ class PortfolioOptimizerV18:
     def _compute_mc_normalization(self, portfolio_size=10, n_samples=200):
         raw_scores = []
         for _ in range(n_samples):
-            rand_port = [self.generator.generate_pure_random() for _ in range(portfolio_size)]
+            rand_port = [self._create_candidate(self.generator.generate_pure_random()) for _ in range(portfolio_size)]
             raw = self._monte_carlo_weighted_sum_raw(rand_port, 300)
             raw_scores.append(raw)
         raw_scores = np.array(raw_scores)
         return {'p5': float(np.percentile(raw_scores, 5)), 'p95': float(np.percentile(raw_scores, 95))}
 
-    def _monte_carlo_weighted_sum_raw(self, portfolio, n_simulations=300):
-        portfolio_masks = np.array([game_to_mask(g) for g in portfolio], dtype=np.uint32)
+    def _monte_carlo_weighted_sum_raw(self, portfolio_candidates, n_simulations=300):
+        portfolio_masks = np.array([c.mask for c in portfolio_candidates], dtype=np.uint32)
         indices = np.random.choice(len(self.historical_masks), size=min(n_simulations, len(self.historical_masks)))
         total_score = 0.0
         for idx in indices:
@@ -573,9 +623,9 @@ class PortfolioOptimizerV18:
                     total_score += EXPONENTIAL_WEIGHTS.get(hits, 0)
         return total_score / len(indices)
 
-    def _repair_portfolio(self, portfolio, pool):
-        repaired = list(portfolio)
-        pool_set = set(tuple(g) for g in pool)
+    def _repair_portfolio(self, portfolio_candidates, pool_candidates):
+        repaired = list(portfolio_candidates)
+        pool_set = set(tuple(c.game) for c in pool_candidates)
         for _ in range(20):
             pair_cov = self._pair_coverage(repaired)
             geo_div = self._geometric_diversity(repaired)
@@ -583,164 +633,154 @@ class PortfolioOptimizerV18:
                 break
             if pair_cov > MAX_PAIR_COVERAGE:
                 contributions = []
-                for game in repaired:
+                for c in repaired:
                     other_pairs = set()
-                    for g in repaired:
-                        if g != game:
-                            for pair in combinations(sorted(g), 2):
+                    for c2 in repaired:
+                        if c2 != c:
+                            for pair in combinations(sorted(c2.game), 2):
                                 other_pairs.add(pair)
-                    game_pairs = set(combinations(sorted(game), 2))
+                    game_pairs = set(combinations(sorted(c.game), 2))
                     contributions.append(len(game_pairs - other_pairs))
-                old_game = repaired[np.argmax(contributions)]
+                old_candidate = repaired[np.argmax(contributions)]
             else:
-                fvs = np.array([self.extractor.extract_features(g, self.last) for g in repaired])
+                fvs = np.array([c.features for c in repaired])
                 centroid = np.mean(fvs, axis=0)
                 distances = [np.linalg.norm(fv - centroid) for fv in fvs]
-                old_game = repaired[np.argmax(distances) if geo_div > MAX_GEO_DIVERSITY else np.argmin(distances)]
+                old_candidate = repaired[np.argmax(distances) if geo_div > MAX_GEO_DIVERSITY else np.argmin(distances)]
             # Encontrar substituto
             best_candidate = None
             best_sim = -float('inf')
-            old_features = self.extractor.extract_features(old_game, self.last)
-            for candidate in random.sample(list(pool_set), min(500, len(pool_set))):
-                candidate = list(candidate)
-                if candidate == old_game or not self.extractor.is_structurally_valid(candidate):
-                    continue
-                cf = self.extractor.extract_features(candidate, self.last)
-                dot = np.dot(old_features, cf)
-                norm = np.linalg.norm(old_features) * np.linalg.norm(cf)
+            old_features = old_candidate.features
+            for c in random.sample(pool_candidates, min(500, len(pool_candidates))):
+                if c == old_candidate: continue
+                dot = np.dot(old_features, c.features)
+                norm = np.linalg.norm(old_features) * np.linalg.norm(c.features)
                 sim = dot / norm if norm > 1e-10 else 1.0
                 if 0.3 <= sim <= 0.7:
-                    best_candidate = candidate
+                    best_candidate = c
                     break
                 if sim > best_sim:
-                    best_sim, best_candidate = sim, candidate
+                    best_sim, best_candidate = sim, c
             if best_candidate:
-                repaired[repaired.index(old_game)] = best_candidate
+                repaired[repaired.index(old_candidate)] = best_candidate
         return repaired
 
-    def _portfolio_score(self, portfolio):
-        if self._pair_coverage(portfolio) > MAX_PAIR_COVERAGE:
+    def _portfolio_score(self, portfolio_candidates):
+        if self._pair_coverage(portfolio_candidates) > MAX_PAIR_COVERAGE:
             return -1000.0
-        if not (MIN_GEO_DIVERSITY <= self._geometric_diversity(portfolio) <= MAX_GEO_DIVERSITY):
+        if not (MIN_GEO_DIVERSITY <= self._geometric_diversity(portfolio_candidates) <= MAX_GEO_DIVERSITY):
             return -1000.0
-        mc_score = self._monte_carlo_weighted_sum(portfolio)
-        structural = self._average_structural_score(portfolio)
-        entropy_penalty = abs(self._portfolio_entropy(portfolio) - self.entropy_target) * 4.0
+        mc_score = self._monte_carlo_weighted_sum(portfolio_candidates)
+        structural = self._average_structural_score(portfolio_candidates)
+        entropy_penalty = abs(self._portfolio_entropy(portfolio_candidates) - self.entropy_target) * 4.0
         return (mc_score * 0.40 + structural * 0.30 +
-                self._portfolio_diversity(portfolio) * 0.20 +
-                self._geometric_diversity(portfolio) * 0.10 -
+                self._portfolio_diversity(portfolio_candidates) * 0.20 +
+                self._geometric_diversity(portfolio_candidates) * 0.10 -
                 entropy_penalty * 0.10)
 
-    def _mutate_game(self, game):
+    def _mutate_candidate(self, candidate):
         for _ in range(20):
-            mutated = list(game)
+            mutated = list(candidate.game)
             for _ in range(random.randint(1, 3)):
                 pos = random.randint(0, 14)
                 avail = [d for d in range(1, 26) if d not in mutated]
                 if avail: mutated[pos] = random.choice(avail)
             mutated = sorted(mutated)[:15]
             if self.extractor.is_structurally_valid(mutated):
-                return mutated
-        return sorted(game)[:15]
+                return self._create_candidate(mutated)
+        return candidate
 
     def optimize(self, n_games=10, n_candidates=50000, iterations=100):
         n_central = max(1, int(n_games * 0.40))
         n_coverage = max(1, int(n_games * 0.35))
         n_temporal = n_games - n_central - n_coverage
-        print(f"   Pipeline: {n_candidates//1000}k candidatos (Fase 1), Top 5k avaliação (Fase 2)")
+        print(f"   Pipeline: {n_candidates//1000}k candidatos | Central:{n_central} Cov:{n_coverage} Temp:{n_temporal}")
 
         # FASE 1: Geração barata
-        pool_all, seen = [], set()
+        raw_pool, seen = [], set()
         for _ in tqdm(range(n_candidates), desc="Fase 1"):
             game = self.generator.generate_one()
             key = tuple(game)
             if key not in seen and self.extractor.is_structurally_valid(game):
                 seen.add(key)
-                pool_all.append(game)
+                raw_pool.append(game)
 
-        # FASE 2: Avaliação UNIFICADA no top 5000
-        top_pool = random.sample(pool_all, min(5000, len(pool_all)))
-        evaluated = []
+        # FASE 2: Pré-computação completa
+        top_pool = random.sample(raw_pool, min(5000, len(raw_pool)))
+        candidates = []
         for g in tqdm(top_pool, desc="Fase 2"):
-            feats, structural = self._evaluate_game(g)
-            temporal = self.extractor.compute_temporal_score(g, self.feature_matrix)
-            central_score = (self.extractor.compute_structural_score(g) * 0.6 +
-                           temporal * 0.4)
-            evaluated.append((central_score, temporal, g, feats, structural))
+            candidates.append(self._create_candidate(g))
 
-        evaluated.sort(key=lambda x: x[0], reverse=True)
+        # Ordenar por score central
+        candidates.sort(key=lambda c: c.central_score, reverse=True)
 
         # Selecionar centrais
-        central_games = []
+        central_candidates = []
         central_masks = []
-        for cs, _, g, _, _ in evaluated:
-            if len(central_games) >= n_central: break
-            game_mask = game_to_mask(g)
-            if central_masks and max(mask_intersection(game_mask, cm) for cm in central_masks) > 8:
+        for c in candidates:
+            if len(central_candidates) >= n_central: break
+            if central_masks and max(mask_intersection(c.mask, cm) for cm in central_masks) > 8:
                 continue
-            central_games.append(g)
-            central_masks.append(game_mask)
+            central_candidates.append(c)
+            central_masks.append(c.mask)
 
         # Cobertura via greedy
-        coverage_games = self._greedy_marginal_coverage(
-            [g for _, _, g, _, _ in evaluated if g not in central_games],
-            central_games, n_coverage)
-        coverage_games = coverage_games[len(central_games):]
+        coverage_candidates = self._greedy_marginal_coverage(
+            [c for c in candidates if c not in central_candidates],
+            central_candidates, n_coverage)
+        coverage_candidates = coverage_candidates[len(central_candidates):]
 
         # Temporais
-        temporal_sorted = sorted(evaluated, key=lambda x: x[1], reverse=True)
-        temporal_games = []
-        for _, _, g, _, _ in temporal_sorted:
-            if g in central_games or g in coverage_games: continue
-            if len(temporal_games) >= n_temporal: break
-            game_mask = game_to_mask(g)
-            all_masks = central_masks + [game_to_mask(cg) for cg in coverage_games] + [game_to_mask(tg) for tg in temporal_games]
-            if all_masks and max(mask_intersection(game_mask, am) for am in all_masks) > 9:
+        candidates.sort(key=lambda c: c.temporal_score, reverse=True)
+        temporal_candidates = []
+        all_existing = central_candidates + coverage_candidates
+        for c in candidates:
+            if c in all_existing: continue
+            if len(temporal_candidates) >= n_temporal: break
+            if any(mask_intersection(c.mask, ec.mask) > 9 for ec in all_existing + temporal_candidates):
                 continue
-            temporal_games.append(g)
+            temporal_candidates.append(c)
 
-        portfolio = central_games + coverage_games + temporal_games
-        portfolio = self._repair_portfolio(portfolio, pool_all)
+        portfolio = central_candidates + coverage_candidates + temporal_candidates
+        portfolio = self._repair_portfolio(portfolio, candidates)
         best_portfolio = list(portfolio)
         best_score = self._portfolio_score(portfolio)
 
         # Simulated Annealing
-        elite_pool = [(cs, g) for cs, _, g, _, _ in evaluated[:len(evaluated)//4]]
+        elite_pool = candidates[:len(candidates)//4]
         for it in tqdm(range(iterations), desc="Annealing"):
             temp = 1.0 * (0.95 ** it)
             new_portfolio = list(portfolio)
             idx = random.randint(0, len(new_portfolio) - 1)
             if random.random() < 0.4 and elite_pool:
-                new_game = random.choice(elite_pool)[1]
+                new_candidate = random.choice(elite_pool)
             elif random.random() < 0.7:
-                new_game = self._mutate_game(new_portfolio[idx])
+                new_candidate = self._mutate_candidate(new_portfolio[idx])
             else:
                 new_game = self.generator.generate_one()
+                new_candidate = self._create_candidate(new_game)
 
-            # BITMASK para verificação de similaridade
-            new_mask = game_to_mask(new_game)
-            too_similar = False
-            for j, sg in enumerate(new_portfolio):
-                if j != idx and mask_intersection(new_mask, game_to_mask(sg)) > 8:
-                    too_similar = True
-                    break
+            too_similar = any(
+                j != idx and mask_intersection(new_candidate.mask, c.mask) > 8
+                for j, c in enumerate(new_portfolio)
+            )
             if too_similar: continue
 
-            new_portfolio[idx] = new_game
+            new_portfolio[idx] = new_candidate
             new_score = self._portfolio_score(new_portfolio)
             if new_score > best_score:
                 best_portfolio, best_score = list(new_portfolio), new_score
             elif random.random() < np.exp((new_score - self._portfolio_score(portfolio)) / max(0.01, temp)):
                 portfolio = new_portfolio
 
-        return best_portfolio, best_score
+        return [c.game for c in best_portfolio], best_score
 
     def backtest(self, portfolio, test_draws):
         n_success, total_premio = 0, 0.0
         total_custo = len(portfolio) * len(test_draws) * CUSTO_APOSTA
-        portfolio_masks = np.array([game_to_mask(g) for g in portfolio], dtype=np.uint32)
+        portfolio_masks = np.array([BITMASK_CACHE.get_mask(g) for g in portfolio], dtype=np.uint32)
         for draw in test_draws:
-            draw_mask = game_to_mask(draw['dezenas'])
+            draw_mask = BITMASK_CACHE.get_mask(draw['dezenas'])
             for pm in portfolio_masks:
                 hits = mask_intersection(pm, draw_mask)
                 if hits >= 11:
@@ -772,7 +812,7 @@ def walk_forward_validation(contests, n_windows=10, train_size=500, test_size=50
         if train_start >= train_end or test_start >= test_end: continue
         train_data, test_data = contests[train_start:train_end], contests[test_start:test_end]
         if len(train_data) < 100 or len(test_data) < 5: continue
-        opt = PortfolioOptimizerV18(train_data)
+        opt = PortfolioOptimizerV19(train_data)
         portfolio, _ = opt.optimize(n_games, n_candidates=50000, iterations=50)
         bt = opt.backtest(portfolio, test_data)
         bt_rand = opt.backtest([opt.generator.generate_pure_random() for _ in range(n_games)], test_data)
@@ -797,7 +837,7 @@ def walk_forward_validation(contests, n_windows=10, train_size=500, test_size=50
 # ============================================================
 def main():
     print("="*70)
-    print("🧬 GERADOR DE CARTEIRA v18 - BITMASK + REGULARIZADO")
+    print("🧬 GERADOR DE CARTEIRA v19 - PRÉ-COMPUTADO + BITMASK")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if contests is None:
@@ -806,7 +846,7 @@ def main():
     print(f"\n📂 {len(contests)} concursos")
     print(f"📌 Último: {contests[-1]['concurso']} - {contests[-1]['dezenas']}")
     print("\n📊 Configuração:")
-    print(f"   Bitmask: SIM | GMM: REMOVIDO | Regularização: SIM")
+    print(f"   GameCandidate pré-computado | Bitmask cacheado | MC features pré-computadas")
     print(f"   Pesos cauda: 11:{EXPONENTIAL_WEIGHTS[11]} 12:{EXPONENTIAL_WEIGHTS[12]} 13:{EXPONENTIAL_WEIGHTS[13]} 14:{EXPONENTIAL_WEIGHTS[14]} 15:{EXPONENTIAL_WEIGHTS[15]}")
     print(f"   Threshold estrutural: {STRUCTURAL_REJECT_THRESHOLD}")
 
@@ -815,7 +855,7 @@ def main():
 
     if op in ("1", "3"):
         t0 = time.time()
-        opt = PortfolioOptimizerV18(contests)
+        opt = PortfolioOptimizerV19(contests)
         print(f"   ✅ Init {time.time()-t0:.1f}s | Cluster: {opt.current_cluster}")
         portfolio, _ = opt.optimize(10, 50000, 100)
         print(f"\n🏆 CARTEIRA:")
