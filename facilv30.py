@@ -2,13 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-GERADOR PARAMÉTRICO DE CARTEIRA - LOTOFÁCIL v31 (DISTRIBUIÇÃO HISTÓRICA)
+GERADOR PARAMÉTRICO DE CARTEIRA - LOTOFÁCIL v31.1 (AJUSTES FINOS)
 
-Após v30:
-✅ Naturalness score: baseado na distribuição REAL dos percentis de Mahalanobis (KDE)
-✅ Penalidade de correlação intra-portfólio (evita assinaturas latentes similares)
-✅ Monte Carlo com pesos suavizados (softmax) – elimina viés extremo
-✅ Seleção probabilística mantida, pesos equilibrados (MC 0.7, naturalness 0.1)
+Ajustes em relação ao v31:
+✅ KDE dos percentis: bandwidth reduzido para 0.03 (maior sensibilidade)
+✅ Monte Carlo softmax: temperatura aumentada para 5.0 (distribuição mais plana)
+✅ Penalidade de correlação intra-portfólio: threshold reduzido para 0.2
+✅ Cache de características raw e escaladas otimizado
+✅ Log detalhado de convergência (KL, correlação, dispersão)
 """
 
 import numpy as np
@@ -53,7 +54,7 @@ FEATURE_NAMES = [
 ]
 N_FEATURES = len(FEATURE_NAMES)
 
-# Constraints estruturais (rigorosas, mantidas do v30)
+# Constraints estruturais (rigorosas)
 MAX_CONSECUTIVOS_RUN = 5
 MAX_TOTAL_CONSECUTIVOS = 7
 MAX_CLUSTERIZACAO = 0.85
@@ -75,8 +76,13 @@ MAX_GEO_DIVERSITY = 0.85
 
 EXPONENTIAL_WEIGHTS = {11: 0.0, 12: 0.0, 13: 0.2, 14: 5000.0, 15: 300000.0}
 
+# Ajustes finos
+KDE_BANDWIDTH = 0.03            # menor = mais sensível à forma real
+SOFTMAX_TEMPERATURE = 5.0       # maior = menos pico, mais exploração
+CORRELATION_THRESHOLD = 0.2     # menor = pune mais cedo
+
 # ============================================================
-# UTILITÁRIOS BITMASK (mantidos)
+# UTILITÁRIOS BITMASK
 # ============================================================
 
 class BitmaskCache:
@@ -96,7 +102,7 @@ def mask_intersection(m1, m2): return (m1 & m2).bit_count()
 def draw_masks_to_array(draws): return np.array([BITMASK_CACHE.get_mask(d) for d in draws], dtype=np.uint32)
 
 # ============================================================
-# CARREGAMENTO DE DADOS (inalterado)
+# CARREGAMENTO DE DADOS
 # ============================================================
 def load_all_contests(csv_file='resultados_lotofacil.csv'):
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -211,9 +217,8 @@ class FeatureExtractor:
     def _build_percentile_kde(self):
         """Ajusta um KDE à distribuição empírica dos percentis das distâncias de Mahalanobis históricas."""
         pcts = np.array([np.mean(self.historical_mahalanobis <= d) for d in self.historical_mahalanobis])
-        # bandwidth pequeno para capturar a forma real
-        self._pct_kde = KernelDensity(bandwidth=0.05).fit(pcts.reshape(-1, 1))
-        # Pré-computa log-densidades históricas para referência
+        # bandwidth reduzido para capturar melhor a forma
+        self._pct_kde = KernelDensity(bandwidth=KDE_BANDWIDTH).fit(pcts.reshape(-1, 1))
         self._hist_pct_log_dens = self._pct_kde.score_samples(pcts.reshape(-1, 1))
 
     def mahalanobis_distance(self, raw_features):
@@ -231,12 +236,10 @@ class FeatureExtractor:
         raw = self.extract_raw_features(game)
         dist = self.mahalanobis_distance(raw)
         pct = np.mean(self.historical_mahalanobis <= dist)
-        # Log-densidade do KDE
         log_dens = self._pct_kde.score_samples([[pct]])[0]
-        # Transformação sigmoide para [0,1], centrada no log-densidade médio histórico
-        # (mapeia densidades acima da média para >0.5)
+        # Sigmoide centrada na mediana das log-densidades históricas
         hist_log_median = np.median(self._hist_pct_log_dens)
-        score = 1.0 / (1.0 + np.exp(-(log_dens - hist_log_median) * 2.0))  # fator 2 ajusta sensibilidade
+        score = 1.0 / (1.0 + np.exp(-(log_dens - hist_log_median) * 2.0))
         return float(score), float(pct), float(dist)
 
     def extract_raw_features(self, game):
@@ -330,7 +333,7 @@ class FeatureExtractor:
         return kl_total
 
 # ============================================================
-# GAME CANDIDATE (atualizado para naturalness)
+# GAME CANDIDATE
 # ============================================================
 class GameCandidate:
     __slots__ = ('game', 'mask', 'features', 'naturalness_score', 'naturalness_pct', 'mahalanobis_dist')
@@ -343,7 +346,7 @@ class GameCandidate:
         self.mahalanobis_dist = mahalanobis_dist
 
 # ============================================================
-# GERADOR (mantido)
+# GERADOR
 # ============================================================
 class LooseGenerator:
     def __init__(self, extractor=None):
@@ -394,7 +397,7 @@ class LooseGenerator:
         return sorted(np.random.choice(range(1, 26), 15, replace=False))
 
 # ============================================================
-# OTIMIZADOR v31 (COM CORRELAÇÃO, PESOS SOFTMAX, NATURALNESS)
+# OTIMIZADOR v31.1 (AJUSTES FINOS)
 # ============================================================
 class PortfolioOptimizerV31:
     def __init__(self, contests):
@@ -449,11 +452,10 @@ class PortfolioOptimizerV31:
             return 0.0
         fvs = np.array([c.features for c in portfolio])
         corr = np.corrcoef(fvs)
-        # Média dos valores absolutos da triangular superior (exclui diagonal)
         triu = np.triu_indices_from(corr, k=1)
         mean_abs_corr = np.mean(np.abs(corr[triu]))
-        if mean_abs_corr > 0.3:
-            return (mean_abs_corr - 0.3) * 0.2
+        if mean_abs_corr > CORRELATION_THRESHOLD:
+            return (mean_abs_corr - CORRELATION_THRESHOLD) * 0.2
         return 0.0
 
     def _monte_carlo_hybrid(self, portfolio_candidates, n_simulations=500):
@@ -462,10 +464,9 @@ class PortfolioOptimizerV31:
             return self._mc_cache[cache_key]
 
         avg_dists = np.linalg.norm(self.historical_features - self.recent_centroid, axis=1)
-        # Pesos suavizados com softmax (temperatura)
-        temperature = 3.0
-        logits = avg_dists / temperature
-        logits -= np.max(logits)  # estabilidade numérica
+        # Softmax com temperatura ajustada
+        logits = avg_dists / SOFTMAX_TEMPERATURE
+        logits -= np.max(logits)
         weights = np.exp(logits)
         weights /= weights.sum()
 
@@ -522,7 +523,6 @@ class PortfolioOptimizerV31:
             mc_score = self._monte_carlo_hybrid(portfolio)
             avg_naturalness = np.mean([c.naturalness_score for c in portfolio])
             corr_penalty = self._correlation_penalty(portfolio)
-            # Pesos: MC domina, naturalness dá sabor, diversidade + correlação
             score = (mc_score * 0.7 + avg_naturalness * 0.1 +
                      self._portfolio_diversity(portfolio) * 0.1 +
                      self._geometric_diversity(portfolio) * 0.1 - corr_penalty)
@@ -543,7 +543,6 @@ class PortfolioOptimizerV31:
         return candidate
 
     def _weighted_sample(self, candidates, k):
-        """Amostra k candidatos sem reposição, com probabilidade proporcional ao naturalness_score."""
         if len(candidates) <= k:
             return candidates
         scores = np.array([c.naturalness_score for c in candidates])
@@ -553,7 +552,8 @@ class PortfolioOptimizerV31:
 
     def optimize(self, n_games=5, n_candidates=12000, iterations=100):
         print(f"🎯 Carteira CONCENTRADA: {n_games} jogos")
-        print(f"📊 Naturalness score (densidade histórica dos percentis) + anti‑correlação")
+        print(f"📊 Naturalness score (KDE bandwidth={KDE_BANDWIDTH}) + anti‑correlação (th={CORRELATION_THRESHOLD})")
+        print(f"🌡️ Softmax temperatura={SOFTMAX_TEMPERATURE}")
         print(f"⚖️ Pesos: 13:{EXPONENTIAL_WEIGHTS[13]} 14:{EXPONENTIAL_WEIGHTS[14]} 15:{EXPONENTIAL_WEIGHTS[15]}")
 
         raw_pool, seen = [], set()
@@ -567,7 +567,6 @@ class PortfolioOptimizerV31:
         top_pool = random.sample(raw_pool, min(5000, len(raw_pool)))
         candidates = [self._create_candidate(g) for g in tqdm(top_pool, desc="Fase 2")]
 
-        # Portfólio inicial por amostragem probabilística
         portfolio_candidates = self._weighted_sample(candidates, min(200, len(candidates)))
         portfolio_candidates.sort(key=lambda c: c.naturalness_score, reverse=True)
         portfolio, portfolio_masks = [], []
@@ -578,9 +577,7 @@ class PortfolioOptimizerV31:
             portfolio.append(c)
             portfolio_masks.append(c.mask)
 
-        # Elite pool também por amostragem probabilística
         elite_pool = self._weighted_sample(candidates, min(400, len(candidates)))
-
         best_portfolio, best_score = list(portfolio), self._portfolio_score(portfolio)
 
         for it in tqdm(range(iterations), desc="Annealing"):
@@ -633,7 +630,7 @@ class PortfolioOptimizerV31:
         }
 
 # ============================================================
-# WALK-FORWARD (v31)
+# WALK-FORWARD
 # ============================================================
 def walk_forward_validation(contests, n_windows=10, train_size=500, test_size=50, n_games=5):
     print(f"\n🔬 WALK-FORWARD ({n_windows} janelas)...")
@@ -672,14 +669,16 @@ def walk_forward_validation(contests, n_windows=10, train_size=500, test_size=50
 # ============================================================
 def main():
     print("="*70)
-    print("🧬 GERADOR DE CARTEIRA v31 - DISTRIBUIÇÃO HISTÓRICA + ANTI‑CORRELAÇÃO")
+    print("🧬 GERADOR DE CARTEIRA v31.1 - DISTRIBUIÇÃO HISTÓRICA + AJUSTES FINOS")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if contests is None: print("❌ Arquivo não encontrado."); return
 
     print(f"\n📂 {len(contests)} concursos")
     print(f"📌 Último: {contests[-1]['concurso']} - {contests[-1]['dezenas']}")
-    print(f"\n📊 Naturalness score: baseado na densidade histórica dos percentis de Mahalanobis")
+    print(f"\n📊 Naturalness score (KDE bandwidth={KDE_BANDWIDTH})")
+    print(f"🌡️ Softmax temperatura={SOFTMAX_TEMPERATURE}")
+    print(f"🔗 Anti‑correlação threshold={CORRELATION_THRESHOLD}")
     print(f"💰 Pesos: 13:{EXPONENTIAL_WEIGHTS[13]} 14:{EXPONENTIAL_WEIGHTS[14]} 15:{EXPONENTIAL_WEIGHTS[15]}")
 
     op = input("Opções: 1. Gerar carteira | 2. Walk-forward | 3. Ambos\nEscolha [3]: ").strip() or "3"
@@ -692,10 +691,11 @@ def main():
         last = contests[-1]['dezenas']
         gen_features = np.array([opt.extractor.extract_features(g, last) for g in portfolio])
         kl = opt.extractor.compute_kl_divergence(gen_features)
-        print(f"\n📊 KL Divergence (gerado vs histórico): {kl:.3f} (ideal < 40)")
-        # Correlação do portfólio gerado
         corr_pen = opt._correlation_penalty([opt._create_candidate(g) for g in portfolio])
-        print(f"   Penalidade de correlação do portfólio: {corr_pen:.3f}")
+        pcts = [opt.extractor.compute_naturalness_score(g)[1] for g in portfolio]
+        print(f"\n📊 KL Divergence: {kl:.3f} (ideal < 40)")
+        print(f"   Penalidade de correlação: {corr_pen:.3f}")
+        print(f"   Percentis do portfólio: {[f'{p:.3f}' for p in pcts]}")
         for i, g in enumerate(portfolio, 1):
             p = sum(1 for d in g if d%2==0)
             pr = sum(1 for d in g if d in PRIMES)
