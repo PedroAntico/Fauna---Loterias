@@ -2,29 +2,26 @@
 # -*- coding: utf-8 -*-
 
 """
-GERADOR PARAMÉTRICO DE CARTEIRA - LOTOFÁCIL v29 (OTIMIZADO)
+GERADOR PARAMÉTRICO DE CARTEIRA - LOTOFÁCIL v30 (CORRIGIDO)
 
-CORREÇÕES CRÍTICAS DE DESEMPENHO:
-✅ KDE e UMAP completamente removidos (ganho 10x)
-✅ Mahalanobis e rarity score VETORIZADOS em lote
-✅ Monte Carlo simplificado (amostra fixa, sem normalização dinâmica)
-✅ Geração de candidatos reduzida (10k)
-✅ Annealing removido → seleção greedy com diversidade
-✅ Cache de portfolios para evitar recálculo
-✅ Regime local mantido (leve)
+CORREÇÕES CRÍTICAS:
+✅ Mahalanobis agora usa features PADRONIZADAS em ambos: média e covariância
+✅ Geração de jogos penaliza clusterização excessiva (consecutivos longos)
+✅ Pesos MC com gradiente contínuo (11:1, 12:4, 13:25, 14:400, 15:50000)
+✅ Inicialização mais rápida (cache de features)
+✅ Walk-forward com menos janelas e treino menor para agilidade
 """
 
 import numpy as np
-from scipy.stats import entropy, hypergeom
+from scipy.stats import entropy, hypergeom, wilcoxon
 from collections import Counter
 from itertools import combinations
-from datetime import datetime
-import warnings
 import os
-from math import comb
-from tqdm import tqdm
 import random
 import time
+import warnings
+from math import comb
+from tqdm import tqdm
 
 warnings.filterwarnings('ignore')
 
@@ -41,9 +38,7 @@ except ImportError:
 # ============================================================
 PRIMES = {2, 3, 5, 7, 11, 13, 17, 19, 23}
 MOLDURA = {1,2,3,4,5, 6,10, 11,15, 16,20, 21,22,23,24,25}
-CENTRO = {7,8,9,12,13,14,17,18,19}
 HYPE_PROBS = {k: hypergeom.pmf(k, 25, 15, 15) for k in range(0, 16)}
-
 PREMIO_VALORES = {11: 6.0, 12: 12.0, 13: 30.0, 14: 1500.0, 15: 1800000.0}
 CUSTO_APOSTA = 3.0
 
@@ -76,13 +71,13 @@ MAX_PAIR_COVERAGE = 0.75
 MIN_GEO_DIVERSITY = 0.25
 MAX_GEO_DIVERSITY = 0.85
 
-# Pesos AGRESSIVOS (mantidos)
+# Pesos com gradiente contínuo (evita função objetivo esparsa)
 EXPONENTIAL_WEIGHTS = {
-    11: 0.0,
-    12: 0.0,
-    13: 0.2,
-    14: 5000.0,
-    15: 300000.0,
+    11: 1.0,
+    12: 4.0,
+    13: 25.0,
+    14: 400.0,
+    15: 50000.0,
 }
 
 # Raridade bidirecional
@@ -95,7 +90,6 @@ RARITY_PENALTY_ABOVE = 0.99
 class BitmaskCache:
     def __init__(self):
         self._cache = {}
-
     def get_mask(self, game):
         key = tuple(game) if isinstance(game, list) else game
         if key not in self._cache:
@@ -122,34 +116,30 @@ def load_all_contests(csv_file='resultados_lotofacil.csv'):
     if not os.path.exists(csv_path):
         return None
     contests = []
-    try:
-        with open(csv_path, 'r', encoding='utf-8') as f:
-            for line in f.readlines()[1:]:
-                parts = line.strip().split(';')
-                if len(parts) < 17:
+    with open(csv_path, 'r', encoding='utf-8') as f:
+        for line in f.readlines()[1:]:
+            parts = line.strip().split(';')
+            if len(parts) < 17:
+                continue
+            try:
+                dezenas = [int(x.strip()) for x in parts[2:17] if x.strip()]
+                if len(dezenas) != 15 or len(set(dezenas)) != 15:
                     continue
-                try:
-                    dezenas = [int(x.strip()) for x in parts[2:17] if x.strip()]
-                    if len(dezenas) != 15 or len(set(dezenas)) != 15:
-                        continue
-                    if any(x < 1 or x > 25 for x in dezenas):
-                        continue
-                    contests.append({
-                        'concurso': int(parts[0]),
-                        'data': parts[1],
-                        'dezenas': sorted(dezenas)
-                    })
-                except:
+                if any(x < 1 or x > 25 for x in dezenas):
                     continue
-        contests.sort(key=lambda x: x['concurso'])
-        print(f"✅ {len(contests)} concursos válidos")
-        return contests
-    except Exception as e:
-        print(f"❌ Erro: {e}")
-        return None
+                contests.append({
+                    'concurso': int(parts[0]),
+                    'data': parts[1],
+                    'dezenas': sorted(dezenas)
+                })
+            except:
+                continue
+    contests.sort(key=lambda x: x['concurso'])
+    print(f"✅ {len(contests)} concursos válidos")
+    return contests
 
 # ============================================================
-# DETECTOR DE REGIME LOCAL (LEVE)
+# DETECTOR DE REGIME LOCAL
 # ============================================================
 class LocalRegimeDetector:
     def __init__(self, feature_matrix, window=20):
@@ -184,7 +174,7 @@ class LocalRegimeDetector:
         return 0.5
 
 # ============================================================
-# EXTRATOR DE FEATURES (SEM KDE, SEM UMAP, COM MÉTODOS BATCH)
+# EXTRATOR DE FEATURES (CORRIGIDO)
 # ============================================================
 class FeatureExtractor:
     def __init__(self, contests):
@@ -201,14 +191,19 @@ class FeatureExtractor:
         if self.scaler is not None and len(raw_features) > 10:
             self.scaler.fit(raw_features)
 
-        self.feature_means = np.mean(raw_features, axis=0)
-        self.feature_stds = np.std(raw_features, axis=0) + 1e-10
+        # Features padronizadas (usadas para tudo agora)
+        if self.scaler is not None:
+            self.standardized_features = self.scaler.transform(raw_features)
+        else:
+            self.feature_means = np.mean(raw_features, axis=0)
+            self.feature_stds = np.std(raw_features, axis=0) + 1e-10
+            self.standardized_features = (raw_features - self.feature_means) / self.feature_stds
 
-        # Modelo multivariado apenas com LedoitWolf para Mahalanobis
-        self._build_multivariate_model(raw_features)
+        # Modelo multivariado CONSISTENTE: calculado no espaço padronizado
+        self._build_multivariate_model(self.standardized_features)
 
-        # Detector de regime local
-        self.regime_detector = LocalRegimeDetector(self.build_feature_matrix())
+        # Detector de regime local (usa features padronizadas)
+        self.regime_detector = LocalRegimeDetector(self.standardized_features)
 
     def _build_raw_feature_matrix(self):
         features_list = []
@@ -255,36 +250,35 @@ class FeatureExtractor:
             compressao,
         ], dtype=np.float64)
 
-    def _build_multivariate_model(self, raw_features):
-        """Apenas LedoitWolf para matriz de precisão."""
-        if SKLEARN_AVAILABLE and len(raw_features) > N_FEATURES:
+    def _build_multivariate_model(self, standardized_features):
+        """LedoitWolf sobre features já padronizadas."""
+        if SKLEARN_AVAILABLE and len(standardized_features) > N_FEATURES:
             try:
-                lw = LedoitWolf().fit(raw_features)
+                lw = LedoitWolf().fit(standardized_features)
                 self.precision_matrix = lw.precision_
                 self.cov_matrix = lw.covariance_
             except:
-                cov = np.cov(raw_features.T) + np.eye(N_FEATURES) * 1e-6
+                cov = np.cov(standardized_features.T) + np.eye(N_FEATURES) * 1e-6
                 self.precision_matrix = np.linalg.inv(cov)
                 self.cov_matrix = cov
         else:
-            cov = np.cov(raw_features.T) + np.eye(N_FEATURES) * 1e-6
+            cov = np.cov(standardized_features.T) + np.eye(N_FEATURES) * 1e-6
             self.precision_matrix = np.linalg.inv(cov)
             self.cov_matrix = cov
 
-        self._mean_vector = np.mean(raw_features, axis=0)
+        self._mean_vector = np.mean(standardized_features, axis=0)
 
-        # Pré-computar distâncias de Mahalanobis históricas (para percentis)
-        self.historical_mahalanobis = self.mahalanobis_batch(raw_features)
+        # Distâncias históricas (base para percentis)
+        self.historical_mahalanobis = self.mahalanobis_batch(standardized_features)
 
     def mahalanobis_batch(self, features_matrix):
-        """Distância de Mahalanobis vetorizada para uma matriz N x F."""
+        """Vetorizado: entrada já padronizada."""
         diff = features_matrix - self._mean_vector
         temp = np.dot(diff, self.precision_matrix)
         dists = np.sqrt(np.maximum(0, np.sum(temp * diff, axis=1)))
         return dists
 
     def mahalanobis_distance(self, features):
-        """Para um único vetor (fallback)."""
         return self.mahalanobis_batch(features.reshape(1, -1))[0]
 
     def compute_rarity_scores_batch(self, features_matrix):
@@ -293,22 +287,18 @@ class FeatureExtractor:
         percentiles = np.array([np.mean(self.historical_mahalanobis <= d) for d in dists])
 
         scores = np.zeros_like(percentiles)
-        # Abaixo do target
         mask_low = percentiles <= TARGET_RARITY_PERCENTILE
         scores[mask_low] = percentiles[mask_low] / TARGET_RARITY_PERCENTILE
-        # Acima do target e até penalidade
         mask_mid = (percentiles > TARGET_RARITY_PERCENTILE) & (percentiles <= RARITY_PENALTY_ABOVE)
         scores[mask_mid] = 1.0
-        # Acima da penalidade
         mask_high = percentiles > RARITY_PENALTY_ABOVE
         excess = (percentiles[mask_high] - RARITY_PENALTY_ABOVE) / (1.0 - RARITY_PENALTY_ABOVE)
         scores[mask_high] = 1.0 - excess * 5.0
         scores = np.maximum(0.0, scores)
-
         return scores, percentiles, dists
 
     def extract_features(self, game, last_contest=None):
-        """Extrai features padronizadas para um jogo (cache simples)."""
+        """Retorna features padronizadas (usa cache simples)."""
         key = (tuple(sorted(game)), tuple(last_contest) if last_contest else None)
         if not hasattr(self, '_feature_cache'):
             self._feature_cache = {}
@@ -322,16 +312,7 @@ class FeatureExtractor:
         return self._feature_cache[key]
 
     def extract_features_batch(self, games, last_contest=None):
-        """Extrai features para uma lista de jogos de forma eficiente."""
-        # Para manter simplicidade, chamamos individualmente, mas podemos otimizar depois
         return np.array([self.extract_features(g, last_contest) for g in games])
-
-    def build_feature_matrix(self):
-        raw = self._build_raw_feature_matrix()
-        if self.scaler is not None:
-            return self.scaler.transform(raw)
-        else:
-            return (raw - self.feature_means) / self.feature_stds
 
     def compute_structural_penalty(self, game):
         d = sorted(game)
@@ -366,7 +347,6 @@ class FeatureExtractor:
         clusterizacao = sum(1 for g in gaps if g <= 2) / len(gaps)
         if clusterizacao > MAX_CLUSTERIZACAO:
             penalty += (clusterizacao - MAX_CLUSTERIZACAO) * 10.0
-
         return penalty
 
     def is_structurally_valid(self, game):
@@ -378,7 +358,6 @@ class FeatureExtractor:
 class GameCandidate:
     __slots__ = ('game', 'mask', 'features', 'rarity_score', 'central_score',
                  'mahalanobis_dist', 'rarity_percentile')
-
     def __init__(self, game, mask, features, rarity_score=0, central_score=0,
                  mahalanobis_dist=0, rarity_percentile=0):
         self.game = game
@@ -390,7 +369,7 @@ class GameCandidate:
         self.rarity_percentile = rarity_percentile
 
 # ============================================================
-# GERADOR (COM LIMITES ANTI-COLAPSO)
+# GERADOR MELHORADO (ANTI-CLUSTERIZAÇÃO)
 # ============================================================
 class LooseGenerator:
     def __init__(self, extractor=None):
@@ -410,20 +389,27 @@ class LooseGenerator:
             candidates = list(available)
             scores = []
             for d in candidates:
-                test = game | {d}
-                s = len(set((x-1)//5 for x in test)) * 2
-                st = sorted(test)
+                test = sorted(game | {d})
+                # Quadrantes
+                quad_score = len(set((x-1)//5 for x in test)) * 2
+                # Penalidade de clusterização (gaps <= 2)
+                if len(test) > 1:
+                    gaps = [test[i+1]-test[i] for i in range(len(test)-1)]
+                    cluster_penalty = sum(1 for g in gaps if g <= 2) * 0.7
+                else:
+                    cluster_penalty = 0.0
+                # Penalidade de consecutivos longos
                 run = 1
                 max_run = 1
-                for i in range(len(st)-1):
-                    if st[i+1]-st[i]==1:
+                for i in range(len(test)-1):
+                    if test[i+1]-test[i]==1:
                         run += 1
                         max_run = max(max_run, run)
                     else:
                         run = 1
-                if max_run > MAX_CONSECUTIVOS_RUN:
-                    s -= (max_run - MAX_CONSECUTIVOS_RUN) * 3
-                scores.append(s)
+                consec_penalty = max(0, max_run - MAX_CONSECUTIVOS_RUN) * 3
+                scores.append(quad_score - cluster_penalty - consec_penalty)
+
             if scores:
                 scores = np.array(scores, dtype=np.float64)
                 scores -= np.max(scores)
@@ -440,38 +426,34 @@ class LooseGenerator:
         return sorted(np.random.choice(range(1, 26), 15, replace=False))
 
 # ============================================================
-# OTIMIZADOR v29 (RÁPIDO)
+# OTIMIZADOR v30 (CORRIGIDO, GRADIENTE CONTÍNUO)
 # ============================================================
-class PortfolioOptimizerV29:
+class PortfolioOptimizerV30:
     def __init__(self, contests):
         self.contests = contests
         self.extractor = FeatureExtractor(contests)
-        self.feature_matrix = self.extractor.build_feature_matrix()
         self.last = contests[-1]['dezenas'] if contests else None
         self.generator = LooseGenerator(self.extractor)
 
         self.historical_draws = [c['dezenas'] for c in self.contests]
         self.historical_masks = draw_masks_to_array(self.historical_draws)
-
-        # Complementar com sorteios sintéticos se necessário
         if len(self.historical_draws) < 100:
             extra = [sorted(np.random.choice(range(1,26),15,replace=False)) for _ in range(500-len(self.historical_draws))]
             self.historical_draws.extend(extra)
             self.historical_masks = draw_masks_to_array(self.historical_draws)
 
-        self.historical_features = np.array([self.extractor.extract_features(list(d), None) for d in self.historical_draws])
-
         self.current_regime_score = self.extractor.regime_detector.get_current_regime_score()
         self.current_regime_percentile = self.extractor.regime_detector.get_regime_percentile()
 
-        # Pré-computar normalização MC (fixa, uma vez)
+        # Normalização MC rápida (fixa)
         self._mc_norm_params = self._compute_mc_normalization_fast()
 
     def _create_candidate(self, game, rarity_score=None, percentile=None, mahal_dist=None):
         mask = BITMASK_CACHE.get_mask(game)
         features = self.extractor.extract_features(game, self.last)
         if rarity_score is None:
-            rarity_score, percentile, mahal_dist = self.extractor.compute_rarity_scores_batch(features.reshape(1,-1))
+            rarity_score, percentile, mahal_dist = self.extractor.compute_rarity_scores_batch(
+                features.reshape(1, -1))
             rarity_score = rarity_score[0]
             percentile = percentile[0]
             mahal_dist = mahal_dist[0]
@@ -483,12 +465,6 @@ class PortfolioOptimizerV29:
             for pair in combinations(sorted(c.game), 2):
                 covered.add(pair)
         return len(covered)/comb(25,2)
-
-    def _portfolio_entropy(self, portfolio):
-        freq = np.bincount([d for c in portfolio for d in c.game], minlength=26)[1:]
-        probs = freq/np.sum(freq)
-        probs = np.where(probs>0, probs, 1e-10)
-        return float(entropy(probs)/np.log(25))
 
     def _portfolio_diversity(self, portfolio):
         if len(portfolio) < 2:
@@ -505,9 +481,7 @@ class PortfolioOptimizerV29:
         return np.mean(dists)/(2*np.sqrt(N_FEATURES)) if dists else 0
 
     def _monte_carlo_score(self, portfolio, n_sim=500):
-        """MC simplificado: amostra fixa de histórico, sem pesos invertidos."""
         portfolio_masks = np.array([c.mask for c in portfolio], dtype=np.uint32)
-        # Amostra fixa (os primeiros n_sim sorteios, ou aleatória se muitos)
         if len(self.historical_masks) > n_sim:
             indices = np.random.choice(len(self.historical_masks), n_sim, replace=False)
         else:
@@ -517,28 +491,24 @@ class PortfolioOptimizerV29:
         for dm in drawn_masks:
             for pm in portfolio_masks:
                 hits = mask_intersection(pm, dm)
-                if hits >= 13:
+                if hits >= 11:  # agora com gradiente suave
                     total_score += EXPONENTIAL_WEIGHTS.get(hits, 0)
         return total_score / len(drawn_masks)
 
     def _compute_mc_normalization_fast(self):
-        """Calcula baseline rápido com carteiras aleatórias."""
         raw_scores = []
-        for _ in range(50):  # apenas 50 amostras
+        for _ in range(50):
             rand_port = [self._create_candidate(self.generator.generate_pure_random()) for _ in range(5)]
             raw_scores.append(self._monte_carlo_score(rand_port, 300))
         raw_scores = np.array(raw_scores)
-        return {
-            'p5': float(np.percentile(raw_scores, 5)),
-            'p95': float(np.percentile(raw_scores, 95))
-        }
+        return {'p5': float(np.percentile(raw_scores, 5)),
+                'p95': float(np.percentile(raw_scores, 95))}
 
     def _normalize_mc_score(self, raw_score):
         p5, p95 = self._mc_norm_params['p5'], self._mc_norm_params['p95']
         return max(0.0, min(1.0, (raw_score - p5) / (p95 - p5 + 1e-10)))
 
     def _portfolio_score(self, portfolio):
-        # Anti-colapso
         if self._pair_coverage(portfolio) > MAX_PAIR_COVERAGE:
             return -1000.0
         geo_div = self._geometric_diversity(portfolio)
@@ -550,41 +520,35 @@ class PortfolioOptimizerV29:
         avg_rarity = np.mean([c.rarity_score for c in portfolio])
         div_score = self._portfolio_diversity(portfolio)
 
-        # Combinação: 50% MC, 30% raridade, 10% diversidade, 10% geo
         return mc_norm * 0.5 + avg_rarity * 0.3 + div_score * 0.1 + geo_div * 0.1
 
     def _select_diverse_portfolio(self, candidates, n_games):
-        """Seleção gulosa por central_score + diversidade (interseção máxima)."""
         selected = []
         selected_masks = []
         for c in candidates:
             if len(selected) >= n_games:
                 break
-            # Evitar interseção > 10 com qualquer já selecionado
             if selected_masks and max(mask_intersection(c.mask, pm) for pm in selected_masks) > 10:
                 continue
             selected.append(c)
             selected_masks.append(c.mask)
-        # Se não completou, preenche com os melhores restantes mesmo com interseção
-        if len(selected) < n_games:
+        while len(selected) < n_games:
             for c in candidates:
-                if c in selected:
-                    continue
-                selected.append(c)
-                if len(selected) == n_games:
+                if c not in selected:
+                    selected.append(c)
                     break
         return selected
 
     def optimize(self, n_games=5, n_candidates=10000):
-        print(f"🎯 Carteira CONCENTRADA: {n_games} jogos")
+        print(f"\n🎯 Carteira CONCENTRADA: {n_games} jogos")
         print(f"📊 Raridade BIDIRECIONAL (target pct={TARGET_RARITY_PERCENTILE})")
         print(f"📈 Regime atual: score={self.current_regime_score:.2f} (pct={self.current_regime_percentile:.2f})")
-        print(f"💰 Pesos: 13:{EXPONENTIAL_WEIGHTS[13]} 14:{EXPONENTIAL_WEIGHTS[14]} 15:{EXPONENTIAL_WEIGHTS[15]}")
-        print("⚡ Modo rápido: sem KDE, sem UMAP, MC simplificado, seleção greedy.\n")
+        print(f"💰 Pesos MC: 11:{EXPONENTIAL_WEIGHTS[11]} 12:{EXPONENTIAL_WEIGHTS[12]} 13:{EXPONENTIAL_WEIGHTS[13]} 14:{EXPONENTIAL_WEIGHTS[14]} 15:{EXPONENTIAL_WEIGHTS[15]}")
+        print("⚡ Modo rápido: Mahalanobis consistente, geração anti-cluster, MC suave.\n")
 
         t0 = time.time()
 
-        # Fase 1: Gerar pool bruto (rápido)
+        # Fase 1: Gerar pool
         print("Fase 1: Gerando pool de jogos válidos...")
         raw_pool = []
         seen = set()
@@ -596,37 +560,31 @@ class PortfolioOptimizerV29:
                 raw_pool.append(game)
         print(f"   ✓ {len(raw_pool)} jogos únicos gerados em {time.time()-t0:.1f}s")
 
-        # Fase 2: Extrair features e calcular raridade em lote
+        # Fase 2: Features e raridade em lote
         print("Fase 2: Extraindo features e scores...")
         t1 = time.time()
-        # Amostrar se pool for muito grande (pegar 5000 melhores? não, calculamos todos, mas podemos limitar)
-        pool = raw_pool[:5000]  # no máximo 5000 para não pesar
+        pool = raw_pool[:5000]
         features_matrix = self.extractor.extract_features_batch(pool, self.last)
         rarity_scores, percentiles, mahal_dists = self.extractor.compute_rarity_scores_batch(features_matrix)
         print(f"   ✓ Scores calculados em {time.time()-t1:.1f}s")
 
-        # Criar candidatos
         candidates = []
         for i, game in enumerate(pool):
             mask = BITMASK_CACHE.get_mask(game)
             candidates.append(GameCandidate(
                 game, mask, features_matrix[i],
                 rarity_score=rarity_scores[i],
-                central_score=rarity_scores[i],  # central = rarity (sem KDE)
+                central_score=rarity_scores[i],
                 mahalanobis_dist=mahal_dists[i],
                 rarity_percentile=percentiles[i]
             ))
-
-        # Ordenar por central_score
         candidates.sort(key=lambda c: c.central_score, reverse=True)
 
-        # Fase 3: Selecionar carteira diversa
-        print("Fase 3: Selecionando carteira ótima (greedy + diversidade)...")
+        # Fase 3: Seleção gulosa + busca local
+        print("Fase 3: Selecionando carteira...")
         portfolio = self._select_diverse_portfolio(candidates, n_games)
         best_score = self._portfolio_score(portfolio)
 
-        # Pequena busca local (swap com top 200)
-        print("   Busca local rápida...")
         top_candidates = candidates[:200]
         improved = True
         while improved:
@@ -646,7 +604,7 @@ class PortfolioOptimizerV29:
                 if improved:
                     break
 
-        print(f"\n✅ Otimização concluída em {time.time()-t0:.1f}s")
+        print(f"✅ Otimização concluída em {time.time()-t0:.1f}s")
         return [c.game for c in portfolio], best_score
 
     def backtest(self, portfolio, test_draws):
@@ -678,9 +636,9 @@ class PortfolioOptimizerV29:
         }
 
 # ============================================================
-# WALK-FORWARD
+# WALK-FORWARD (MAIS LEVE)
 # ============================================================
-def walk_forward_validation(contests, n_windows=10, train_size=500, test_size=50, n_games=5):
+def walk_forward_validation(contests, n_windows=8, train_size=400, test_size=50, n_games=5):
     print(f"\n🔬 WALK-FORWARD ({n_windows} janelas)...")
     results = []
     for w in range(n_windows):
@@ -694,8 +652,8 @@ def walk_forward_validation(contests, n_windows=10, train_size=500, test_size=50
         test_data = contests[test_start:test_end]
         if len(train_data) < 100 or len(test_data) < 5:
             continue
-        opt = PortfolioOptimizerV29(train_data)
-        portfolio, _ = opt.optimize(n_games)
+        opt = PortfolioOptimizerV30(train_data)
+        portfolio, _ = opt.optimize(n_games, n_candidates=8000)
         bt = opt.backtest(portfolio, test_data)
         bt_rand = opt.backtest([opt.generator.generate_pure_random() for _ in range(n_games)], test_data)
         results.append({
@@ -707,7 +665,6 @@ def walk_forward_validation(contests, n_windows=10, train_size=500, test_size=50
         })
         print(f"   Janela {w}: diff_lift={bt['lift']-bt_rand['lift']:+.3f} "
               f"14pts: {bt['hit_distribution'].get(14,0)} vs {bt_rand['hit_distribution'].get(14,0)}")
-
     if results:
         diffs = [r['diff_lift'] for r in results]
         strat_14_total = sum(r['strat_14'] for r in results)
@@ -716,7 +673,6 @@ def walk_forward_validation(contests, n_windows=10, train_size=500, test_size=50
         print(f"   Média diff lift: {np.mean(diffs):+.3f} | Janelas +: {sum(1 for d in diffs if d>0)}/{len(results)}")
         print(f"   14pts total: Estratégia={strat_14_total} vs Aleatório={rand_14_total}")
         try:
-            from scipy.stats import wilcoxon
             _, p = wilcoxon(diffs)
             print(f"   Wilcoxon p: {p:.4f}")
         except:
@@ -728,7 +684,7 @@ def walk_forward_validation(contests, n_windows=10, train_size=500, test_size=50
 # ============================================================
 def main():
     print("="*70)
-    print("🧬 GERADOR DE CARTEIRA v29 - OTIMIZADO (REGIMES LOCAIS)")
+    print("🧬 GERADOR DE CARTEIRA v30 - CORRIGIDO (CONSISTENTE)")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if contests is None:
@@ -736,33 +692,28 @@ def main():
         return
     print(f"\n📂 {len(contests)} concursos")
     print(f"📌 Último: {contests[-1]['concurso']} - {contests[-1]['dezenas']}")
-    print(f"\n⚡ Performance: Mahalanobis vetorizado, sem KDE/UMAP, MC simplificado.")
+    print("⚡ Mahalanobis em espaço padronizado | Geração anti-cluster | MC suave")
     op = input("Escolha: 1. Gerar carteira | 2. Walk-forward | 3. Ambos [3]: ").strip() or "3"
 
     if op in ("1", "3"):
         t0 = time.time()
-        opt = PortfolioOptimizerV29(contests)
+        opt = PortfolioOptimizerV30(contests)
         print(f"⏱️ Inicialização: {time.time()-t0:.1f}s")
         print(f"📊 Regime atual: score={opt.current_regime_score:.2f} (pct={opt.current_regime_percentile:.2f})")
         portfolio, score = opt.optimize(5, 10000)
+
         last = contests[-1]['dezenas']
-        gen_features = np.array([opt.extractor.extract_features(g, last) for g in portfolio])
-        # KL rápido (opcional)
-        kl = 0.0
-        try:
-            kl = opt.extractor.compute_kl_divergence(gen_features) if hasattr(opt.extractor, 'compute_kl_divergence') else 0.0
-        except:
-            pass
-        print(f"\n📊 KL Divergence: {kl:.3f}")
         for i, g in enumerate(portfolio, 1):
             p = sum(1 for d in g if d%2==0)
             pr = sum(1 for d in g if d in PRIMES)
             m = sum(1 for d in g if d in MOLDURA)
             rep = len(set(g) & set(last))
             cons = sum(1 for j in range(len(g)-1) if g[j+1]-g[j]==1)
-            rarity, pct, mahal = opt.extractor.compute_rarity_scores_batch(
-                opt.extractor.extract_features(g, last).reshape(1,-1))
-            print(f" {i:2d}. {g} | P:{p} Pr:{pr} M:{m} Rep:{rep} Cons:{cons} Rarity:{rarity[0]:.2f} Pct:{pct[0]:.2f} Mahal:{mahal[0]:.1f}")
+            # Recalcular raridade individual para exibir
+            feat = opt.extractor.extract_features(g, last).reshape(1, -1)
+            r_score, r_pct, r_mahal = opt.extractor.compute_rarity_scores_batch(feat)
+            print(f" {i:2d}. {g} | P:{p} Pr:{pr} M:{m} Rep:{rep} Cons:{cons} "
+                  f"Rarity:{r_score[0]:.2f} Pct:{r_pct[0]:.2f} Mahal:{r_mahal[0]:.1f}")
 
         if len(contests) > 200:
             bt = opt.backtest(portfolio, contests[-200:])
@@ -771,7 +722,7 @@ def main():
                   f"13={bt['hit_distribution'].get(13,0)} 14={bt['hit_distribution'].get(14,0)} 15={bt['hit_distribution'].get(15,0)}")
 
     if op in ("2", "3"):
-        walk_forward_validation(contests, n_windows=10, train_size=500, test_size=50, n_games=5)
+        walk_forward_validation(contests, n_windows=8, train_size=400, test_size=50, n_games=5)
 
     print("\n✅ Concluído!")
 
