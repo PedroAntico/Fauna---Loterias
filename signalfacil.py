@@ -2,15 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-V34.1 — DRIFT LOCAL CONDICIONAL (OTIMIZADO)
+V34.2 — DRIFT LOCAL CONDICIONAL (TESTE DE HIPÓTESE DEFINITIVO)
 
-Otimizações:
-✅ N_CANDIDATOS reduzido para 10.000 (suficiente para baixa dimensionalidade)
-✅ Pool de features pré-computadas (pares, primos, moldura)
-✅ Repetição como único termo dinâmico
-✅ Seleção por amostragem ponderada (softmax) em vez de top-5 duro
-✅ Sem logs — usa razão simples para ranking
-✅ Execução viável em Pydroid/Colab
+Ajuste final:
+✅ n_testes = 300 (poder estatístico máximo com execução rápida)
+✅ Mantém pool pré-computado, amostragem ponderada e protocolo congelado
+✅ Se p > 0.05 ou lift < 0.02 com 300 testes → hipótese praticamente descartada
 """
 
 import numpy as np
@@ -27,15 +24,15 @@ import time
 
 WINDOW = 30
 N_JOGOS = 5
-N_CANDIDATOS = 10_000      # reduzido — suficiente para 4 features discretas
+N_CANDIDATOS = 10_000
 MAX_INTERSECAO = 10
 EPS = 1e-6
+N_TESTES = 300              # ← AUMENTADO PARA 300
 
 MOLDURA = {1,2,3,4,5, 6,10, 11,15, 16,20, 21,22,23,24,25}
 PRIMES = {2, 3, 5, 7, 11, 13, 17, 19, 23}
 
 def features_jogo(jogo):
-    """Extrai features de um jogo (retorna tupla imutável)."""
     pares = sum(1 for d in jogo if d % 2 == 0)
     moldura = sum(1 for d in jogo if d in MOLDURA)
     primos = sum(1 for d in jogo if d in PRIMES)
@@ -96,11 +93,10 @@ def carregar_concursos(csv_file='resultados_lotofacil.csv'):
         return None
 
 # ============================================================
-# POOL DE JOGOS PRÉ-COMPUTADO
+# POOL PRÉ-COMPUTADO
 # ============================================================
 
 def criar_pool(tamanho=20000):
-    """Gera um pool fixo de jogos com features pré-calculadas."""
     print(f"🔧 Criando pool de {tamanho} jogos...")
     pool = []
     for _ in tqdm(range(tamanho), desc="Pool"):
@@ -115,11 +111,10 @@ def criar_pool(tamanho=20000):
     return pool
 
 # ============================================================
-# MODELO DE DRIFT LOCAL
+# FREQUÊNCIAS
 # ============================================================
 
-def calcular_frequencias_locais(janela, ultimo):
-    """Frequências das features na janela local."""
+def calcular_frequencias_locais(janela):
     freq = {
         'pares': Counter(),
         'moldura': Counter(),
@@ -159,8 +154,11 @@ def calcular_frequencias_globais(historico):
             freq[k][v] /= total
     return freq
 
+# ============================================================
+# SCORE E SELEÇÃO
+# ============================================================
+
 def score_jogo(item_pool, freq_local, freq_global, ultimo):
-    """Score = soma das razões local/global (sem log)."""
     score = 0.0
     for feat in ['pares', 'moldura', 'primos']:
         valor = item_pool[feat]
@@ -173,62 +171,48 @@ def score_jogo(item_pool, freq_local, freq_global, ultimo):
     score += p_local / (p_global + EPS)
     return score
 
-# ============================================================
-# SELEÇÃO DE CARTEIRA (AMOSTRAGEM PONDERADA)
-# ============================================================
-
-def selecionar_carteira(pool, freq_local, freq_global, ultimo, n_candidatos=10000):
-    # Amostra aleatória do pool
-    indices = np.random.choice(len(pool), size=min(n_candidatos, len(pool)), replace=False)
+def selecionar_carteira(pool, freq_local, freq_global, ultimo):
+    indices = np.random.choice(len(pool), size=N_CANDIDATOS, replace=False)
     candidatos = [(idx, score_jogo(pool[idx], freq_local, freq_global, ultimo)) for idx in indices]
-    
-    # Ordena por score
     candidatos.sort(key=lambda x: x[1], reverse=True)
     
-    # Seleciona os N_CANDIDATOS melhores
-    top = candidatos[:n_candidatos]
+    top = candidatos[:N_CANDIDATOS]
     scores = np.array([s for _, s in top])
-    
-    # Softmax para amostragem ponderada
     scores_adj = scores - np.max(scores)
-    probs = np.exp(scores_adj / 0.5)  # temperatura 0.5
+    probs = np.exp(scores_adj / 0.5)
     probs /= probs.sum()
     
     selecionados = []
-    selecionados_jogos = []
     tentativas = 0
     while len(selecionados) < N_JOGOS and tentativas < 500:
         idx_pool = np.random.choice(len(top), p=probs)
         jogo = pool[top[idx_pool][0]]['jogo']
-        if all(interseccao(jogo, s) <= MAX_INTERSECAO for s in selecionados_jogos):
+        if all(interseccao(jogo, s) <= MAX_INTERSECAO for s in selecionados):
             selecionados.append(jogo)
-            selecionados_jogos.append(jogo)
         tentativas += 1
     
-    # Fallback: se não conseguir 5, completa com os melhores disponíveis
     for idx_sorted, _ in top:
         jogo = pool[idx_sorted]['jogo']
         if len(selecionados) >= N_JOGOS:
             break
-        if all(interseccao(jogo, s) <= MAX_INTERSECAO for s in selecionados_jogos):
+        if all(interseccao(jogo, s) <= MAX_INTERSECAO for s in selecionados):
             selecionados.append(jogo)
-            selecionados_jogos.append(jogo)
     
     return selecionados
 
 # ============================================================
-# WALK-FORWARD
+# WALK-FORWARD COM 300 TESTES
 # ============================================================
 
-def walk_forward_test(concursos, pool, n_testes=50):
+def walk_forward_test(concursos, pool):
     estrategia_hits = []
     aleatorio_hits = []
     indices_testados = []
     
-    passo = max(1, (len(concursos) - WINDOW - 1) // n_testes)
+    passo = max(1, (len(concursos) - WINDOW - 1) // N_TESTES)
     
-    for inicio in tqdm(range(0, len(concursos) - WINDOW - 1, passo), desc="Walk-forward"):
-        if len(estrategia_hits) >= n_testes:
+    for inicio in tqdm(range(0, len(concursos) - WINDOW - 1, passo), desc=f"Walk-forward ({N_TESTES} testes)"):
+        if len(estrategia_hits) >= N_TESTES:
             break
         
         fim = inicio + WINDOW
@@ -241,7 +225,7 @@ def walk_forward_test(concursos, pool, n_testes=50):
         teste = concursos[fim]
         ultimo = janela_local[-1]
         
-        freq_local = calcular_frequencias_locais(janela_local, ultimo)
+        freq_local = calcular_frequencias_locais(janela_local)
         freq_global = calcular_frequencias_globais(historico_global)
         
         carteira_estrategia = selecionar_carteira(pool, freq_local, freq_global, ultimo)
@@ -257,16 +241,16 @@ def walk_forward_test(concursos, pool, n_testes=50):
     return estrategia_hits, aleatorio_hits, indices_testados
 
 # ============================================================
-# ANÁLISE
+# ANÁLISE FINAL
 # ============================================================
 
-def analisar(est, ale, indices):
+def analisar(est, ale):
     print("\n" + "="*60)
-    print("RESULTADOS V34.1")
+    print(f"RESULTADOS V34.2 — {N_TESTES} TESTES")
     print("="*60)
-    print(f"Testes realizados: {len(est)}")
-    print(f"Média hits estratégia: {np.mean(est):.3f} ± {np.std(est):.3f}")
-    print(f"Média hits aleatório:   {np.mean(ale):.3f} ± {np.std(ale):.3f}")
+    print(f"Média hits estratégia: {np.mean(est):.4f} ± {np.std(est):.4f}")
+    print(f"Média hits aleatório:   {np.mean(ale):.4f} ± {np.std(ale):.4f}")
+    print(f"Diferença média: {np.mean([e-a for e,a in zip(est,ale)]):.4f}")
     
     for h in [11, 12, 13, 14, 15]:
         fe = sum(1 for x in est if x >= h) / len(est)
@@ -276,14 +260,22 @@ def analisar(est, ale, indices):
     diffs = [e - a for e, a in zip(est, ale)]
     try:
         stat, p = wilcoxon(diffs)
-        print(f"\nWilcoxon: p={p:.4f}")
-        if p < 0.05 and np.mean(diffs) > 0.02:
-            print("✅ Hipótese CONFIRMADA")
-        else:
-            print("❌ Hipótese NÃO confirmada")
+        print(f"\nWilcoxon: estatística={stat:.3f}, p={p:.4f}")
     except:
         p = 1.0
         print("Wilcoxon não pôde ser calculado")
+    
+    print("\n" + "="*60)
+    print("CONCLUSÃO")
+    print("="*60)
+    if p < 0.05 and np.mean(diffs) > 0.02:
+        print("✅ Há evidência de drift local explorável.")
+        print("   A estratégia supera o aleatório com significância estatística.")
+    else:
+        print("❌ NÃO há evidência de drift local explorável.")
+        print("   Com 300 testes, a Lotofácil comporta-se como IID.")
+        print("   Os desvios locais não persistem o suficiente para gerar vantagem.")
+    print("="*60)
     
     return diffs, p
 
@@ -293,7 +285,8 @@ def analisar(est, ale, indices):
 
 def main():
     print("="*60)
-    print("V34.1 — DRIFT LOCAL (OTIMIZADO)")
+    print("V34.2 — TESTE DEFINITIVO DE DRIFT LOCAL")
+    print(f"Configuração: janela={WINDOW}, testes={N_TESTES}, features fixas")
     print("="*60)
     
     concursos = carregar_concursos()
@@ -303,20 +296,10 @@ def main():
     pool = criar_pool(20000)
     
     t0 = time.time()
-    est, ale, idx = walk_forward_test(concursos, pool, n_testes=50)
-    print(f"\n⏱️ Tempo: {time.time()-t0:.1f}s")
+    est, ale, idx = walk_forward_test(concursos, pool)
+    print(f"\n⏱️ Tempo total: {time.time()-t0:.1f}s")
     
-    diffs, p = analisar(est, ale, idx)
-    
-    print("\n" + "="*60)
-    print("CONCLUSÃO")
-    print("="*60)
-    if p < 0.05 and np.mean(diffs) > 0.02:
-        print("Evidência de drift local explorável.")
-    else:
-        print("SEM evidência de drift local explorável.")
-        print("A Lotofácil comporta-se como IID nas condições testadas.")
-    print("="*60)
+    analisar(est, ale)
 
 if __name__ == "__main__":
     main()
