@@ -2,24 +2,21 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v32.3
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v32.4
 
-Refinamentos estatísticos:
-✅ Permutation test com permutações independentes (np.random.permutation)
-✅ MI ajustada (mi_obs - média da distribuição nula)
-✅ Autocorrelação linear de Pearson adicionada
-✅ Suporte a múltiplos lags (1 a 5) para detectar dependência de ordem superior
-✅ Opção "6" no menu para análise de autocorrelação e lags
-
-Mantém todas as funcionalidades do v32.2:
-- Carteira de cobertura otimizada
-- Walk-forward honesto
-- MI por features discretizadas + permutation test
-- Comparação real vs. sintético (RNG)
+Correções e melhorias:
+✅ Bug corrigido: .count() substituído por np.mean() para arrays NumPy
+✅ FDR (Benjamini-Hochberg) para controlar múltiplos testes
+✅ Autocorrelação parcial (PACF) incluída
+✅ FFT / espectro de potência básico para detectar periodicidades
+✅ Mantém todas as funcionalidades do v32.3
 """
 
 import numpy as np
 from scipy.stats import entropy, hypergeom, wilcoxon, pearsonr
+from scipy.signal import periodogram
+from statsmodels.tsa.stattools import pacf
+from statsmodels.stats.multitest import multipletests
 from collections import Counter
 from itertools import combinations
 import os, random, time, warnings
@@ -313,7 +310,7 @@ class LooseGenerator:
         return sorted(np.random.choice(range(1, 26), 15, replace=False))
 
 # ============================================================
-# NOVAS FUNÇÕES DE DEPENDÊNCIA TEMPORAL (v32.3)
+# FUNÇÕES DE DEPENDÊNCIA TEMPORAL (v32.4 corrigidas)
 # ============================================================
 def compute_temporal_features(contests):
     """Extrai features temporais para cada concurso (par chave:valor)."""
@@ -332,15 +329,17 @@ def compute_temporal_features(contests):
             series[name].append(val)
     return series
 
-def mutual_information_feature(x, y):
+def mutual_information_feature(series_x, series_y):
     """MI discreta entre duas sequências (já discretizadas)."""
-    joint = Counter(zip(x, y))
+    joint = Counter(zip(series_x, series_y))
     total = sum(joint.values())
+    x_arr = np.asarray(series_x)
+    y_arr = np.asarray(series_y)
     mi = 0.0
     for (x_val, y_val), count in joint.items():
         p_xy = count / total
-        p_x = x.count(x_val) / len(x)
-        p_y = y.count(y_val) / len(y)
+        p_x = np.mean(x_arr == x_val)
+        p_y = np.mean(y_arr == y_val)
         if p_x > 0 and p_y > 0:
             mi += p_xy * np.log2(p_xy / (p_x * p_y))
     return mi
@@ -356,15 +355,16 @@ def permutation_mi_test(series_t, lag=1, n_perm=500):
 
     # Distribuição nula: permutações independentes de y
     mi_null = np.zeros(n_perm)
+    y_arr = np.asarray(y)
     for i in range(n_perm):
-        y_perm = np.random.permutation(y)
+        y_perm = np.random.permutation(y_arr)
         mi_null[i] = mutual_information_feature(x, y_perm)
 
     # MI ajustada (subtrai viés)
     mean_null = np.mean(mi_null)
     adjusted_mi = mi_obs - mean_null
 
-    # p-valor bicaudal? Vamos usar unicaudal à direita: P(null >= obs)
+    # p-valor unicaudal à direita
     p_value = np.mean(mi_null >= mi_obs)
     return mi_obs, adjusted_mi, p_value, mi_null
 
@@ -376,6 +376,25 @@ def autocorrelation_test(series_t, lag=1):
         return 0.0, 1.0
     corr, p_val = pearsonr(x, y)
     return corr, p_val
+
+def partial_autocorrelation(series_t, nlags=5):
+    """Autocorrelação parcial (PACF)."""
+    x = np.array(series_t, dtype=float)
+    if len(x) < nlags + 1:
+        return np.zeros(nlags)
+    try:
+        return pacf(x, nlags=nlags)
+    except:
+        return np.zeros(nlags)
+
+def fft_analysis(series_t):
+    """Espectro de potência básico (periodograma)."""
+    x = np.array(series_t, dtype=float)
+    x = x - np.mean(x)
+    freqs, power = periodogram(x)
+    # Retorna frequência dominante e potência máxima (além da DC)
+    idx = np.argmax(power[1:]) + 1
+    return freqs[idx], power[idx], freqs, power
 
 # ============================================================
 # COMPARAÇÃO REAL vs SINTÉTICO
@@ -397,16 +416,19 @@ def compare_real_vs_synthetic(contests, n_synthetic=None):
     real_series = compute_temporal_features(contests)
     synth_series = compute_temporal_features(synthetic)
 
+    real_pvals = []
     for name in TEMPORAL_FEATURES:
         _, mi_adj_real, p_real, _ = permutation_mi_test(real_series[name], lag=1)
         _, mi_adj_synth, p_synth, _ = permutation_mi_test(synth_series[name], lag=1)
+        real_pvals.append(p_real)
         print(f"{name:<15} {mi_adj_real:<12.4f} {p_real:<10.3f} {mi_adj_synth:<15.4f} {p_synth:<10.3f}")
 
-    print("\n🔍 Se MI_adj ≈ 0 e p > 0.05, não há dependência temporal significativa.")
-    # Verificação geral
-    all_insignificant = all(permutation_mi_test(real_series[name], lag=1)[2] > 0.05 for name in TEMPORAL_FEATURES)
-    if all_insignificant:
-        print("   ➡️ Nenhuma feature mostrou dependência temporal significativa nos dados reais.")
+    # Correção FDR
+    _, fdr_pvals, _, _ = multipletests(real_pvals, method='fdr_bh')
+    print("\n🔍 Após correção FDR (Benjamini-Hochberg):")
+    for i, name in enumerate(TEMPORAL_FEATURES):
+        sig = "⚠️" if fdr_pvals[i] <= 0.05 else "não"
+        print(f"   {name}: p_raw={real_pvals[i]:.3f}, p_fdr={fdr_pvals[i]:.3f} -> {sig}")
 
     # PCA
     if SKLEARN_AVAILABLE:
@@ -654,7 +676,7 @@ def walk_forward_validation(contests, n_windows=8, train_size=400, test_size=50,
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v32.3")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v32.4")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
@@ -667,9 +689,9 @@ def main():
         print("\nOpções:")
         print("1. Gerar carteira de cobertura")
         print("2. Walk-forward (falsificação de hipóteses)")
-        print("3. Análise de dependência temporal (MI + permutação, lag=1)")
+        print("3. Análise de dependência temporal (MI + permutação, FDR)")
         print("4. Comparar concursos reais vs. sintéticos (RNG)")
-        print("5. Análise de autocorrelação e múltiplos lags (1 a 5)")
+        print("5. Autocorrelação, PACF e espectro (lags 1-5)")
         print("6. Sair")
         op = input("Escolha: ").strip()
         if op == '1':
@@ -692,30 +714,42 @@ def main():
         elif op == '2':
             walk_forward_validation(contests, n_windows=8, train_size=400, test_size=50, n_games=5)
         elif op == '3':
-            print("\n📊 INFORMAÇÃO MÚTUA AJUSTADA (lag=1) + TESTE DE PERMUTAÇÃO")
+            print("\n📊 INFORMAÇÃO MÚTUA AJUSTADA (lag=1) + CORREÇÃO FDR")
             series = compute_temporal_features(contests)
-            print(f"{'Feature':<15} {'MI_obs':<8} {'MI_adj':<8} {'p_val':<8} {'Signif.':<10}")
-            print("-" * 55)
+            pvals = []
+            print(f"{'Feature':<15} {'MI_obs':<8} {'MI_adj':<8} {'p_raw':<8}")
+            print("-" * 45)
             for name in TEMPORAL_FEATURES:
                 mi_obs, mi_adj, p_val, _ = permutation_mi_test(series[name], lag=1)
-                sig = "⚠️" if p_val <= 0.05 else "não"
-                print(f"{name:<15} {mi_obs:<8.4f} {mi_adj:<8.4f} {p_val:<8.3f} {sig:<10}")
-            print("\n🔍 Se MI_adj ≈ 0 e p > 0.05, não há dependência temporal significativa.")
+                pvals.append(p_val)
+                print(f"{name:<15} {mi_obs:<8.4f} {mi_adj:<8.4f} {p_val:<8.3f}")
+            _, fdr_pvals, _, _ = multipletests(pvals, method='fdr_bh')
+            print("\nApós FDR (Benjamini-Hochberg):")
+            for i, name in enumerate(TEMPORAL_FEATURES):
+                sig = "⚠️" if fdr_pvals[i] <= 0.05 else "não"
+                print(f"   {name}: p_fdr={fdr_pvals[i]:.3f} -> {sig}")
         elif op == '4':
             compare_real_vs_synthetic(contests)
         elif op == '5':
-            print("\n📊 AUTOCORRELAÇÃO E MI POR LAG (1 a 5)")
+            print("\n📊 AUTOCORRELAÇÃO, PACF E ESPECTRO POR FEATURE")
             series = compute_temporal_features(contests)
-            for lag in range(1, 6):
-                print(f"\n--- Lag {lag} ---")
-                print(f"{'Feature':<15} {'Corr':<8} {'p_corr':<8} {'MI_adj':<8} {'p_mi':<8} {'Signif.':<10}")
-                print("-" * 65)
-                for name in TEMPORAL_FEATURES:
-                    corr, p_corr = autocorrelation_test(series[name], lag)
-                    _, mi_adj, p_mi, _ = permutation_mi_test(series[name], lag)
-                    sig = "⚠️" if (p_corr <= 0.05 or p_mi <= 0.05) else "não"
-                    print(f"{name:<15} {corr:<8.3f} {p_corr:<8.3f} {mi_adj:<8.4f} {p_mi:<8.3f} {sig:<10}")
-            print("\n🔍 Correlação e MI ajustada próximas de zero + p > 0.05 = independência temporal.")
+            for name in TEMPORAL_FEATURES:
+                print(f"\n--- {name} ---")
+                s = series[name]
+                # Correlação e MI para múltiplos lags
+                print("Lag  Corr    p_corr  MI_adj  p_mi")
+                all_p_mi = []
+                for lag in range(1, 6):
+                    corr, p_corr = autocorrelation_test(s, lag)
+                    _, mi_adj, p_mi, _ = permutation_mi_test(s, lag)
+                    all_p_mi.append(p_mi)
+                    print(f"{lag:3d}  {corr:+.3f}  {p_corr:.3f}   {mi_adj:.4f}  {p_mi:.3f}")
+                # PACF
+                pacf_vals = partial_autocorrelation(s, nlags=5)
+                print(f"PACF (lags 1-5): {np.array2string(pacf_vals[1:], precision=3, separator=', ')}")
+                # FFT
+                freq_dom, pow_dom, freqs, power = fft_analysis(s)
+                print(f"Espectro: freq dominante = {freq_dom:.4f} (período ≈ {1/freq_dom if freq_dom>0 else np.inf:.1f}), potência = {pow_dom:.4f}")
         elif op == '6':
             break
         else:
