@@ -2,19 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v32
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v32.1
 
-Foco: investigação das propriedades estatísticas e combinatórias do sistema,
-não mais "previsão". Ferramentas incluídas:
-
-1. Geração de carteiras com cobertura ortogonal (v31)
-2. Cálculo de entropia condicional / mutual information entre concursos
-3. PCA do espaço de features (se sklearn disponível)
-4. Simulações massivas de cobertura de pares/trios
-5. Walk-forward honesto para falsificação de hipóteses
-
-Pesos e vieses dos modelos anteriores foram removidos ou atenuados.
-Este script é um instrumento científico, não um gerador de apostas.
+Correções:
+✅ f-strings com {{t-1}} para evitar NameError
+✅ Removida a chamada perigosa a bincount(2**25)
+✅ Adicionada opção "5" para comparar concursos reais com RNG sintético
 """
 
 import numpy as np
@@ -72,7 +65,6 @@ STRUCTURAL_REJECT_THRESHOLD = 15
 MAX_PAIR_COVERAGE = 0.90
 MAX_INTERSECTION = 7
 
-# Pesos (para análise de carteira, ainda mantidos mas com peso baixo)
 EXPONENTIAL_WEIGHTS = {
     11: 1.0,
     12: 4.0,
@@ -313,7 +305,6 @@ def compute_conditional_entropy(contests):
         joint_counts[(masks[i-1], masks[i])] += 1
     total = sum(joint_counts.values())
     cond_ent = 0.0
-    # P(prev)
     prev_counts = Counter()
     for i in range(len(masks)-1):
         prev_counts[masks[i]] += 1
@@ -327,8 +318,7 @@ def compute_conditional_entropy(contests):
 def mutual_information(contests):
     """I(X_t; X_{t-1}) = H(X_t) - H(X_t | X_{t-1})."""
     masks = [BITMASK_CACHE.get_mask(c['dezenas']) for c in contests]
-    h_xt = entropy(np.bincount(masks, minlength=2**25)[:len(set(masks))])  # aproximação grosseira, melhor usar frequências
-    # Vamos calcular H(X_t) pela distribuição empírica das máscaras
+    # H(X_t) pela distribuição empírica das máscaras
     mask_counts = Counter(masks)
     probs = np.array(list(mask_counts.values())) / len(masks)
     h_xt = entropy(probs, base=2)
@@ -336,15 +326,18 @@ def mutual_information(contests):
     return h_xt - cond_ent
 
 def pca_analysis(feature_matrix):
-    """Realiza PCA e retorna a variância explicada pelas 3 primeiras componentes."""
     if not SKLEARN_AVAILABLE:
         return None
     pca = PCA(n_components=min(5, feature_matrix.shape[1]))
     pca.fit(feature_matrix)
     return pca.explained_variance_ratio_[:3]
 
+def generate_synthetic_contests(n):
+    """Gera n concursos puramente aleatórios (i.i.d.)."""
+    return [{'concurso': i, 'data': '', 'dezenas': sorted(np.random.choice(range(1,26), 15, replace=False))} for i in range(n)]
+
 # ============================================================
-# OTIMIZADOR DE CARTEIRA (v31, com foco em cobertura)
+# OTIMIZADOR DE CARTEIRA (v31, mantido para referência)
 # ============================================================
 class PortfolioOptimizerV32:
     def __init__(self, contests):
@@ -528,25 +521,87 @@ def walk_forward_validation(contests, n_windows=8, train_size=400, test_size=50,
     return results
 
 # ============================================================
-# SIMULAÇÕES MASSIVAS DE COBERTURA
+# COMPARAÇÃO REAL vs SINTÉTICO
 # ============================================================
-def simulate_coverage(n_games, n_trials=200):
-    """Simula a cobertura de trios para carteiras aleatórias de tamanho n_games."""
-    triples_counts = []
-    for _ in range(n_trials):
-        portfolio = [sorted(np.random.choice(range(1,26), 15, replace=False)) for _ in range(n_games)]
-        all_triples = set()
-        for g in portfolio:
-            all_triples.update(combinations(g, 3))
-        triples_counts.append(len(all_triples))
-    return np.mean(triples_counts), np.std(triples_counts)
+def compare_real_vs_synthetic(contests, n_synthetic=None):
+    """Compara propriedades dos concursos reais com concursos sintéticos aleatórios."""
+    if n_synthetic is None:
+        n_synthetic = len(contests)
+    print(f"\n🔄 Gerando {n_synthetic} concursos sintéticos (i.i.d.)...")
+    synthetic = generate_synthetic_contests(n_synthetic)
+
+    # Entropia condicional e MI
+    real_cond_ent = compute_conditional_entropy(contests)
+    real_mi = mutual_information(contests)
+    synth_cond_ent = compute_conditional_entropy(synthetic)
+    synth_mi = mutual_information(synthetic)
+
+    print("\n📊 DEPENDÊNCIA TEMPORAL:")
+    print(f"   Real:   H(X_t|X_t-1) = {real_cond_ent:.4f} bits, MI = {real_mi:.4f} bits")
+    print(f"   Sintético: H(X_t|X_t-1) = {synth_cond_ent:.4f} bits, MI = {synth_mi:.4f} bits")
+    if real_mi < 0.01:
+        print("   ➡️ MI real muito próxima de zero: evidência de independência temporal.")
+
+    # PCA
+    if SKLEARN_AVAILABLE:
+        ext_real = FeatureExtractor(contests)
+        ext_synth = FeatureExtractor(synthetic)
+        real_pca = pca_analysis(ext_real.standardized_features)
+        synth_pca = pca_analysis(ext_synth.standardized_features)
+        if real_pca is not None and synth_pca is not None:
+            print("\n📊 PCA (variância explicada pelas 3 primeiras PCs):")
+            print(f"   Real: PC1={real_pca[0]:.2%}, PC2={real_pca[1]:.2%}, PC3={real_pca[2]:.2%}, Soma={np.sum(real_pca):.2%}")
+            print(f"   Sintético: PC1={synth_pca[0]:.2%}, PC2={synth_pca[1]:.2%}, PC3={synth_pca[2]:.2%}, Soma={np.sum(synth_pca):.2%}")
+            if np.sum(real_pca) < 0.5:
+                print("   ➡️ Variância explicada baixa: espaço aproximadamente isotrópico (sem direções preferenciais fortes).")
+    else:
+        print("\n⚠️ PCA indisponível (instale scikit-learn).")
+
+    # Distribuição de gaps
+    print("\n📊 DISTRIBUIÇÃO DE GAPS (média):")
+    for label, data in [("Real", contests), ("Sintético", synthetic)]:
+        gaps_all = []
+        for c in data:
+            d = sorted(c['dezenas'])
+            gaps_all.extend([d[i+1]-d[i] for i in range(len(d)-1)])
+        print(f"   {label}: média={np.mean(gaps_all):.2f}, desvio={np.std(gaps_all):.2f}")
+
+    # Mahalanobis médio
+    print("\n📊 DISTÂNCIA DE MAHALANOBIS MÉDIA:")
+    try:
+        # Usa o extrator real para ambos (só para referência)
+        ext = FeatureExtractor(contests)
+        real_f = ext.standardized_features
+        synth_f_raw = ext._build_raw_feature_matrix_from_contests(synthetic)
+        if ext.scaler is not None:
+            synth_f = ext.scaler.transform(synth_f_raw)
+        else:
+            synth_f = (synth_f_raw - ext.feature_means) / ext.feature_stds
+        real_m_dist = np.mean(ext.mahalanobis_batch(real_f))
+        synth_m_dist = np.mean(ext.mahalanobis_batch(synth_f))
+        print(f"   Real: {real_m_dist:.2f}, Sintético: {synth_m_dist:.2f}")
+    except Exception as e:
+        print(f"   Não foi possível calcular: {e}")
+
+    print("\n🔍 Se os valores forem muito próximos, reforça a hipótese de pseudoaleatoriedade efetiva.")
+
+# Necessário adicionar método auxiliar para construir features a partir de contests genéricos
+def _build_raw_feature_matrix_from_contests(self, contests_list):
+    # Versão estática, pois o FeatureExtractor usa self.contests, mas podemos criar uma função auxiliar
+    feats = []
+    for i, c in enumerate(contests_list):
+        last = set(contests_list[i-1]['dezenas']) if i > 0 else None
+        feats.append(self._extract_raw(c['dezenas'], last))
+    return np.array(feats, dtype=np.float64)
+
+FeatureExtractor._build_raw_feature_matrix_from_contests = _build_raw_feature_matrix_from_contests
 
 # ============================================================
 # INTERFACE PRINCIPAL
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v32")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v32.1")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
@@ -560,7 +615,7 @@ def main():
         print("1. Gerar carteira de cobertura")
         print("2. Walk-forward (falsificação de hipóteses)")
         print("3. Análise de aleatoriedade (entropia condicional / MI / PCA)")
-        print("4. Simulação massiva de cobertura de trios")
+        print("4. Comparar concursos reais vs. sintéticos (RNG)")
         print("5. Sair")
         op = input("Escolha: ").strip()
         if op == '1':
@@ -586,27 +641,18 @@ def main():
             print("\n📊 ANÁLISE DE ALEATORIEDADE")
             cond_ent = compute_conditional_entropy(contests)
             mi = mutual_information(contests)
-            print(f"Entropia condicional H(X_t | X_{t-1}): {cond_ent:.4f} bits")
-            print(f"Informação mútua I(X_t; X_{t-1}): {mi:.4f} bits")
+            print(f"Entropia condicional H(X_t | X_{{t-1}}): {cond_ent:.4f} bits")
+            print(f"Informação mútua I(X_t; X_{{t-1}}): {mi:.4f} bits")
             print("(Se MI ≈ 0, não há dependência temporal significativa)")
             if SKLEARN_AVAILABLE:
                 ext = FeatureExtractor(contests)
                 ratios = pca_analysis(ext.standardized_features)
                 if ratios is not None:
-                    print(f"Variância explicada pelas 3 primeiras PCs: {np.sum(ratios):.2%} (se baixa, espaço é isotrópico)")
+                    print(f"Variância explicada pelas 3 primeiras PCs: PC1={ratios[0]:.2%}, PC2={ratios[1]:.2%}, PC3={ratios[2]:.2%} (total={np.sum(ratios):.2%})")
             else:
                 print("PCA indisponível (instale scikit-learn).")
         elif op == '4':
-            try:
-                n_games = int(input("Tamanho da carteira (ex: 50, 100, 500): "))
-            except:
-                n_games = 50
-            mean_cov, std_cov = simulate_coverage(n_games, 200)
-            max_possible = n_games * comb(15, 3)
-            print(f"\n📈 Carteira de {n_games} jogos aleatórios (200 simulações):")
-            print(f"   Cobertura média de trios: {mean_cov:.0f} / {max_possible} ({mean_cov/comb(25,3)*100:.1f}% do total)")
-            print(f"   Desvio padrão: {std_cov:.0f}")
-            print("   (A cobertura máxima teórica de trios é 455)")
+            compare_real_vs_synthetic(contests)
         elif op == '5':
             break
         else:
