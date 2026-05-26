@@ -2,32 +2,32 @@
 # -*- coding: utf-8 -*-
 
 """
-V34.2 — DRIFT LOCAL CONDICIONAL (TESTE DE HIPÓTESE DEFINITIVO)
+V34.3 — MICRO‑DRIFT LOCAL (JANELAS 5, 10, 20)
 
-Ajuste final:
-✅ n_testes = 300 (poder estatístico máximo com execução rápida)
-✅ Mantém pool pré-computado, amostragem ponderada e protocolo congelado
-✅ Se p > 0.05 ou lift < 0.02 com 300 testes → hipótese praticamente descartada
+Último teste legítimo:
+✅ Três janelas testadas: 5, 10, 20
+✅ Mesmo protocolo congelado: features fixas, pool, scoring, amostragem
+✅ 300 testes por janela
+✅ Se todos p > 0.05 → encerra‑se a investigação honestamente
 """
 
 import numpy as np
 from scipy.stats import wilcoxon
 from collections import Counter
-import random
 import os
 from tqdm import tqdm
 import time
+import random
 
 # ============================================================
 # CONFIGURAÇÕES FIXAS (CONGELADAS)
 # ============================================================
 
-WINDOW = 30
 N_JOGOS = 5
 N_CANDIDATOS = 10_000
 MAX_INTERSECAO = 10
 EPS = 1e-6
-N_TESTES = 300              # ← AUMENTADO PARA 300
+N_TESTES = 300
 
 MOLDURA = {1,2,3,4,5, 6,10, 11,15, 16,20, 21,22,23,24,25}
 PRIMES = {2, 3, 5, 7, 11, 13, 17, 19, 23}
@@ -201,21 +201,20 @@ def selecionar_carteira(pool, freq_local, freq_global, ultimo):
     return selecionados
 
 # ============================================================
-# WALK-FORWARD COM 300 TESTES
+# WALK-FORWARD COM JANELA VARIÁVEL
 # ============================================================
 
-def walk_forward_test(concursos, pool):
+def walk_forward_test(concursos, pool, window):
     estrategia_hits = []
     aleatorio_hits = []
-    indices_testados = []
     
-    passo = max(1, (len(concursos) - WINDOW - 1) // N_TESTES)
+    passo = max(1, (len(concursos) - window - 1) // N_TESTES)
     
-    for inicio in tqdm(range(0, len(concursos) - WINDOW - 1, passo), desc=f"Walk-forward ({N_TESTES} testes)"):
+    for inicio in tqdm(range(0, len(concursos) - window - 1, passo), desc=f"W={window}"):
         if len(estrategia_hits) >= N_TESTES:
             break
         
-        fim = inicio + WINDOW
+        fim = inicio + window
         janela_local = concursos[inicio:fim]
         historico_global = concursos[:inicio]
         
@@ -236,47 +235,36 @@ def walk_forward_test(concursos, pool):
         
         estrategia_hits.append(hits_est)
         aleatorio_hits.append(hits_ale)
-        indices_testados.append(fim)
     
-    return estrategia_hits, aleatorio_hits, indices_testados
+    return estrategia_hits, aleatorio_hits
 
 # ============================================================
-# ANÁLISE FINAL
+# ANÁLISE DE UMA JANELA
 # ============================================================
 
-def analisar(est, ale):
-    print("\n" + "="*60)
-    print(f"RESULTADOS V34.2 — {N_TESTES} TESTES")
-    print("="*60)
+def analisar_janela(est, ale, window):
+    print(f"\n--- Janela {window} ---")
     print(f"Média hits estratégia: {np.mean(est):.4f} ± {np.std(est):.4f}")
     print(f"Média hits aleatório:   {np.mean(ale):.4f} ± {np.std(ale):.4f}")
-    print(f"Diferença média: {np.mean([e-a for e,a in zip(est,ale)]):.4f}")
+    diffs = [e - a for e, a in zip(est, ale)]
+    print(f"Diferença média: {np.mean(diffs):.4f}")
     
     for h in [11, 12, 13, 14, 15]:
         fe = sum(1 for x in est if x >= h) / len(est)
         fa = sum(1 for x in ale if x >= h) / len(ale)
         print(f"  {h}+ pts: estratégia={fe:.4f} | aleatório={fa:.4f}")
     
-    diffs = [e - a for e, a in zip(est, ale)]
     try:
         stat, p = wilcoxon(diffs)
-        print(f"\nWilcoxon: estatística={stat:.3f}, p={p:.4f}")
+        print(f"Wilcoxon: p={p:.4f}")
     except:
         p = 1.0
-        print("Wilcoxon não pôde ser calculado")
+        print("Wilcoxon não calculado")
     
-    print("\n" + "="*60)
-    print("CONCLUSÃO")
-    print("="*60)
     if p < 0.05 and np.mean(diffs) > 0.02:
-        print("✅ Há evidência de drift local explorável.")
-        print("   A estratégia supera o aleatório com significância estatística.")
+        print("✅ Sinal detectado")
     else:
-        print("❌ NÃO há evidência de drift local explorável.")
-        print("   Com 300 testes, a Lotofácil comporta-se como IID.")
-        print("   Os desvios locais não persistem o suficiente para gerar vantagem.")
-    print("="*60)
-    
+        print("❌ Sem evidência")
     return diffs, p
 
 # ============================================================
@@ -285,8 +273,7 @@ def analisar(est, ale):
 
 def main():
     print("="*60)
-    print("V34.2 — TESTE DEFINITIVO DE DRIFT LOCAL")
-    print(f"Configuração: janela={WINDOW}, testes={N_TESTES}, features fixas")
+    print("V34.3 — TESTE FINAL DE MICRO‑DRIFT (JANELAS 5,10,20)")
     print("="*60)
     
     concursos = carregar_concursos()
@@ -295,11 +282,34 @@ def main():
     
     pool = criar_pool(20000)
     
-    t0 = time.time()
-    est, ale, idx = walk_forward_test(concursos, pool)
-    print(f"\n⏱️ Tempo total: {time.time()-t0:.1f}s")
+    janelas = [5, 10, 20]
+    resultados = {}
     
-    analisar(est, ale)
+    for w in janelas:
+        t0 = time.time()
+        est, ale = walk_forward_test(concursos, pool, w)
+        tempo = time.time() - t0
+        diffs, p = analisar_janela(est, ale, w)
+        resultados[w] = {
+            'p': p,
+            'diff_media': np.mean(diffs),
+            'tempo': tempo
+        }
+    
+    print("\n" + "="*60)
+    print("RESUMO FINAL")
+    for w in janelas:
+        r = resultados[w]
+        sig = "✅" if (r['p'] < 0.05 and r['diff_media'] > 0.02) else "❌"
+        print(f"Janela {w:2d}: p={r['p']:.4f}, dif={r['diff_media']:.4f} {sig}")
+    
+    if all(r['p'] > 0.05 or r['diff_media'] <= 0.02 for r in resultados.values()):
+        print("\nConclusão: NENHUMA janela apresentou evidência de drift local.")
+        print("A Lotofácil se comporta como um processo IID nas condições testadas.")
+        print("Encerra-se a investigação estatística de forma honesta.")
+    else:
+        print("\nAtenção: Pelo menos uma janela indicou sinal — investigar com cautela.")
+    print("="*60)
 
 if __name__ == "__main__":
     main()
