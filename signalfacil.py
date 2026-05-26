@@ -2,17 +2,21 @@
 # -*- coding: utf-8 -*-
 
 """
-GERADOR DE CARTEIRA v30.1 – GERADOR ANTI-CLUSTERIZAÇÃO FORTE
+GERADOR DE CARTEIRA v31 – COBERTURA COMBINATÓRIA (ANTI-REDUNDÂNCIA)
 
-CORREÇÕES vs v30:
-✅ Gerador: penalidade de gaps ≤2 aumentada (1.8×), peso de quadrantes reduzido (1.2×)
-✅ Gerador: limiar de consecutivos reduzido para 4, penalidade interna aumentada
-✅ Estrutural: MAX_CONSECUTIVOS_RUN = 5, penalidade mais severa
-✅ Mantém Mahalanobis corrigido, MC suave, seleção gulosa
-⚠️  ATENÇÃO: o objetivo atual (raridade + MC histórico) favorece jogos "normais",
-    o que maximiza 11/12 pontos mas reduz drasticamente a chance de 14/15.
-    Para buscar acertos altos, o foco deve migrar para cobertura combinatória,
-    dispersão de pares/trios e entropia da carteira – veja comentários ao final.
+MUDANÇA DE PARADIGMA:
+✅ Objetivo deixou de ser "prever" e passou a ser "cobrir o espaço com dispersão máxima"
+✅ MC histórico: peso reduzido a 10%
+✅ Cobertura de trios únicos como métrica principal
+✅ Entropia da carteira (distribuição uniforme das dezenas)
+✅ Penalidade de redundância de pares entre jogos
+✅ Interseção máxima entre jogos reduzida a 7 (ortogonalidade forte)
+✅ Gerador anti-cluster do v30.1 mantido para jogos naturais
+
+FILOSOFIA:
+Não buscamos o jogo mais provável, mas o conjunto de jogos que maximiza
+a probabilidade de que pelo menos um deles capture um evento raro (14/15 pontos),
+minimizando correlação interna e maximizando cobertura combinatória.
 """
 
 import numpy as np
@@ -34,7 +38,7 @@ except ImportError:
     print("⚠️ Scikit-learn não instalado. Use: pip install scikit-learn")
 
 # ============================================================
-# CONJUNTOS E CONSTANTES (AJUSTADAS)
+# CONJUNTOS E CONSTANTES
 # ============================================================
 PRIMES = {2, 3, 5, 7, 11, 13, 17, 19, 23}
 MOLDURA = {1,2,3,4,5, 6,10, 11,15, 16,20, 21,22,23,24,25}
@@ -51,8 +55,8 @@ FEATURE_NAMES = [
 ]
 N_FEATURES = len(FEATURE_NAMES)
 
-# Constraints ESTRUTURAIS (mais rígidas contra consecutivos)
-MAX_CONSECUTIVOS_RUN = 5          # era 6
+# Constraints ESTRUTURAIS (mantidas do v30.1)
+MAX_CONSECUTIVOS_RUN = 5
 MAX_CLUSTERIZACAO = 0.95
 
 STRUCTURAL_TARGETS = {
@@ -66,11 +70,12 @@ STRUCTURAL_TARGETS = {
 }
 STRUCTURAL_REJECT_THRESHOLD = 15
 
-MAX_PAIR_COVERAGE = 0.75
-MIN_GEO_DIVERSITY = 0.25
-MAX_GEO_DIVERSITY = 0.85
+# Cobertura – limites mais frouxos porque o objetivo é explorar
+MAX_PAIR_COVERAGE = 0.90          # antes 0.75, agora permitimos mais cobertura
+MIN_GEO_DIVERSITY = 0.20
+MAX_GEO_DIVERSITY = 0.90
 
-# Pesos MC com gradiente contínuo
+# Pesos MC (agora usados apenas para referência leve)
 EXPONENTIAL_WEIGHTS = {
     11: 1.0,
     12: 4.0,
@@ -79,9 +84,12 @@ EXPONENTIAL_WEIGHTS = {
     15: 50000.0,
 }
 
-# Raridade bidirecional (mantida, mas ciente da tendência central)
+# Raridade (não mais central)
 TARGET_RARITY_PERCENTILE = 0.80
 RARITY_PENALTY_ABOVE = 0.99
+
+# Ortogonalidade: interseção máxima entre jogos
+MAX_INTERSECTION = 7            # era 10, agora bem mais restritivo
 
 # ============================================================
 # UTILITÁRIOS BITMASK
@@ -138,41 +146,7 @@ def load_all_contests(csv_file='resultados_lotofacil.csv'):
     return contests
 
 # ============================================================
-# DETECTOR DE REGIME LOCAL
-# ============================================================
-class LocalRegimeDetector:
-    def __init__(self, feature_matrix, window=20):
-        self.feature_matrix = feature_matrix
-        self.window = window
-        self.global_mean = np.mean(feature_matrix, axis=0)
-        self.global_std = np.std(feature_matrix, axis=0) + 1e-10
-        self._compute_regime_history()
-
-    def _compute_regime_history(self):
-        self.regime_scores = []
-        for i in range(self.window, len(self.feature_matrix)):
-            recent = self.feature_matrix[i-self.window:i]
-            recent_mean = np.mean(recent, axis=0)
-            z_scores = (recent_mean - self.global_mean) / self.global_std
-            self.regime_scores.append(np.mean(np.abs(z_scores)))
-        self.regime_scores = np.array(self.regime_scores)
-
-    def get_current_regime_score(self):
-        if len(self.feature_matrix) >= self.window:
-            recent = self.feature_matrix[-self.window:]
-            recent_mean = np.mean(recent, axis=0)
-            z_scores = (recent_mean - self.global_mean) / self.global_std
-            return float(np.mean(np.abs(z_scores)))
-        return 0.0
-
-    def get_regime_percentile(self):
-        current = self.get_current_regime_score()
-        if len(self.regime_scores) > 0:
-            return float(np.mean(self.regime_scores <= current))
-        return 0.5
-
-# ============================================================
-# EXTRATOR DE FEATURES (MESMA BASE CORRIGIDA DO v30)
+# EXTRATOR DE FEATURES (idêntico ao v30.1)
 # ============================================================
 class FeatureExtractor:
     def __init__(self, contests):
@@ -197,7 +171,6 @@ class FeatureExtractor:
             self.standardized_features = (raw_features - self.feature_means) / self.feature_stds
 
         self._build_multivariate_model(self.standardized_features)
-        self.regime_detector = LocalRegimeDetector(self.standardized_features)
 
     def _build_raw_feature_matrix(self):
         features_list = []
@@ -221,10 +194,8 @@ class FeatureExtractor:
         std_pos = np.std(d) if len(d)>1 else 0.0
         compressao = std_pos/amplitude if amplitude>0 else 0.5
         return np.array([
-            float(np.mean(gaps)),
-            float(np.var(gaps)),
-            float(max(gaps)),
-            float(min(gaps)),
+            float(np.mean(gaps)), float(np.var(gaps)),
+            float(max(gaps)), float(min(gaps)),
             float(sum(abs(d[i]-d[i-1]) for i in range(1, len(d)))),
             ent_trans,
             float(len(set((x-1)//5 for x in d))),
@@ -262,9 +233,6 @@ class FeatureExtractor:
         diff = features_matrix - self._mean_vector
         temp = np.dot(diff, self.precision_matrix)
         return np.sqrt(np.maximum(0, np.sum(temp * diff, axis=1)))
-
-    def mahalanobis_distance(self, features):
-        return self.mahalanobis_batch(features.reshape(1, -1))[0]
 
     def compute_rarity_scores_batch(self, features_matrix):
         dists = self.mahalanobis_batch(features_matrix)
@@ -322,7 +290,7 @@ class FeatureExtractor:
             else:
                 run = 1
         if max_run > MAX_CONSECUTIVOS_RUN:
-            penalty += (max_run - MAX_CONSECUTIVOS_RUN) * 10.0   # era 5.0
+            penalty += (max_run - MAX_CONSECUTIVOS_RUN) * 10.0
 
         gaps = [d[i+1]-d[i] for i in range(len(d)-1)]
         clusterizacao = sum(1 for g in gaps if g <= 2) / len(gaps)
@@ -334,23 +302,7 @@ class FeatureExtractor:
         return self.compute_structural_penalty(game) < STRUCTURAL_REJECT_THRESHOLD
 
 # ============================================================
-# GAMECANDIDATE
-# ============================================================
-class GameCandidate:
-    __slots__ = ('game', 'mask', 'features', 'rarity_score', 'central_score',
-                 'mahalanobis_dist', 'rarity_percentile')
-    def __init__(self, game, mask, features, rarity_score=0, central_score=0,
-                 mahalanobis_dist=0, rarity_percentile=0):
-        self.game = game
-        self.mask = mask
-        self.features = features
-        self.rarity_score = rarity_score
-        self.central_score = central_score
-        self.mahalanobis_dist = mahalanobis_dist
-        self.rarity_percentile = rarity_percentile
-
-# ============================================================
-# GERADOR FORTEMENTE ANTI-CLUSTERIZAÇÃO
+# GERADOR ANTI-CLUSTER (v30.1)
 # ============================================================
 class LooseGenerator:
     def __init__(self, extractor=None):
@@ -371,15 +323,12 @@ class LooseGenerator:
             scores = []
             for d in candidates:
                 test = sorted(game | {d})
-                # Quadrantes: peso reduzido (1.2 em vez de 2)
                 quad_score = len(set((x-1)//5 for x in test)) * 1.2
-                # Penalidade de clusterização (gaps ≤ 2): peso forte 1.8
                 if len(test) > 1:
                     gaps = [test[i+1]-test[i] for i in range(len(test)-1)]
                     cluster_penalty = sum(1 for g in gaps if g <= 2) * 1.8
                 else:
                     cluster_penalty = 0.0
-                # Penalidade de consecutivos longos: limiar 4, peso 5
                 run = 1
                 max_run = 1
                 for i in range(len(test)-1):
@@ -390,7 +339,6 @@ class LooseGenerator:
                         run = 1
                 consec_penalty = max(0, max_run - 4) * 5
                 scores.append(quad_score - cluster_penalty - consec_penalty)
-
             if scores:
                 scores = np.array(scores, dtype=np.float64)
                 scores -= np.max(scores)
@@ -407,9 +355,9 @@ class LooseGenerator:
         return sorted(np.random.choice(range(1, 26), 15, replace=False))
 
 # ============================================================
-# OTIMIZADOR v30.1 (COM ALERTA SOBRE O OBJETIVO)
+# OTIMIZADOR v31 – COBERTURA COMBINATÓRIA
 # ============================================================
-class PortfolioOptimizerV301:
+class PortfolioOptimizerV31:
     def __init__(self, contests):
         self.contests = contests
         self.extractor = FeatureExtractor(contests)
@@ -423,10 +371,6 @@ class PortfolioOptimizerV301:
             self.historical_draws.extend(extra)
             self.historical_masks = draw_masks_to_array(self.historical_draws)
 
-        self.current_regime_score = self.extractor.regime_detector.get_current_regime_score()
-        self.current_regime_percentile = self.extractor.regime_detector.get_regime_percentile()
-        self._mc_norm_params = self._compute_mc_normalization_fast()
-
     def _create_candidate(self, game, rarity_score=None, percentile=None, mahal_dist=None):
         mask = BITMASK_CACHE.get_mask(game)
         features = self.extractor.extract_features(game, self.last)
@@ -437,26 +381,47 @@ class PortfolioOptimizerV301:
             mahal_dist = mahal_dist[0]
         return GameCandidate(game, mask, features, rarity_score, rarity_score, mahal_dist, percentile)
 
-    def _pair_coverage(self, portfolio):
+    # ========== Novas métricas de cobertura ==========
+    def _unique_triples(self, portfolio):
+        """Número de triplas distintas entre todos os jogos."""
+        all_triples = set()
+        for c in portfolio:
+            for triple in combinations(sorted(c.game), 3):
+                all_triples.add(triple)
+        return len(all_triples)
+
+    def _pair_coverage_global(self, portfolio):
+        """Fração de pares cobertos pela carteira."""
         covered = set()
         for c in portfolio:
             for pair in combinations(sorted(c.game), 2):
                 covered.add(pair)
-        return len(covered)/comb(25,2)
+        return len(covered) / comb(25, 2)
 
-    def _portfolio_diversity(self, portfolio):
-        if len(portfolio) < 2: return 1.0
-        masks = [c.mask for c in portfolio]
-        sims = [mask_intersection(masks[i], masks[j]) for i in range(len(masks)) for j in range(i+1, len(masks))]
-        return 1.0 - np.mean(sims)/15.0 if sims else 1.0
+    def _pair_redundancy(self, portfolio):
+        """
+        Mede quantos pares são compartilhados entre mais de um jogo.
+        Alta redundância → penalidade.
+        """
+        pair_counts = Counter()
+        for c in portfolio:
+            for pair in combinations(sorted(c.game), 2):
+                pair_counts[pair] += 1
+        # Pares que aparecem em mais de 1 jogo
+        redundant = sum(max(0, cnt-1) for cnt in pair_counts.values())
+        # Normaliza pelo máximo possível (se todos pares fossem idênticos)
+        max_possible = (len(portfolio)-1) * comb(15, 2)
+        return redundant / max_possible if max_possible > 0 else 0
 
-    def _geometric_diversity(self, portfolio):
-        if len(portfolio) < 2: return 0.5
-        fvs = np.array([c.features for c in portfolio])
-        dists = [np.linalg.norm(fvs[i]-fvs[j]) for i in range(len(fvs)) for j in range(i+1, len(fvs))]
-        return np.mean(dists)/(2*np.sqrt(N_FEATURES)) if dists else 0
+    def _portfolio_entropy(self, portfolio):
+        """Entropia da distribuição das dezenas na carteira."""
+        freq = np.bincount([d for c in portfolio for d in c.game], minlength=26)[1:]
+        probs = freq / np.sum(freq)
+        probs = np.where(probs > 0, probs, 1e-10)
+        return entropy(probs) / np.log(25)  # normalizada para [0,1]
 
     def _monte_carlo_score(self, portfolio, n_sim=500):
+        """MC rápido, mantido apenas como leve referência (peso baixo)."""
         portfolio_masks = np.array([c.mask for c in portfolio], dtype=np.uint32)
         if len(self.historical_masks) > n_sim:
             indices = np.random.choice(len(self.historical_masks), n_sim, replace=False)
@@ -471,36 +436,73 @@ class PortfolioOptimizerV301:
                     total_score += EXPONENTIAL_WEIGHTS.get(hits, 0)
         return total_score / len(drawn_masks)
 
-    def _compute_mc_normalization_fast(self):
+    # ========== Score principal da carteira ==========
+    def _portfolio_score(self, portfolio):
+        """
+        Objetivo combinado:
+        - Maximizar cobertura de triplas (proxy de cobertura espacial)
+        - Maximizar entropia (distribuição uniforme)
+        - Minimizar redundância de pares
+        - Manter um piso de raridade (para não gerar jogos extremamente atípicos)
+        - Pequena referência ao MC (10%)
+        """
+        # Pré‑checagens de diversidade (mais frouxas, pois queremos cobertura)
+        pair_cov = self._pair_coverage_global(portfolio)
+        if pair_cov > MAX_PAIR_COVERAGE:
+            return -1000.0
+
+        # Métricas principais
+        triples = self._unique_triples(portfolio)
+        # Normalização: máximo teórico se cada jogo contribuir com triplas totalmente distintas
+        max_triples = len(portfolio) * comb(15, 3)
+        triple_score = triples / max_triples
+
+        entropy_score = self._portfolio_entropy(portfolio)
+        redundancy = self._pair_redundancy(portfolio)
+        redundancy_penalty = redundancy * 0.5   # peso moderado
+
+        avg_rarity = np.mean([c.rarity_score for c in portfolio])
+        # MC normalizado grosseiramente (sem normalização dinâmica para não viciar)
+        raw_mc = self._monte_carlo_score(portfolio)
+        # Normalização simples: usa p5 e p95 pré-computados uma única vez
+        if not hasattr(self, '_mc_bounds'):
+            self._mc_bounds = self._compute_mc_bounds()
+        p5, p95 = self._mc_bounds
+        mc_norm = max(0.0, min(1.0, (raw_mc - p5) / (p95 - p5 + 1e-10)))
+
+        # Pesos: cobertura de triplas domina (40%), entropia (30%),
+        # raridade leve (20%), MC apenas 10%
+        score = (triple_score * 0.4 +
+                 entropy_score * 0.3 +
+                 avg_rarity * 0.2 +
+                 mc_norm * 0.1 -
+                 redundancy_penalty)
+        return score
+
+    def _compute_mc_bounds(self):
+        """Calcula uma vez os percentis de MC para carteiras aleatórias."""
         raw_scores = []
-        for _ in range(50):
+        for _ in range(30):
             rand_port = [self._create_candidate(self.generator.generate_pure_random()) for _ in range(5)]
             raw_scores.append(self._monte_carlo_score(rand_port, 300))
         raw_scores = np.array(raw_scores)
-        return {'p5': float(np.percentile(raw_scores, 5)), 'p95': float(np.percentile(raw_scores, 95))}
-
-    def _normalize_mc_score(self, raw_score):
-        p5, p95 = self._mc_norm_params['p5'], self._mc_norm_params['p95']
-        return max(0.0, min(1.0, (raw_score - p5) / (p95 - p5 + 1e-10)))
-
-    def _portfolio_score(self, portfolio):
-        if self._pair_coverage(portfolio) > MAX_PAIR_COVERAGE: return -1000.0
-        geo_div = self._geometric_diversity(portfolio)
-        if not (MIN_GEO_DIVERSITY <= geo_div <= MAX_GEO_DIVERSITY): return -1000.0
-        raw_mc = self._monte_carlo_score(portfolio)
-        mc_norm = self._normalize_mc_score(raw_mc)
-        avg_rarity = np.mean([c.rarity_score for c in portfolio])
-        div_score = self._portfolio_diversity(portfolio)
-        return mc_norm * 0.5 + avg_rarity * 0.3 + div_score * 0.1 + geo_div * 0.1
+        return float(np.percentile(raw_scores, 5)), float(np.percentile(raw_scores, 95))
 
     def _select_diverse_portfolio(self, candidates, n_games):
+        """
+        Seleção gulosa com restrição de interseção ≤ MAX_INTERSECTION.
+        Prioriza candidatos com maior central_score (raridade), mas sem sobreposição.
+        """
         selected, selected_masks = [], []
         for c in candidates:
-            if len(selected) >= n_games: break
-            if selected_masks and max(mask_intersection(c.mask, pm) for pm in selected_masks) > 10:
+            if len(selected) >= n_games:
+                break
+            # Testa interseção com todos os já selecionados
+            if selected_masks and any(mask_intersection(c.mask, pm) > MAX_INTERSECTION for pm in selected_masks):
                 continue
             selected.append(c)
             selected_masks.append(c.mask)
+        # Se não completou, preenche com os melhores restantes (ignorando interseção)
         while len(selected) < n_games:
             for c in candidates:
                 if c not in selected:
@@ -509,12 +511,11 @@ class PortfolioOptimizerV301:
         return selected
 
     def optimize(self, n_games=5, n_candidates=10000):
-        print(f"\n🎯 Carteira CONCENTRADA: {n_games} jogos")
-        print(f"📊 Raridade BIDIRECIONAL (target pct={TARGET_RARITY_PERCENTILE})")
-        print(f"📈 Regime atual: score={self.current_regime_score:.2f} (pct={self.current_regime_percentile:.2f})")
-        print(f"💰 Pesos MC: 11:{EXPONENTIAL_WEIGHTS[11]} 12:{EXPONENTIAL_WEIGHTS[12]} 13:{EXPONENTIAL_WEIGHTS[13]} 14:{EXPONENTIAL_WEIGHTS[14]} 15:{EXPONENTIAL_WEIGHTS[15]}")
-        print("⚡ Gerador anti-cluster: quadrantes 1.2×, gap penalty 1.8×, max run 4")
-        print("⚠️  Alerta: objetivo atual favorece jogos 'normais' – maximiza 11/12, reduz 14/15.\n")
+        print(f"\n🧩 CARTEIRA DE COBERTURA: {n_games} jogos")
+        print(f"🎯 Objetivo: maximizar cobertura de triplas + entropia, minimizar redundância")
+        print(f"🚫 Interseção máxima entre jogos: {MAX_INTERSECTION}")
+        print(f"⚖️  Pesos: Triplas 40%, Entropia 30%, Raridade 20%, MC 10%")
+        print(f"🔧 Gerador anti-cluster (v30.1)\n")
 
         t0 = time.time()
         print("Fase 1: Gerando pool de jogos válidos...")
@@ -544,30 +545,49 @@ class PortfolioOptimizerV301:
                 mahalanobis_dist=mahal_dists[i],
                 rarity_percentile=percentiles[i]
             ))
+        # Ordena por central_score (raridade) para que a seleção gulosa priorize jogos plausíveis
         candidates.sort(key=lambda c: c.central_score, reverse=True)
 
-        print("Fase 3: Selecionando carteira...")
+        print("Fase 3: Selecionando carteira de cobertura...")
         portfolio = self._select_diverse_portfolio(candidates, n_games)
         best_score = self._portfolio_score(portfolio)
 
-        top_candidates = candidates[:200]
+        # Busca local simples: tenta trocar por candidatos do top 300
+        top_candidates = candidates[:300]
         improved = True
         while improved:
             improved = False
             for i in range(len(portfolio)):
                 for c in top_candidates:
-                    if c in portfolio: continue
+                    if c in portfolio:
+                        continue
                     new_port = portfolio.copy()
                     new_port[i] = c
+                    # Verifica restrição de interseção
+                    masks_new = [x.mask for x in new_port]
+                    ok = True
+                    for a in range(len(new_port)):
+                        for b in range(a+1, len(new_port)):
+                            if mask_intersection(masks_new[a], masks_new[b]) > MAX_INTERSECTION:
+                                ok = False
+                                break
+                        if not ok:
+                            break
+                    if not ok:
+                        continue
                     new_score = self._portfolio_score(new_port)
                     if new_score > best_score:
                         portfolio = new_port
                         best_score = new_score
                         improved = True
                         break
-                if improved: break
+                if improved:
+                    break
 
         print(f"✅ Otimização concluída em {time.time()-t0:.1f}s")
+        print(f"   Cobertura de triplas: {self._unique_triples(portfolio)}/{len(portfolio)*comb(15,3)}")
+        print(f"   Entropia: {self._portfolio_entropy(portfolio):.3f}")
+        print(f"   Redundância de pares: {self._pair_redundancy(portfolio):.3f}")
         return [c.game for c in portfolio], best_score
 
     def backtest(self, portfolio, test_draws):
@@ -596,6 +616,22 @@ class PortfolioOptimizerV301:
         }
 
 # ============================================================
+# GAMECANDIDATE (inalterado)
+# ============================================================
+class GameCandidate:
+    __slots__ = ('game', 'mask', 'features', 'rarity_score', 'central_score',
+                 'mahalanobis_dist', 'rarity_percentile')
+    def __init__(self, game, mask, features, rarity_score=0, central_score=0,
+                 mahalanobis_dist=0, rarity_percentile=0):
+        self.game = game
+        self.mask = mask
+        self.features = features
+        self.rarity_score = rarity_score
+        self.central_score = central_score
+        self.mahalanobis_dist = mahalanobis_dist
+        self.rarity_percentile = rarity_percentile
+
+# ============================================================
 # WALK-FORWARD
 # ============================================================
 def walk_forward_validation(contests, n_windows=8, train_size=400, test_size=50, n_games=5):
@@ -606,11 +642,13 @@ def walk_forward_validation(contests, n_windows=8, train_size=400, test_size=50,
         test_start = test_end - test_size
         train_end = test_start
         train_start = max(0, train_end - train_size)
-        if train_start >= train_end or test_start >= test_end: continue
+        if train_start >= train_end or test_start >= test_end:
+            continue
         train_data = contests[train_start:train_end]
         test_data = contests[test_start:test_end]
-        if len(train_data) < 100 or len(test_data) < 5: continue
-        opt = PortfolioOptimizerV301(train_data)
+        if len(train_data) < 100 or len(test_data) < 5:
+            continue
+        opt = PortfolioOptimizerV31(train_data)
         portfolio, _ = opt.optimize(n_games, n_candidates=8000)
         bt = opt.backtest(portfolio, test_data)
         bt_rand = opt.backtest([opt.generator.generate_pure_random() for _ in range(n_games)], test_data)
@@ -639,7 +677,7 @@ def walk_forward_validation(contests, n_windows=8, train_size=400, test_size=50,
 # ============================================================
 def main():
     print("="*70)
-    print("🧬 GERADOR DE CARTEIRA v30.1 – ANTI-CLUSTERIZAÇÃO FORTE")
+    print("🧬 GERADOR DE CARTEIRA v31 – COBERTURA COMBINATÓRIA")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if contests is None:
@@ -647,13 +685,13 @@ def main():
         return
     print(f"\n📂 {len(contests)} concursos")
     print(f"📌 Último: {contests[-1]['concurso']} - {contests[-1]['dezenas']}")
+    print("🎯 Foco: cobertura de triplas, entropia, redução de redundância")
     op = input("Escolha: 1. Gerar carteira | 2. Walk-forward | 3. Ambos [3]: ").strip() or "3"
 
     if op in ("1", "3"):
         t0 = time.time()
-        opt = PortfolioOptimizerV301(contests)
+        opt = PortfolioOptimizerV31(contests)
         print(f"⏱️ Inicialização: {time.time()-t0:.1f}s")
-        print(f"📊 Regime atual: score={opt.current_regime_score:.2f} (pct={opt.current_regime_percentile:.2f})")
         portfolio, score = opt.optimize(5, 10000)
         last = contests[-1]['dezenas']
         for i, g in enumerate(portfolio, 1):
@@ -671,14 +709,11 @@ def main():
             print(f"\n🔬 BACKTEST (últimos 200): Lift={bt['lift']:.2f}x | ROI={bt['roi']:+.1f}%")
             print(f"   Dist: 11={bt['hit_distribution'].get(11,0)} 12={bt['hit_distribution'].get(12,0)} "
                   f"13={bt['hit_distribution'].get(13,0)} 14={bt['hit_distribution'].get(14,0)} 15={bt['hit_distribution'].get(15,0)}")
-        print("\n⚠️  Lembrete: este objetivo favorece jogos centrais (muitos 11/12 pts).")
-        print("   Para buscar 14/15, é necessário migrar para uma função multi‑objetivo focada em")
-        print("   cobertura combinatória, ortogonalidade e dispersão de pares/trios.\n")
 
     if op in ("2", "3"):
         walk_forward_validation(contests, n_windows=8, train_size=400, test_size=50, n_games=5)
 
-    print("✅ Concluído!")
+    print("\n✅ Concluído!")
 
 if __name__ == "__main__":
     main()
