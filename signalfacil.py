@@ -2,25 +2,22 @@
 # -*- coding: utf-8 -*-
 
 """
-V34 — DRIFT LOCAL CONDICIONAL (HIPÓTESE FALSIFICÁVEL)
+V34.1 — DRIFT LOCAL CONDICIONAL (OTIMIZADO)
 
-Protocolo congelado (sem tuning posterior):
-✅ Janela fixa: 30 concursos
-✅ Features locais: pares, moldura, repetição, primos
-✅ Fitness: log-likelihood ratio (local vs global)
-✅ Geração: 100k jogos aleatórios puros (apenas filtro mínimo de estrutura)
-✅ Seleção: top 5 scores com interseção ≤ 10
-✅ Teste: walk-forward temporal real (compara com aleatório)
-✅ Métrica: Wilcoxon sobre a diferença de hits máximos
+Otimizações:
+✅ N_CANDIDATOS reduzido para 10.000 (suficiente para baixa dimensionalidade)
+✅ Pool de features pré-computadas (pares, primos, moldura)
+✅ Repetição como único termo dinâmico
+✅ Seleção por amostragem ponderada (softmax) em vez de top-5 duro
+✅ Sem logs — usa razão simples para ranking
+✅ Execução viável em Pydroid/Colab
 """
 
 import numpy as np
 from scipy.stats import wilcoxon
 from collections import Counter
-from itertools import combinations
 import random
 import os
-from math import comb
 from tqdm import tqdm
 import time
 
@@ -28,43 +25,28 @@ import time
 # CONFIGURAÇÕES FIXAS (CONGELADAS)
 # ============================================================
 
-WINDOW = 30                # tamanho da janela local
-N_JOGOS = 5                # número de jogos na carteira
-N_CANDIDATOS = 100_000     # jogos aleatórios gerados por janela
-MAX_INTERSECAO = 10        # sobreposição máxima permitida entre jogos da carteira
-EPS = 1e-6                 # suavização para log
+WINDOW = 30
+N_JOGOS = 5
+N_CANDIDATOS = 10_000      # reduzido — suficiente para 4 features discretas
+MAX_INTERSECAO = 10
+EPS = 1e-6
 
-# Features monitoradas e suas funções de extração
-def pares_count(game):
-    return sum(1 for d in game if d % 2 == 0)
+MOLDURA = {1,2,3,4,5, 6,10, 11,15, 16,20, 21,22,23,24,25}
+PRIMES = {2, 3, 5, 7, 11, 13, 17, 19, 23}
 
-def moldura_count(game):
-    MOLDURA = {1,2,3,4,5, 6,10, 11,15, 16,20, 21,22,23,24,25}
-    return sum(1 for d in game if d in MOLDURA)
+def features_jogo(jogo):
+    """Extrai features de um jogo (retorna tupla imutável)."""
+    pares = sum(1 for d in jogo if d % 2 == 0)
+    moldura = sum(1 for d in jogo if d in MOLDURA)
+    primos = sum(1 for d in jogo if d in PRIMES)
+    return pares, moldura, primos
 
-def primos_count(game):
-    PRIMES = {2, 3, 5, 7, 11, 13, 17, 19, 23}
-    return sum(1 for d in game if d in PRIMES)
-
-def repeticao_count(game, ultimo_sorteio):
-    return len(set(game) & set(ultimo_sorteio))
-
-FEATURE_FUNCS = {
-    'pares': pares_count,
-    'moldura': moldura_count,
-    'primos': primos_count,
-    # 'repeticao' é tratada separadamente porque depende do último sorteio
-}
-
-# ============================================================
-# UTILITÁRIOS
-# ============================================================
+def repeticao(jogo, ultimo):
+    return len(set(jogo) & set(ultimo))
 
 def gerar_jogo_aleatorio():
-    """Gera um jogo completamente aleatório, com filtro mínimo de estrutura."""
     while True:
         jogo = sorted(np.random.choice(range(1, 26), 15, replace=False))
-        # Filtro leve: no máximo 3 consecutivos em sequência
         max_run = 1
         run = 1
         for i in range(len(jogo)-1):
@@ -74,7 +56,6 @@ def gerar_jogo_aleatorio():
             else:
                 run = 1
         if max_run <= 3:
-            # Clusterização simples (gaps <= 2)
             gaps = [jogo[i+1]-jogo[i] for i in range(len(jogo)-1)]
             cluster = sum(1 for g in gaps if g <= 2) / len(gaps)
             if cluster < 0.9:
@@ -108,222 +89,233 @@ def carregar_concursos(csv_file='resultados_lotofacil.csv'):
                     contests.append(sorted(dezenas))
                 except:
                     continue
-        print(f"✅ {len(contests)} concursos carregados")
+        print(f"✅ {len(contests)} concursos")
         return contests
     except Exception as e:
         print(f"❌ Erro: {e}")
         return None
 
 # ============================================================
+# POOL DE JOGOS PRÉ-COMPUTADO
+# ============================================================
+
+def criar_pool(tamanho=20000):
+    """Gera um pool fixo de jogos com features pré-calculadas."""
+    print(f"🔧 Criando pool de {tamanho} jogos...")
+    pool = []
+    for _ in tqdm(range(tamanho), desc="Pool"):
+        jogo = gerar_jogo_aleatorio()
+        pares, moldura, primos = features_jogo(jogo)
+        pool.append({
+            'jogo': jogo,
+            'pares': pares,
+            'moldura': moldura,
+            'primos': primos,
+        })
+    return pool
+
+# ============================================================
 # MODELO DE DRIFT LOCAL
 # ============================================================
 
-def calcular_frequencias_locais(historico_local):
-    """Calcula a distribuição empírica das features na janela local."""
-    freq = {feat: Counter() for feat in FEATURE_FUNCS}
-    freq['repeticao'] = Counter()
-    
-    for i, jogo in enumerate(historico_local):
-        for feat, func in FEATURE_FUNCS.items():
-            valor = func(jogo)
-            freq[feat][valor] += 1
+def calcular_frequencias_locais(janela, ultimo):
+    """Frequências das features na janela local."""
+    freq = {
+        'pares': Counter(),
+        'moldura': Counter(),
+        'primos': Counter(),
+        'repeticao': Counter(),
+    }
+    for i, jogo in enumerate(janela):
+        p, m, pr = features_jogo(jogo)
+        freq['pares'][p] += 1
+        freq['moldura'][m] += 1
+        freq['primos'][pr] += 1
         if i > 0:
-            rep = repeticao_count(jogo, historico_local[i-1])
-            freq['repeticao'][rep] += 1
-    
-    # Normaliza para probabilidades
-    total = len(historico_local)
-    for feat in freq:
-        for v in freq[feat]:
-            freq[feat][v] /= total
+            freq['repeticao'][repeticao(jogo, janela[i-1])] += 1
+    total = len(janela)
+    for k in freq:
+        for v in freq[k]:
+            freq[k][v] /= total
     return freq
 
-def calcular_frequencias_globais(historico_global):
-    """Calcula a distribuição empírica das features no histórico global."""
-    freq = {feat: Counter() for feat in FEATURE_FUNCS}
-    freq['repeticao'] = Counter()
-    
-    for i, jogo in enumerate(historico_global):
-        for feat, func in FEATURE_FUNCS.items():
-            valor = func(jogo)
-            freq[feat][valor] += 1
+def calcular_frequencias_globais(historico):
+    freq = {
+        'pares': Counter(),
+        'moldura': Counter(),
+        'primos': Counter(),
+        'repeticao': Counter(),
+    }
+    for i, jogo in enumerate(historico):
+        p, m, pr = features_jogo(jogo)
+        freq['pares'][p] += 1
+        freq['moldura'][m] += 1
+        freq['primos'][pr] += 1
         if i > 0:
-            rep = repeticao_count(jogo, historico_global[i-1])
-            freq['repeticao'][rep] += 1
-    
-    total = len(historico_global)
-    for feat in freq:
-        for v in freq[feat]:
-            freq[feat][v] /= total
+            freq['repeticao'][repeticao(jogo, historico[i-1])] += 1
+    total = len(historico)
+    for k in freq:
+        for v in freq[k]:
+            freq[k][v] /= total
     return freq
 
-def score_jogo(jogo, freq_local, freq_global, ultimo_sorteio=None):
-    """Log-likelihood ratio de um jogo em relação às distribuições local/global."""
+def score_jogo(item_pool, freq_local, freq_global, ultimo):
+    """Score = soma das razões local/global (sem log)."""
     score = 0.0
-    for feat, func in FEATURE_FUNCS.items():
-        valor = func(jogo)
+    for feat in ['pares', 'moldura', 'primos']:
+        valor = item_pool[feat]
         p_local = freq_local[feat].get(valor, EPS)
         p_global = freq_global[feat].get(valor, EPS)
-        score += np.log((p_local + EPS) / (p_global + EPS))
-    if ultimo_sorteio:
-        rep = repeticao_count(jogo, ultimo_sorteio)
-        p_local = freq_local['repeticao'].get(rep, EPS)
-        p_global = freq_global['repeticao'].get(rep, EPS)
-        score += np.log((p_local + EPS) / (p_global + EPS))
+        score += p_local / (p_global + EPS)
+    rep = repeticao(item_pool['jogo'], ultimo)
+    p_local = freq_local['repeticao'].get(rep, EPS)
+    p_global = freq_global['repeticao'].get(rep, EPS)
+    score += p_local / (p_global + EPS)
     return score
 
 # ============================================================
-# SELEÇÃO DE CARTEIRA
+# SELEÇÃO DE CARTEIRA (AMOSTRAGEM PONDERADA)
 # ============================================================
 
-def selecionar_carteira(freq_local, freq_global, ultimo_sorteio, n_candidatos=100000):
-    """Gera N jogos aleatórios e seleciona os 5 melhores com restrição de interseção."""
-    candidatos = []
-    scores = []
-    for _ in range(n_candidatos):
-        jogo = gerar_jogo_aleatorio()
-        s = score_jogo(jogo, freq_local, freq_global, ultimo_sorteio)
-        candidatos.append(jogo)
-        scores.append(s)
+def selecionar_carteira(pool, freq_local, freq_global, ultimo, n_candidatos=10000):
+    # Amostra aleatória do pool
+    indices = np.random.choice(len(pool), size=min(n_candidatos, len(pool)), replace=False)
+    candidatos = [(idx, score_jogo(pool[idx], freq_local, freq_global, ultimo)) for idx in indices]
     
-    # Ordena por score decrescente
-    indices = np.argsort(scores)[::-1]
+    # Ordena por score
+    candidatos.sort(key=lambda x: x[1], reverse=True)
+    
+    # Seleciona os N_CANDIDATOS melhores
+    top = candidatos[:n_candidatos]
+    scores = np.array([s for _, s in top])
+    
+    # Softmax para amostragem ponderada
+    scores_adj = scores - np.max(scores)
+    probs = np.exp(scores_adj / 0.5)  # temperatura 0.5
+    probs /= probs.sum()
+    
     selecionados = []
-    for idx in indices:
-        jogo = candidatos[idx]
-        if all(interseccao(jogo, sel) <= MAX_INTERSECAO for sel in selecionados):
+    selecionados_jogos = []
+    tentativas = 0
+    while len(selecionados) < N_JOGOS and tentativas < 500:
+        idx_pool = np.random.choice(len(top), p=probs)
+        jogo = pool[top[idx_pool][0]]['jogo']
+        if all(interseccao(jogo, s) <= MAX_INTERSECAO for s in selecionados_jogos):
             selecionados.append(jogo)
-        if len(selecionados) == N_JOGOS:
+            selecionados_jogos.append(jogo)
+        tentativas += 1
+    
+    # Fallback: se não conseguir 5, completa com os melhores disponíveis
+    for idx_sorted, _ in top:
+        jogo = pool[idx_sorted]['jogo']
+        if len(selecionados) >= N_JOGOS:
             break
+        if all(interseccao(jogo, s) <= MAX_INTERSECAO for s in selecionados_jogos):
+            selecionados.append(jogo)
+            selecionados_jogos.append(jogo)
+    
     return selecionados
 
 # ============================================================
-# BACKTEST WALK-FORWARD
+# WALK-FORWARD
 # ============================================================
 
-def walk_forward_test(concursos, n_testes=100):
-    """
-    Realiza walk-forward:
-    - Para cada janela de 30 concursos, gera carteira condicionada e aleatória
-    - Testa no concurso seguinte (janela deslizante de 1 em 1)
-    - Retorna listas de acertos máximos para estratégia e aleatório
-    """
+def walk_forward_test(concursos, pool, n_testes=50):
     estrategia_hits = []
     aleatorio_hits = []
+    indices_testados = []
     
-    # Para cada janela de WINDOW concursos, testa no próximo
-    for inicio in tqdm(range(0, len(concursos) - WINDOW - 1, max(1, (len(concursos) - WINDOW - 1) // n_testes)), desc="Walk-forward"):
+    passo = max(1, (len(concursos) - WINDOW - 1) // n_testes)
+    
+    for inicio in tqdm(range(0, len(concursos) - WINDOW - 1, passo), desc="Walk-forward"):
         if len(estrategia_hits) >= n_testes:
             break
-            
+        
         fim = inicio + WINDOW
         janela_local = concursos[inicio:fim]
-        historico_global = concursos[:inicio]  # tudo antes da janela
+        historico_global = concursos[:inicio]
         
-        if len(historico_global) < 50:  # precisa de histórico global mínimo
+        if len(historico_global) < 50:
             continue
         
-        teste = concursos[fim]  # próximo sorteio
-        
-        # Calcula frequências
-        freq_local = calcular_frequencias_locais(janela_local)
-        freq_global = calcular_frequencias_globais(historico_global)
+        teste = concursos[fim]
         ultimo = janela_local[-1]
         
-        # Carteira da estratégia
-        carteira_estrategia = selecionar_carteira(freq_local, freq_global, ultimo, N_CANDIDATOS)
+        freq_local = calcular_frequencias_locais(janela_local, ultimo)
+        freq_global = calcular_frequencias_globais(historico_global)
         
-        # Carteira aleatória pura (para comparação)
+        carteira_estrategia = selecionar_carteira(pool, freq_local, freq_global, ultimo)
         carteira_aleatoria = [gerar_jogo_aleatorio() for _ in range(N_JOGOS)]
         
-        # Calcula acertos máximos
-        hits_estrategia = max(interseccao(jogo, teste) for jogo in carteira_estrategia)
-        hits_aleatorio = max(interseccao(jogo, teste) for jogo in carteira_aleatoria)
+        hits_est = max(interseccao(j, teste) for j in carteira_estrategia)
+        hits_ale = max(interseccao(j, teste) for j in carteira_aleatoria)
         
-        estrategia_hits.append(hits_estrategia)
-        aleatorio_hits.append(hits_aleatorio)
+        estrategia_hits.append(hits_est)
+        aleatorio_hits.append(hits_ale)
+        indices_testados.append(fim)
     
-    return estrategia_hits, aleatorio_hits
+    return estrategia_hits, aleatorio_hits, indices_testados
 
 # ============================================================
-# ANÁLISE ESTATÍSTICA
+# ANÁLISE
 # ============================================================
 
-def analisar_resultados(estrategia_hits, aleatorio_hits):
-    """Compara as distribuições de acertos usando Wilcoxon e métricas descritivas."""
+def analisar(est, ale, indices):
     print("\n" + "="*60)
-    print("RESULTADOS DO EXPERIMENTO")
+    print("RESULTADOS V34.1")
     print("="*60)
+    print(f"Testes realizados: {len(est)}")
+    print(f"Média hits estratégia: {np.mean(est):.3f} ± {np.std(est):.3f}")
+    print(f"Média hits aleatório:   {np.mean(ale):.3f} ± {np.std(ale):.3f}")
     
-    # Métricas descritivas
-    print(f"\nNúmero de testes: {len(estrategia_hits)}")
-    print(f"Média de hits (estratégia): {np.mean(estrategia_hits):.3f}")
-    print(f"Média de hits (aleatório): {np.mean(aleatorio_hits):.3f}")
-    print(f"Desvio padrão (estratégia): {np.std(estrategia_hits):.3f}")
-    print(f"Desvio padrão (aleatório): {np.std(aleatorio_hits):.3f}")
+    for h in [11, 12, 13, 14, 15]:
+        fe = sum(1 for x in est if x >= h) / len(est)
+        fa = sum(1 for x in ale if x >= h) / len(ale)
+        print(f"  {h}+ pts: estratégia={fe:.4f} | aleatório={fa:.4f}")
     
-    # Distribuições
-    for hits in [11, 12, 13, 14, 15]:
-        freq_est = sum(1 for h in estrategia_hits if h >= hits) / len(estrategia_hits)
-        freq_ale = sum(1 for h in aleatorio_hits if h >= hits) / len(aleatorio_hits)
-        print(f"Freq. {hits}+: estratégia={freq_est:.4f} | aleatório={freq_ale:.4f}")
-    
-    # Wilcoxon signed-rank test
-    diffs = [e - a for e, a in zip(estrategia_hits, aleatorio_hits)]
+    diffs = [e - a for e, a in zip(est, ale)]
     try:
         stat, p = wilcoxon(diffs)
-        print(f"\nWilcoxon signed-rank: estatística={stat:.3f}, p-value={p:.4f}")
+        print(f"\nWilcoxon: p={p:.4f}")
         if p < 0.05 and np.mean(diffs) > 0.02:
-            print("✅ Hipótese confirmada: estratégia supera aleatório com significância estatística.")
+            print("✅ Hipótese CONFIRMADA")
         else:
-            print("❌ Hipótese NÃO confirmada: não há evidência suficiente de vantagem.")
-    except Exception as e:
-        print(f"\nErro no teste Wilcoxon: {e}")
+            print("❌ Hipótese NÃO confirmada")
+    except:
+        p = 1.0
+        print("Wilcoxon não pôde ser calculado")
     
-    return diffs, p if 'p' in locals() else 1.0
+    return diffs, p
 
 # ============================================================
-# INTERFACE PRINCIPAL
+# MAIN
 # ============================================================
 
 def main():
     print("="*60)
-    print("V34 — DRIFT LOCAL CONDICIONAL (HIPÓTESE FALSIFICÁVEL)")
+    print("V34.1 — DRIFT LOCAL (OTIMIZADO)")
     print("="*60)
-    print(f"Configurações congeladas:")
-    print(f"  Janela: {WINDOW} concursos")
-    print(f"  Features: pares, moldura, repetição, primos")
-    print(f"  Fitness: log-likelihood ratio")
-    print(f"  Candidatos: {N_CANDIDATOS:,} jogos aleatórios")
-    print(f"  Carteira: {N_JOGOS} jogos (interseção ≤ {MAX_INTERSECAO})")
     
-    # Carrega dados
-    concursos = carregar_concursos('resultados_lotofacil.csv')
+    concursos = carregar_concursos()
     if concursos is None:
-        print("❌ Arquivo de dados não encontrado.")
         return
     
-    # Executa walk-forward
-    print(f"\n🔍 Executando walk-forward...")
+    pool = criar_pool(20000)
+    
     t0 = time.time()
-    estrategia_hits, aleatorio_hits = walk_forward_test(concursos, n_testes=100)
-    print(f"⏱️ Tempo: {time.time()-t0:.1f}s")
+    est, ale, idx = walk_forward_test(concursos, pool, n_testes=50)
+    print(f"\n⏱️ Tempo: {time.time()-t0:.1f}s")
     
-    # Analisa resultados
-    diffs, p_valor = analisar_resultados(estrategia_hits, aleatorio_hits)
+    diffs, p = analisar(est, ale, idx)
     
-    # Conclusão final
     print("\n" + "="*60)
     print("CONCLUSÃO")
     print("="*60)
-    if p_valor < 0.05 and np.mean(diffs) > 0.02:
-        print("Há evidência estatística de drift local explorável.")
-        print("Recomendação: investigar com mais features ou janelas adaptativas.")
+    if p < 0.05 and np.mean(diffs) > 0.02:
+        print("Evidência de drift local explorável.")
     else:
-        print("NÃO há evidência de drift local explorável com este protocolo.")
-        print("As distribuições condicionais recentes não persistem o suficiente.")
-        print("Isso sugere que a Lotofácil se comporta como um processo IID,")
-        print("ou que os desvios têm meia-vida muito curta para serem aproveitados.")
+        print("SEM evidência de drift local explorável.")
+        print("A Lotofácil comporta-se como IID nas condições testadas.")
     print("="*60)
 
 if __name__ == "__main__":
