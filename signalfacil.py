@@ -2,16 +2,24 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v32.1
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v32.3
 
-Correções:
-✅ f-strings com {{t-1}} para evitar NameError
-✅ Removida a chamada perigosa a bincount(2**25)
-✅ Adicionada opção "5" para comparar concursos reais com RNG sintético
+Refinamentos estatísticos:
+✅ Permutation test com permutações independentes (np.random.permutation)
+✅ MI ajustada (mi_obs - média da distribuição nula)
+✅ Autocorrelação linear de Pearson adicionada
+✅ Suporte a múltiplos lags (1 a 5) para detectar dependência de ordem superior
+✅ Opção "6" no menu para análise de autocorrelação e lags
+
+Mantém todas as funcionalidades do v32.2:
+- Carteira de cobertura otimizada
+- Walk-forward honesto
+- MI por features discretizadas + permutation test
+- Comparação real vs. sintético (RNG)
 """
 
 import numpy as np
-from scipy.stats import entropy, hypergeom, wilcoxon
+from scipy.stats import entropy, hypergeom, wilcoxon, pearsonr
 from collections import Counter
 from itertools import combinations
 import os, random, time, warnings
@@ -46,6 +54,16 @@ FEATURE_NAMES = [
     "pares", "primos", "moldura", "soma", "amplitude", "compressao",
 ]
 N_FEATURES = len(FEATURE_NAMES)
+
+# Features para análise de dependência temporal (espaço reduzido)
+TEMPORAL_FEATURES = {
+    'repeticoes': lambda d, prev: len(set(d) & prev) if prev else 8,
+    'soma': lambda d, prev: sum(d),
+    'pares': lambda d, prev: sum(1 for x in d if x%2==0),
+    'primos': lambda d, prev: sum(1 for x in d if x in PRIMES),
+    'clusterizacao': lambda d, prev: sum(1 for i in range(len(d)-1) if d[i+1]-d[i]<=2)/14,
+    'gaps': lambda d, prev: np.mean([d[i+1]-d[i] for i in range(len(d)-1)]),
+}
 
 # Estruturais
 MAX_CONSECUTIVOS_RUN = 5
@@ -295,35 +313,150 @@ class LooseGenerator:
         return sorted(np.random.choice(range(1, 26), 15, replace=False))
 
 # ============================================================
-# MÓDULOS DE ANÁLISE ESTRUTURAL
+# NOVAS FUNÇÕES DE DEPENDÊNCIA TEMPORAL (v32.3)
 # ============================================================
-def compute_conditional_entropy(contests):
-    """Estima H(X_t | X_{t-1}) usando máscaras de bits."""
-    masks = [BITMASK_CACHE.get_mask(c['dezenas']) for c in contests]
-    joint_counts = Counter()
-    for i in range(1, len(masks)):
-        joint_counts[(masks[i-1], masks[i])] += 1
-    total = sum(joint_counts.values())
-    cond_ent = 0.0
-    prev_counts = Counter()
-    for i in range(len(masks)-1):
-        prev_counts[masks[i]] += 1
-    for (prev, curr), cnt in joint_counts.items():
-        p_joint = cnt / total
-        p_prev = prev_counts[prev] / (len(masks)-1)
-        if p_prev > 0:
-            cond_ent -= p_joint * np.log2(p_joint / p_prev)
-    return cond_ent
+def compute_temporal_features(contests):
+    """Extrai features temporais para cada concurso (par chave:valor)."""
+    series = {name: [] for name in TEMPORAL_FEATURES}
+    for i, c in enumerate(contests):
+        prev = set(contests[i-1]['dezenas']) if i > 0 else None
+        for name, func in TEMPORAL_FEATURES.items():
+            val = func(c['dezenas'], prev)
+            # Discretização simples para features contínuas
+            if name == 'gaps':
+                val = round(val, 2)
+            elif name == 'clusterizacao':
+                val = round(val, 3)
+            elif name == 'soma':
+                val = val // 5 * 5  # agrupa somas em bins de 5
+            series[name].append(val)
+    return series
 
-def mutual_information(contests):
-    """I(X_t; X_{t-1}) = H(X_t) - H(X_t | X_{t-1})."""
-    masks = [BITMASK_CACHE.get_mask(c['dezenas']) for c in contests]
-    # H(X_t) pela distribuição empírica das máscaras
-    mask_counts = Counter(masks)
-    probs = np.array(list(mask_counts.values())) / len(masks)
-    h_xt = entropy(probs, base=2)
-    cond_ent = compute_conditional_entropy(contests)
-    return h_xt - cond_ent
+def mutual_information_feature(x, y):
+    """MI discreta entre duas sequências (já discretizadas)."""
+    joint = Counter(zip(x, y))
+    total = sum(joint.values())
+    mi = 0.0
+    for (x_val, y_val), count in joint.items():
+        p_xy = count / total
+        p_x = x.count(x_val) / len(x)
+        p_y = y.count(y_val) / len(y)
+        if p_x > 0 and p_y > 0:
+            mi += p_xy * np.log2(p_xy / (p_x * p_y))
+    return mi
+
+def permutation_mi_test(series_t, lag=1, n_perm=500):
+    """
+    Testa MI(series_t, series_{t-lag}) com permutações independentes.
+    Retorna mi_obs, adjusted_mi, p_value, null_distribution.
+    """
+    x = series_t[lag:]          # X_t
+    y = series_t[:-lag]         # X_{t-lag}
+    mi_obs = mutual_information_feature(x, y)
+
+    # Distribuição nula: permutações independentes de y
+    mi_null = np.zeros(n_perm)
+    for i in range(n_perm):
+        y_perm = np.random.permutation(y)
+        mi_null[i] = mutual_information_feature(x, y_perm)
+
+    # MI ajustada (subtrai viés)
+    mean_null = np.mean(mi_null)
+    adjusted_mi = mi_obs - mean_null
+
+    # p-valor bicaudal? Vamos usar unicaudal à direita: P(null >= obs)
+    p_value = np.mean(mi_null >= mi_obs)
+    return mi_obs, adjusted_mi, p_value, mi_null
+
+def autocorrelation_test(series_t, lag=1):
+    """Correlação de Pearson entre X_t e X_{t-lag}."""
+    x = np.array(series_t[lag:], dtype=float)
+    y = np.array(series_t[:-lag], dtype=float)
+    if len(x) < 3 or np.std(x) == 0 or np.std(y) == 0:
+        return 0.0, 1.0
+    corr, p_val = pearsonr(x, y)
+    return corr, p_val
+
+# ============================================================
+# COMPARAÇÃO REAL vs SINTÉTICO
+# ============================================================
+def generate_synthetic_contests(n):
+    return [{'concurso': i, 'data': '', 'dezenas': sorted(np.random.choice(range(1,26), 15, replace=False))} for i in range(n)]
+
+def compare_real_vs_synthetic(contests, n_synthetic=None):
+    if n_synthetic is None:
+        n_synthetic = len(contests)
+    print(f"\n🔄 Gerando {n_synthetic} concursos sintéticos (i.i.d.)...")
+    synthetic = generate_synthetic_contests(n_synthetic)
+
+    # MI para cada feature (lag=1)
+    print("\n📊 INFORMAÇÃO MÚTUA AJUSTADA (X_t; X_{{t-1}}) POR FEATURE:")
+    print(f"{'Feature':<15} {'Real MI_adj':<12} {'Real p':<10} {'Sintético MI_adj':<15} {'Sintético p':<10}")
+    print("-" * 65)
+
+    real_series = compute_temporal_features(contests)
+    synth_series = compute_temporal_features(synthetic)
+
+    for name in TEMPORAL_FEATURES:
+        _, mi_adj_real, p_real, _ = permutation_mi_test(real_series[name], lag=1)
+        _, mi_adj_synth, p_synth, _ = permutation_mi_test(synth_series[name], lag=1)
+        print(f"{name:<15} {mi_adj_real:<12.4f} {p_real:<10.3f} {mi_adj_synth:<15.4f} {p_synth:<10.3f}")
+
+    print("\n🔍 Se MI_adj ≈ 0 e p > 0.05, não há dependência temporal significativa.")
+    # Verificação geral
+    all_insignificant = all(permutation_mi_test(real_series[name], lag=1)[2] > 0.05 for name in TEMPORAL_FEATURES)
+    if all_insignificant:
+        print("   ➡️ Nenhuma feature mostrou dependência temporal significativa nos dados reais.")
+
+    # PCA
+    if SKLEARN_AVAILABLE:
+        ext_real = FeatureExtractor(contests)
+        ext_synth = FeatureExtractor(synthetic)
+        real_pca = pca_analysis(ext_real.standardized_features)
+        synth_pca = pca_analysis(ext_synth.standardized_features)
+        if real_pca is not None and synth_pca is not None:
+            print("\n📊 PCA (variância explicada pelas 3 primeiras PCs):")
+            print(f"   Real: PC1={real_pca[0]:.2%}, PC2={real_pca[1]:.2%}, PC3={real_pca[2]:.2%}, Soma={np.sum(real_pca):.2%}")
+            print(f"   Sintético: PC1={synth_pca[0]:.2%}, PC2={synth_pca[1]:.2%}, PC3={synth_pca[2]:.2%}, Soma={np.sum(synth_pca):.2%}")
+            if np.sum(real_pca) < 0.5:
+                print("   ➡️ Variância explicada baixa: espaço aproximadamente isotrópico.")
+    else:
+        print("\n⚠️ PCA indisponível.")
+
+    # Distribuição de gaps
+    print("\n📊 DISTRIBUIÇÃO DE GAPS (média):")
+    for label, data in [("Real", contests), ("Sintético", synthetic)]:
+        gaps_all = []
+        for c in data:
+            d = sorted(c['dezenas'])
+            gaps_all.extend([d[i+1]-d[i] for i in range(len(d)-1)])
+        print(f"   {label}: média={np.mean(gaps_all):.2f}, desvio={np.std(gaps_all):.2f}")
+
+    # Mahalanobis
+    print("\n📊 DISTÂNCIA DE MAHALANOBIS MÉDIA:")
+    try:
+        ext = FeatureExtractor(contests)
+        real_f = ext.standardized_features
+        synth_f_raw = ext._build_raw_feature_matrix_from_contests(synthetic)
+        if ext.scaler is not None:
+            synth_f = ext.scaler.transform(synth_f_raw)
+        else:
+            synth_f = (synth_f_raw - ext.feature_means) / ext.feature_stds
+        print(f"   Real: {np.mean(ext.mahalanobis_batch(real_f)):.2f}, Sintético: {np.mean(ext.mahalanobis_batch(synth_f)):.2f}")
+    except Exception as e:
+        print(f"   Não foi possível calcular: {e}")
+
+    print("\n🔍 Se todos os valores forem muito próximos, reforça a hipótese de pseudoaleatoriedade efetiva.")
+
+# Helper para FeatureExtractor
+def _build_raw_feature_matrix_from_contests(self, contests_list):
+    feats = []
+    for i, c in enumerate(contests_list):
+        last = set(contests_list[i-1]['dezenas']) if i > 0 else None
+        feats.append(self._extract_raw(c['dezenas'], last))
+    return np.array(feats, dtype=np.float64)
+
+FeatureExtractor._build_raw_feature_matrix_from_contests = _build_raw_feature_matrix_from_contests
 
 def pca_analysis(feature_matrix):
     if not SKLEARN_AVAILABLE:
@@ -332,12 +465,8 @@ def pca_analysis(feature_matrix):
     pca.fit(feature_matrix)
     return pca.explained_variance_ratio_[:3]
 
-def generate_synthetic_contests(n):
-    """Gera n concursos puramente aleatórios (i.i.d.)."""
-    return [{'concurso': i, 'data': '', 'dezenas': sorted(np.random.choice(range(1,26), 15, replace=False))} for i in range(n)]
-
 # ============================================================
-# OTIMIZADOR DE CARTEIRA (v31, mantido para referência)
+# OTIMIZADOR DE CARTEIRA (mantido)
 # ============================================================
 class PortfolioOptimizerV32:
     def __init__(self, contests):
@@ -521,87 +650,11 @@ def walk_forward_validation(contests, n_windows=8, train_size=400, test_size=50,
     return results
 
 # ============================================================
-# COMPARAÇÃO REAL vs SINTÉTICO
-# ============================================================
-def compare_real_vs_synthetic(contests, n_synthetic=None):
-    """Compara propriedades dos concursos reais com concursos sintéticos aleatórios."""
-    if n_synthetic is None:
-        n_synthetic = len(contests)
-    print(f"\n🔄 Gerando {n_synthetic} concursos sintéticos (i.i.d.)...")
-    synthetic = generate_synthetic_contests(n_synthetic)
-
-    # Entropia condicional e MI
-    real_cond_ent = compute_conditional_entropy(contests)
-    real_mi = mutual_information(contests)
-    synth_cond_ent = compute_conditional_entropy(synthetic)
-    synth_mi = mutual_information(synthetic)
-
-    print("\n📊 DEPENDÊNCIA TEMPORAL:")
-    print(f"   Real:   H(X_t|X_t-1) = {real_cond_ent:.4f} bits, MI = {real_mi:.4f} bits")
-    print(f"   Sintético: H(X_t|X_t-1) = {synth_cond_ent:.4f} bits, MI = {synth_mi:.4f} bits")
-    if real_mi < 0.01:
-        print("   ➡️ MI real muito próxima de zero: evidência de independência temporal.")
-
-    # PCA
-    if SKLEARN_AVAILABLE:
-        ext_real = FeatureExtractor(contests)
-        ext_synth = FeatureExtractor(synthetic)
-        real_pca = pca_analysis(ext_real.standardized_features)
-        synth_pca = pca_analysis(ext_synth.standardized_features)
-        if real_pca is not None and synth_pca is not None:
-            print("\n📊 PCA (variância explicada pelas 3 primeiras PCs):")
-            print(f"   Real: PC1={real_pca[0]:.2%}, PC2={real_pca[1]:.2%}, PC3={real_pca[2]:.2%}, Soma={np.sum(real_pca):.2%}")
-            print(f"   Sintético: PC1={synth_pca[0]:.2%}, PC2={synth_pca[1]:.2%}, PC3={synth_pca[2]:.2%}, Soma={np.sum(synth_pca):.2%}")
-            if np.sum(real_pca) < 0.5:
-                print("   ➡️ Variância explicada baixa: espaço aproximadamente isotrópico (sem direções preferenciais fortes).")
-    else:
-        print("\n⚠️ PCA indisponível (instale scikit-learn).")
-
-    # Distribuição de gaps
-    print("\n📊 DISTRIBUIÇÃO DE GAPS (média):")
-    for label, data in [("Real", contests), ("Sintético", synthetic)]:
-        gaps_all = []
-        for c in data:
-            d = sorted(c['dezenas'])
-            gaps_all.extend([d[i+1]-d[i] for i in range(len(d)-1)])
-        print(f"   {label}: média={np.mean(gaps_all):.2f}, desvio={np.std(gaps_all):.2f}")
-
-    # Mahalanobis médio
-    print("\n📊 DISTÂNCIA DE MAHALANOBIS MÉDIA:")
-    try:
-        # Usa o extrator real para ambos (só para referência)
-        ext = FeatureExtractor(contests)
-        real_f = ext.standardized_features
-        synth_f_raw = ext._build_raw_feature_matrix_from_contests(synthetic)
-        if ext.scaler is not None:
-            synth_f = ext.scaler.transform(synth_f_raw)
-        else:
-            synth_f = (synth_f_raw - ext.feature_means) / ext.feature_stds
-        real_m_dist = np.mean(ext.mahalanobis_batch(real_f))
-        synth_m_dist = np.mean(ext.mahalanobis_batch(synth_f))
-        print(f"   Real: {real_m_dist:.2f}, Sintético: {synth_m_dist:.2f}")
-    except Exception as e:
-        print(f"   Não foi possível calcular: {e}")
-
-    print("\n🔍 Se os valores forem muito próximos, reforça a hipótese de pseudoaleatoriedade efetiva.")
-
-# Necessário adicionar método auxiliar para construir features a partir de contests genéricos
-def _build_raw_feature_matrix_from_contests(self, contests_list):
-    # Versão estática, pois o FeatureExtractor usa self.contests, mas podemos criar uma função auxiliar
-    feats = []
-    for i, c in enumerate(contests_list):
-        last = set(contests_list[i-1]['dezenas']) if i > 0 else None
-        feats.append(self._extract_raw(c['dezenas'], last))
-    return np.array(feats, dtype=np.float64)
-
-FeatureExtractor._build_raw_feature_matrix_from_contests = _build_raw_feature_matrix_from_contests
-
-# ============================================================
 # INTERFACE PRINCIPAL
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v32.1")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v32.3")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
@@ -614,9 +667,10 @@ def main():
         print("\nOpções:")
         print("1. Gerar carteira de cobertura")
         print("2. Walk-forward (falsificação de hipóteses)")
-        print("3. Análise de aleatoriedade (entropia condicional / MI / PCA)")
+        print("3. Análise de dependência temporal (MI + permutação, lag=1)")
         print("4. Comparar concursos reais vs. sintéticos (RNG)")
-        print("5. Sair")
+        print("5. Análise de autocorrelação e múltiplos lags (1 a 5)")
+        print("6. Sair")
         op = input("Escolha: ").strip()
         if op == '1':
             opt = PortfolioOptimizerV32(contests)
@@ -638,22 +692,31 @@ def main():
         elif op == '2':
             walk_forward_validation(contests, n_windows=8, train_size=400, test_size=50, n_games=5)
         elif op == '3':
-            print("\n📊 ANÁLISE DE ALEATORIEDADE")
-            cond_ent = compute_conditional_entropy(contests)
-            mi = mutual_information(contests)
-            print(f"Entropia condicional H(X_t | X_{{t-1}}): {cond_ent:.4f} bits")
-            print(f"Informação mútua I(X_t; X_{{t-1}}): {mi:.4f} bits")
-            print("(Se MI ≈ 0, não há dependência temporal significativa)")
-            if SKLEARN_AVAILABLE:
-                ext = FeatureExtractor(contests)
-                ratios = pca_analysis(ext.standardized_features)
-                if ratios is not None:
-                    print(f"Variância explicada pelas 3 primeiras PCs: PC1={ratios[0]:.2%}, PC2={ratios[1]:.2%}, PC3={ratios[2]:.2%} (total={np.sum(ratios):.2%})")
-            else:
-                print("PCA indisponível (instale scikit-learn).")
+            print("\n📊 INFORMAÇÃO MÚTUA AJUSTADA (lag=1) + TESTE DE PERMUTAÇÃO")
+            series = compute_temporal_features(contests)
+            print(f"{'Feature':<15} {'MI_obs':<8} {'MI_adj':<8} {'p_val':<8} {'Signif.':<10}")
+            print("-" * 55)
+            for name in TEMPORAL_FEATURES:
+                mi_obs, mi_adj, p_val, _ = permutation_mi_test(series[name], lag=1)
+                sig = "⚠️" if p_val <= 0.05 else "não"
+                print(f"{name:<15} {mi_obs:<8.4f} {mi_adj:<8.4f} {p_val:<8.3f} {sig:<10}")
+            print("\n🔍 Se MI_adj ≈ 0 e p > 0.05, não há dependência temporal significativa.")
         elif op == '4':
             compare_real_vs_synthetic(contests)
         elif op == '5':
+            print("\n📊 AUTOCORRELAÇÃO E MI POR LAG (1 a 5)")
+            series = compute_temporal_features(contests)
+            for lag in range(1, 6):
+                print(f"\n--- Lag {lag} ---")
+                print(f"{'Feature':<15} {'Corr':<8} {'p_corr':<8} {'MI_adj':<8} {'p_mi':<8} {'Signif.':<10}")
+                print("-" * 65)
+                for name in TEMPORAL_FEATURES:
+                    corr, p_corr = autocorrelation_test(series[name], lag)
+                    _, mi_adj, p_mi, _ = permutation_mi_test(series[name], lag)
+                    sig = "⚠️" if (p_corr <= 0.05 or p_mi <= 0.05) else "não"
+                    print(f"{name:<15} {corr:<8.3f} {p_corr:<8.3f} {mi_adj:<8.4f} {p_mi:<8.3f} {sig:<10}")
+            print("\n🔍 Correlação e MI ajustada próximas de zero + p > 0.05 = independência temporal.")
+        elif op == '6':
             break
         else:
             print("Opção inválida.")
