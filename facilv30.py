@@ -2,15 +2,26 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v32.6
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v33
 
-Correções baseadas no diagnóstico de "compressão de variância":
-✅ Filtro estrutural: hard reject substituído por penalidade suave (soft penalty)
-✅ Restrições estruturais relaxadas (limites ampliados)
-✅ Nova estratégia de diversidade: farthest‑point sampling no espaço de features
-✅ Carteira híbrida: 2 jogos centrais + 2 extremos + 1 balanceado
+CONSOLIDADO FINAL COM TODAS AS MELHORIAS:
+
+✅ Penalidade estrutural suave (soft penalty)
+✅ Farthest‑point sampling para diversidade geométrica real
+✅ Carteira híbrida (centrais + extremos + balanceados)
+✅ Ensemble de cobertura (Hamming, pares, entropia)
 ✅ Diagnóstico de distribuição hipergeométrica (observado vs esperado)
-✅ Mantém todas as ferramentas estatísticas do v32.5 (MI, FDR, PACF, FFT, ensemble)
+✅ Walk‑forward honesto com Wilcoxon
+✅ Análise de dependência temporal completa:
+   - MI ajustada com permutation test
+   - Autocorrelação linear (Pearson)
+   - Autocorrelação parcial (PACF)
+   - Correção FDR para múltiplos testes
+   - Espectro de potência (FFT)
+✅ Comparação real vs sintético (RNG)
+✅ Análise de cobertura de triplas e pares
+✅ Backtest com distribuição de acertos e ROI
+✅ Validação estatística rigorosa em todas as etapas
 """
 
 import numpy as np
@@ -34,16 +45,16 @@ try:
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
-    print("⚠️ Scikit-learn não instalado. Algumas análises estarão indisponíveis.")
+    print("⚠️ Scikit-learn não instalado. PCA indisponível.")
 
 # ============================================================
-# CONSTANTES (RELAXADAS)
+# CONSTANTES GERAIS
 # ============================================================
 PRIMES = {2, 3, 5, 7, 11, 13, 17, 19, 23}
 MOLDURA = {1,2,3,4,5, 6,10, 11,15, 16,20, 21,22,23,24,25}
 HYPE_PROBS = {k: hypergeom.pmf(k, 25, 15, 15) for k in range(0, 16)}
 PREMIO_VALORES = {11: 6.0, 12: 12.0, 13: 30.0, 14: 1500.0, 15: 1800000.0}
-CUSTO_APOSTA = 3.0
+CUSTO_APOSTA = 3.5
 
 FEATURE_NAMES = [
     "gap_medio", "gap_var", "gap_max", "gap_min",
@@ -54,6 +65,7 @@ FEATURE_NAMES = [
 ]
 N_FEATURES = len(FEATURE_NAMES)
 
+# Features para análise de dependência temporal (espaço reduzido)
 TEMPORAL_FEATURES = {
     'repeticoes': lambda d, prev: len(set(d) & prev) if prev else 8,
     'soma': lambda d, prev: sum(d),
@@ -63,11 +75,10 @@ TEMPORAL_FEATURES = {
     'gaps': lambda d, prev: np.mean([d[i+1]-d[i] for i in range(len(d)-1)]),
 }
 
-# Estruturais – limites relaxados e penalidade suave
-MAX_CONSECUTIVOS_RUN = 7          # era 5
-MAX_CLUSTERIZACAO = 1.0           # era 0.95, agora sem limite rígido
+# Estruturais – relaxadas com penalidade suave
+MAX_CONSECUTIVOS_RUN = 7
 STRUCTURAL_TARGETS = {
-    'pares': (7.5, 3.0, 0.5),     # tolerância maior, peso menor
+    'pares': (7.5, 3.0, 0.5),
     'primos': (5.0, 3.0, 0.5),
     'moldura': (9.5, 3.0, 0.3),
     'repeticoes': (9.0, 4.0, 0.3),
@@ -75,14 +86,14 @@ STRUCTURAL_TARGETS = {
     'consecutivos': (5.5, 5.0, 0.1),
     'amplitude': (22.0, 6.0, 0.1),
 }
-# Agora a penalidade é adicionada ao score em vez de causar rejeição
-SOFT_PENALTY_WEIGHT = 0.05  # peso leve na função objetivo
+SOFT_PENALTY_WEIGHT = 0.05
 
 # Cobertura
 MAX_PAIR_COVERAGE = 0.95
 MAX_INTERSECTION = 7
 HAMMING_MIN_DIST = 4
 
+# Pesos MC (atenuados)
 EXPONENTIAL_WEIGHTS = {
     11: 1.0,
     12: 4.0,
@@ -137,7 +148,7 @@ def load_all_contests(csv_file='resultados_lotofacil.csv'):
     return contests
 
 # ============================================================
-# EXTRATOR DE FEATURES (mantido)
+# EXTRATOR DE FEATURES
 # ============================================================
 class FeatureExtractor:
     def __init__(self, contests):
@@ -242,7 +253,6 @@ class FeatureExtractor:
         return np.array([self.extract_features(g, last_contest) for g in games])
 
     def compute_structural_penalty(self, game):
-        """Penalidade suave – usada como termo negativo no score, não como rejeição."""
         d = sorted(game)
         penalty = 0.0
         actuals = {
@@ -268,13 +278,12 @@ class FeatureExtractor:
         return penalty
 
 # ============================================================
-# GERADOR (MANTIDO, MAS COM ACEITAÇÃO SUAVE)
+# GERADOR (COM PENALIDADE SUAVE)
 # ============================================================
 class LooseGenerator:
     def __init__(self, extractor=None):
         self.extractor = extractor
     def generate_one(self, max_penalty=30):
-        """Gera um jogo com penalidade estrutural limitada (mas não zero)."""
         for _ in range(50):
             game = self._generate_raw()
             if self.extractor is not None:
@@ -316,7 +325,7 @@ class LooseGenerator:
         return sorted(np.random.choice(range(1, 26), 15, replace=False))
 
 # ============================================================
-# FUNÇÕES DE DEPENDÊNCIA TEMPORAL (inalteradas)
+# FUNÇÕES DE DEPENDÊNCIA TEMPORAL
 # ============================================================
 def compute_temporal_features(contests):
     series = {name: [] for name in TEMPORAL_FEATURES}
@@ -377,9 +386,6 @@ def fft_analysis(series_t):
 def generate_synthetic_contests(n):
     return [{'concurso': i, 'data': '', 'dezenas': sorted(np.random.choice(range(1,26), 15, replace=False))} for i in range(n)]
 
-# ============================================================
-# COMPARAÇÃO REAL vs SINTÉTICO (inalterada)
-# ============================================================
 def compare_real_vs_synthetic(contests, n_synthetic=None):
     if n_synthetic is None: n_synthetic = len(contests)
     print(f"\n🔄 Gerando {n_synthetic} concursos sintéticos (i.i.d.)...")
@@ -445,9 +451,9 @@ def pca_analysis(feature_matrix):
     return pca.explained_variance_ratio_[:3]
 
 # ============================================================
-# OTIMIZADOR v32.6 COM PENALIDADE SUAVE E FARTHEST-POINT
+# OTIMIZADOR DE CARTEIRA (PENALIDADE SUAVE + FARTHEST-POINT)
 # ============================================================
-class PortfolioOptimizerV326:
+class PortfolioOptimizer:
     def __init__(self, contests):
         self.contests = contests
         self.extractor = FeatureExtractor(contests)
@@ -508,7 +514,6 @@ class PortfolioOptimizerV326:
         if not hasattr(self, '_mc_bounds'): self._mc_bounds = self._compute_mc_bounds()
         p5, p95 = self._mc_bounds
         mc_norm = max(0.0, min(1.0, (raw_mc - p5) / (p95 - p5 + 1e-10)))
-        # Penalidade estrutural suave agregada
         avg_penalty = np.mean([c.penalty for c in portfolio])
         return (triple_score * 0.35 + ent_score * 0.25 + avg_rarity * 0.2 +
                 mc_norm * 0.1 - redundancy * 0.5 - avg_penalty * SOFT_PENALTY_WEIGHT)
@@ -519,14 +524,11 @@ class PortfolioOptimizerV326:
         return np.percentile(scores, 5), np.percentile(scores, 95)
 
     def _farthest_point_sampling(self, candidates, n_select):
-        """Seleciona n_select jogos maximizando distância mínima no espaço de features."""
         features = np.array([c.features for c in candidates])
-        # Começa com o de maior central_score
         selected_idx = [0]
         for _ in range(n_select - 1):
             dists = cdist(features, features[selected_idx], metric='euclidean')
             min_dists = np.min(dists, axis=1)
-            # Não selecionar os já escolhidos
             min_dists[selected_idx] = -1
             next_idx = np.argmax(min_dists)
             selected_idx.append(next_idx)
@@ -589,12 +591,11 @@ class PortfolioOptimizerV326:
         return [c.game for c in portfolio], best_score
 
     def hybrid_portfolio(self, n_central=2, n_extreme=2, n_balanced=1, n_candidates=10000):
-        """Carteira híbrida: mescla jogos centrais, extremos e balanceados."""
         print(f"\n🎯 CARTEIRA HÍBRIDA: {n_central} centrais + {n_extreme} extremos + {n_balanced} balanceado")
         t0 = time.time()
         raw_pool, seen = [], set()
         for _ in tqdm(range(n_candidates), desc="Gerando pool"):
-            g = self.generator.generate_one(max_penalty=40)  # aceita jogos mais "estranhos"
+            g = self.generator.generate_one(max_penalty=40)
             key = tuple(g)
             if key not in seen:
                 seen.add(key); raw_pool.append(g)
@@ -606,29 +607,21 @@ class PortfolioOptimizerV326:
             mask = BITMASK_CACHE.get_mask(game)
             pen = self.extractor.compute_structural_penalty(game)
             candidates.append(GameCandidate(game, mask, fmat[i], r_scores[i], r_scores[i], m_dists[i], pcts[i], pen))
-        # Ordena por central_score (raridade)
         candidates.sort(key=lambda c: c.central_score, reverse=True)
-        # Centrais: maior central_score
-        centrais = candidates[:n_central*100]  # pool reduzido para centrais
-        # Extremos: maior distância de Mahalanobis (percentil alto)
+        centrais = candidates[:n_central*100]
         candidates_by_mahal = sorted(candidates, key=lambda c: c.mahalanobis_dist, reverse=True)
         extremos = candidates_by_mahal[:n_extreme*100]
-        # Seleciona com diversidade
         selected = []
-        # Centrais
         sel_cent = self._select_diverse_portfolio(centrais, n_central, use_hamming=True)
         selected.extend(sel_cent)
-        # Extremos (evitando sobreposição com centrais)
         masks_sel = [c.mask for c in selected]
         sel_ext = []
         for c in extremos:
             if len(sel_ext) >= n_extreme: break
             if any(mask_intersection(c.mask, m) > MAX_INTERSECTION for m in masks_sel): continue
             if sel_ext and any(hamming_distance(c.game, x.game) < HAMMING_MIN_DIST for x in sel_ext): continue
-            sel_ext.append(c)
-            masks_sel.append(c.mask)
+            sel_ext.append(c); masks_sel.append(c.mask)
         selected.extend(sel_ext)
-        # Balanceado: score intermediário
         mid_idx = len(candidates) // 2
         balanceados = candidates[mid_idx:mid_idx+200]
         sel_bal = self._select_diverse_portfolio(balanceados, n_balanced, use_hamming=True)
@@ -640,11 +633,9 @@ class PortfolioOptimizerV326:
         return [c.game for c in selected]
 
     def diagnostic_distribution(self, portfolio, test_draws):
-        """Compara distribuição observada de acertos com a esperada pela hipergeométrica."""
         n_jogos = len(portfolio)
         n_test = len(test_draws)
         total_sim = n_jogos * n_test
-        # Observado
         hit_counts = {k:0 for k in range(11,16)}
         portfolio_masks = np.array([BITMASK_CACHE.get_mask(g) for g in portfolio], dtype=np.uint32)
         for draw in test_draws:
@@ -652,7 +643,6 @@ class PortfolioOptimizerV326:
             for pm in portfolio_masks:
                 hits = mask_intersection(pm, dm)
                 if hits >= 11: hit_counts[hits] += 1
-        # Esperado teórico
         expected = {k: total_sim * HYPE_PROBS.get(k, 0) for k in range(11,16)}
         print(f"\n📊 DIAGNÓSTICO DE DISTRIBUIÇÃO (n={total_sim} tentativas):")
         print(f"{'Acertos':<8} {'Observado':<10} {'Esperado':<10} {'Razão O/E':<10}")
@@ -663,7 +653,6 @@ class PortfolioOptimizerV326:
             ratio = obs/exp if exp > 0 else float('inf')
             flag = " ⚠️" if ratio < 0.5 or ratio > 2.0 else ""
             print(f"{k:<8} {obs:<10} {exp:<10.1f} {ratio:<10.2f}{flag}")
-        # Diagnóstico qualitativo
         ratio_13 = hit_counts.get(13,0)/expected[13] if expected[13] > 0 else 0
         if ratio_13 < 0.5:
             print("\n🔍 ALERTA: 13 pontos muito abaixo do esperado.")
@@ -760,7 +749,7 @@ def walk_forward_validation(contests, n_windows=8, train_size=400, test_size=50,
         train_data = contests[train_start:train_end]
         test_data = contests[test_start:test_end]
         if len(train_data) < 100 or len(test_data) < 5: continue
-        opt = PortfolioOptimizerV326(train_data)
+        opt = PortfolioOptimizer(train_data)
         if use_ensemble:
             portfolio = opt.ensemble_optimize(n_carteiras=3, n_games_por_carteira=5, n_candidates=8000)
             bt = opt.backtest_ensemble(portfolio, test_data)
@@ -795,8 +784,8 @@ def walk_forward_validation(contests, n_windows=8, train_size=400, test_size=50,
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v32.6")
-    print("   (penalidade suave + farthest-point + híbrido + diagnóstico)")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v33")
+    print("   CONSOLIDADO FINAL")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
@@ -807,19 +796,19 @@ def main():
 
     while True:
         print("\nOpções:")
-        print("1. Gerar carteira padrão (penalidade suave)")
+        print("1. Gerar carteira padrão (penalidade suave + farthest-point)")
         print("2. Gerar carteira híbrida (central + extrema)")
         print("3. Walk-forward padrão")
         print("4. Walk-forward híbrido")
         print("5. Walk-forward ensemble")
-        print("6. Diagnóstico de distribuição (backtest)")
+        print("6. Diagnóstico de distribuição (backtest + O/E)")
         print("7. Análise de dependência temporal (MI + FDR)")
         print("8. Comparar real vs. sintético (RNG)")
         print("9. Autocorrelação, PACF e espectro")
         print("0. Sair")
         op = input("Escolha: ").strip()
         if op == '1':
-            opt = PortfolioOptimizerV326(contests)
+            opt = PortfolioOptimizer(contests)
             use_farthest = input("Usar farthest-point sampling? (s/n) [s]: ").strip().lower() != 'n'
             portfolio, score = opt.optimize(5, 10000, use_hamming=True, use_farthest=use_farthest)
             last = contests[-1]['dezenas']
@@ -836,7 +825,7 @@ def main():
                 print(f"\n🔬 BACKTEST (últimos 200): Lift={bt['lift']:.2f}x | ROI={bt['roi']:+.1f}%")
                 print(f"   Dist: 11={bt['hit_distribution'].get(11,0)} 12={bt['hit_distribution'].get(12,0)} 13={bt['hit_distribution'].get(13,0)} 14={bt['hit_distribution'].get(14,0)} 15={bt['hit_distribution'].get(15,0)}")
         elif op == '2':
-            opt = PortfolioOptimizerV326(contests)
+            opt = PortfolioOptimizer(contests)
             portfolio = opt.hybrid_portfolio(n_central=2, n_extreme=2, n_balanced=1, n_candidates=10000)
             last = contests[-1]['dezenas']
             for i, g in enumerate(portfolio, 1):
@@ -858,7 +847,7 @@ def main():
         elif op == '5':
             walk_forward_validation(contests, n_windows=8, train_size=400, test_size=50, n_games=5, use_ensemble=True)
         elif op == '6':
-            opt = PortfolioOptimizerV326(contests)
+            opt = PortfolioOptimizer(contests)
             portfolio, _ = opt.optimize(5, 10000)
             print("Carteira gerada. Executando diagnóstico...")
             opt.diagnostic_distribution(portfolio, contests[-200:])
