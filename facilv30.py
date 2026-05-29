@@ -91,7 +91,7 @@ SOFT_PENALTY_WEIGHT = 0.05
 # Cobertura
 MAX_PAIR_COVERAGE = 0.95
 MAX_INTERSECTION = 7
-HAMMING_MIN_DIST = 5
+HAMMING_MIN_DIST = 4
 
 # Pesos MC (atenuados)
 EXPONENTIAL_WEIGHTS = {
@@ -757,7 +757,7 @@ def walk_forward_validation(contests, n_windows=8, train_size=400, test_size=50,
             rand_port = [opt.generator.generate_pure_random() for _ in range(total_random_games)]
             bt_rand = opt.backtest(rand_port, test_data)
         elif use_hybrid:
-            portfolio = opt.hybrid_portfolio(n_central=1, n_extreme=3, n_balanced=1, n_candidates=8000)
+            portfolio = opt.hybrid_portfolio(n_central=2, n_extreme=1, n_balanced=2, n_candidates=8000)
             bt = opt.backtest(portfolio, test_data)
             bt_rand = opt.backtest([opt.generator.generate_pure_random() for _ in range(n_games)], test_data)
         else:
@@ -826,7 +826,7 @@ def main():
                 print(f"   Dist: 11={bt['hit_distribution'].get(11,0)} 12={bt['hit_distribution'].get(12,0)} 13={bt['hit_distribution'].get(13,0)} 14={bt['hit_distribution'].get(14,0)} 15={bt['hit_distribution'].get(15,0)}")
         elif op == '2':
             opt = PortfolioOptimizer(contests)
-            portfolio = opt.hybrid_portfolio(n_central=1, n_extreme=3, n_balanced=1, n_candidates=10000)
+            portfolio = opt.hybrid_portfolio(n_central=2, n_extreme=1, n_balanced=2, n_candidates=10000)
             last = contests[-1]['dezenas']
             for i, g in enumerate(portfolio, 1):
                 p = sum(1 for d in g if d%2==0); pr = sum(1 for d in g if d in PRIMES)
