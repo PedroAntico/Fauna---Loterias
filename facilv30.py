@@ -550,7 +550,7 @@ class PortfolioOptimizer:
                     selected.append(c); break
         return selected
 
-    def optimize(self, n_games=5, n_candidates=10000, use_hamming=True, use_farthest=False):
+    def optimize(self, n_games=5, n_candidates=30000, use_hamming=True, use_farthest=False):
         method = "farthest-point" if use_farthest else ("Hamming + interseção" if use_hamming else "greedy básico")
         print(f"\n🧩 CARTEIRA DE COBERTURA: {n_games} jogos | método: {method}")
         t0 = time.time()
@@ -571,7 +571,7 @@ class PortfolioOptimizer:
         candidates.sort(key=lambda c: c.central_score - c.penalty * 0.1, reverse=True)
         portfolio = self._select_diverse_portfolio(candidates, n_games, use_hamming, use_farthest)
         best_score = self._portfolio_score(portfolio)
-        top = candidates[:300]
+        top = candidates[:500]
         improved = True
         while improved:
             improved = False
@@ -590,7 +590,7 @@ class PortfolioOptimizer:
         print(f"✅ Otimizado em {time.time()-t0:.1f}s")
         return [c.game for c in portfolio], best_score
 
-    def hybrid_portfolio(self, n_central=2, n_extreme=2, n_balanced=1, n_candidates=10000):
+    def hybrid_portfolio(self, n_central=2, n_extreme=2, n_balanced=1, n_candidates=30000):
         print(f"\n🎯 CARTEIRA HÍBRIDA: {n_central} centrais + {n_extreme} extremos + {n_balanced} balanceado")
         t0 = time.time()
         raw_pool, seen = [], set()
@@ -683,7 +683,7 @@ class PortfolioOptimizer:
                 'roi': (total_premio-total_custo)/total_custo*100 if total_custo>0 else 0,
                 'hit_distribution': hit_counts}
 
-    def ensemble_optimize(self, n_carteiras=3, n_games_por_carteira=5, n_candidates=10000):
+    def ensemble_optimize(self, n_carteiras=3, n_games_por_carteira=5, n_candidates=30000):
         print(f"\n🎯 GERANDO ENSEMBLE DE {n_carteiras} CARTEIRAS")
         ensembles = []
         print("   Carteira 1: cobertura padrão (farthest-point)")
@@ -751,17 +751,17 @@ def walk_forward_validation(contests, n_windows=8, train_size=400, test_size=50,
         if len(train_data) < 100 or len(test_data) < 5: continue
         opt = PortfolioOptimizer(train_data)
         if use_ensemble:
-            portfolio = opt.ensemble_optimize(n_carteiras=3, n_games_por_carteira=5, n_candidates=8000)
+            portfolio = opt.ensemble_optimize(n_carteiras=3, n_games_por_carteira=5, n_candidates=10000)
             bt = opt.backtest_ensemble(portfolio, test_data)
             total_random_games = sum(len(p) for p in portfolio)
             rand_port = [opt.generator.generate_pure_random() for _ in range(total_random_games)]
             bt_rand = opt.backtest(rand_port, test_data)
         elif use_hybrid:
-            portfolio = opt.hybrid_portfolio(n_central=1, n_extreme=0, n_balanced=4, n_candidates=8000)
+            portfolio = opt.hybrid_portfolio(n_central=1, n_extreme=0, n_balanced=4, n_candidates=10000)
             bt = opt.backtest(portfolio, test_data)
             bt_rand = opt.backtest([opt.generator.generate_pure_random() for _ in range(n_games)], test_data)
         else:
-            portfolio, _ = opt.optimize(n_games, n_candidates=8000)
+            portfolio, _ = opt.optimize(n_games, n_candidates=10000)
             bt = opt.backtest(portfolio, test_data)
             bt_rand = opt.backtest([opt.generator.generate_pure_random() for _ in range(n_games)], test_data)
         results.append({
@@ -826,7 +826,7 @@ def main():
                 print(f"   Dist: 11={bt['hit_distribution'].get(11,0)} 12={bt['hit_distribution'].get(12,0)} 13={bt['hit_distribution'].get(13,0)} 14={bt['hit_distribution'].get(14,0)} 15={bt['hit_distribution'].get(15,0)}")
         elif op == '2':
             opt = PortfolioOptimizer(contests)
-            portfolio = opt.hybrid_portfolio(n_central=1, n_extreme=0, n_balanced=4, n_candidates=10000)
+            portfolio = opt.hybrid_portfolio(n_central=1, n_extreme=0, n_balanced=4, n_candidates=30000)
             last = contests[-1]['dezenas']
             for i, g in enumerate(portfolio, 1):
                 p = sum(1 for d in g if d%2==0); pr = sum(1 for d in g if d in PRIMES)
