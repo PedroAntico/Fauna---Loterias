@@ -555,7 +555,7 @@ class PortfolioOptimizer:
                 # Contagem de bits da interseção
                 intersect = np.array([mask_intersection(masks[i], masks[idx]) for i in range(n)])
                 dists += (15 - intersect)  # distância de Hamming
-            min_dist = np.min([15 - intersect_to_each_selected])
+            min_dist = np.min([dists])
             min_dists[selected_idx] = -1  # não escolher já selecionados
             next_idx = np.argmax(min_dists)
             selected_idx.append(next_idx)
