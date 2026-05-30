@@ -72,12 +72,12 @@ STRUCTURAL_TARGETS = {
     'consecutivos': (5.5, 5.0, 0.1),
     'amplitude': (22.0, 6.0, 0.1),
 }
-SOFT_PENALTY_WEIGHT = 0.03
+SOFT_PENALTY_WEIGHT = 0.02
 
 # Cobertura
-MAX_PAIR_COVERAGE = 0.95
-MAX_INTERSECTION = 6       # respeitado rigorosamente agora
-HAMMING_MIN_DIST = 5         # distância mínima entre jogos
+MAX_PAIR_COVERAGE = 0.93
+MAX_INTERSECTION = 7       # respeitado rigorosamente agora
+HAMMING_MIN_DIST = 4         # distância mínima entre jogos
 
 # Pesos MC
 EXPONENTIAL_WEIGHTS = {
