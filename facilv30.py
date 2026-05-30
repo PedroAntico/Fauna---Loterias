@@ -531,7 +531,7 @@ class PortfolioOptimizer:
         avg_penalty = np.mean([c.penalty for c in portfolio])
         # Pesos ajustados para priorizar cobertura
         return (triple_score * 0.25 + quad_score * 0.25 + ent_score * 0.15 +
-                decade_cov * 0.10 + avg_rarity * 0.10 + mc_norm * 0.05 -
+                decade_cov * 0.10 + avg_rarity * 0.10 + mc_norm * 0.03 -
                 redundancy * 0.5 - avg_penalty * SOFT_PENALTY_WEIGHT)
 
     def _compute_mc_bounds(self):
