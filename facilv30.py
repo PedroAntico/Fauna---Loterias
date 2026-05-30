@@ -85,7 +85,7 @@ SOFT_PENALTY_WEIGHT = 0.03  # reduzido para dar mais liberdade
 
 # Cobertura – mais restritiva agora
 MAX_PAIR_COVERAGE = 0.95
-MAX_INTERSECTION = 5       # era 7, agora mais rigoroso
+MAX_INTERSECTION = 3       # era 7, agora mais rigoroso
 HAMMING_MIN_DIST = 5        # era 4, agora exige mais distância
 
 # Pesos MC (atenuados)
@@ -555,7 +555,7 @@ class PortfolioOptimizer:
                 # Contagem de bits da interseção
                 intersect = np.array([mask_intersection(masks[i], masks[idx]) for i in range(n)])
                 dists += (15 - intersect)  # distância de Hamming
-            min_dists = dists / len(selected_idx)  # média das distâncias
+            min_dist = np.min([15 - intersect_to_each_selected])
             min_dists[selected_idx] = -1  # não escolher já selecionados
             next_idx = np.argmax(min_dists)
             selected_idx.append(next_idx)
