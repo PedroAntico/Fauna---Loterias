@@ -76,7 +76,7 @@ SOFT_PENALTY_WEIGHT = 0.03
 
 # Cobertura
 MAX_PAIR_COVERAGE = 0.95
-MAX_INTERSECTION = 9       # respeitado rigorosamente agora
+MAX_INTERSECTION = 6       # respeitado rigorosamente agora
 HAMMING_MIN_DIST = 5         # distância mínima entre jogos
 
 # Pesos MC
