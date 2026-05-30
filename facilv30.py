@@ -76,7 +76,7 @@ SOFT_PENALTY_WEIGHT = 0.03
 
 # Cobertura
 MAX_PAIR_COVERAGE = 0.95
-MAX_INTERSECTION = 5        # respeitado rigorosamente agora
+MAX_INTERSECTION = 8        # respeitado rigorosamente agora
 HAMMING_MIN_DIST = 5         # distância mínima entre jogos
 
 # Pesos MC
@@ -548,6 +548,14 @@ class PortfolioOptimizer:
         selected_idx = [0]
         for _ in range(n_select - 1):
             # Inicializa distâncias com infinito
+            seen_masks = set()
+            filtered = []
+            for c in candidates:
+                if c.mask not in seen_masks:
+                    filtered.append(c)
+                    seen_masks.add(c.mask)
+
+            candidates = filtered
             min_dists = np.full(n, np.inf, dtype=np.float64)
             for idx in selected_idx:
                 intersect = np.array([mask_intersection(masks[i], masks[idx]) for i in range(n)])
