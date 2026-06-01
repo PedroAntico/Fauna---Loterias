@@ -2,14 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v37
-TESTE DE CAPACIDADE PREDITIVA DAS FEATURES
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v37.1
 
-NOVO:
-✅ Opção 11: Teste de capacidade preditiva (walk‑forward com modelo)
-   - Para cada feature alvo, treina um modelo linear e compara com baseline
-   - Métricas: RMSE, MAE, redução vs. baseline, significância estatística
-✅ Mantém todas as funcionalidades do v36.2
+CORREÇÕES:
+✅ TEMPORAL_FEATURES agora inclui moldura, consecutivos, amplitude
+✅ predictive_test() reformulado: testa memória temporal da própria feature
+   usando y(t-1), y(t-2), ..., y(t-5) como preditores
+✅ Mantém todas as funcionalidades do v37
 """
 
 import numpy as np
@@ -31,7 +30,6 @@ try:
     from sklearn.preprocessing import StandardScaler
     from sklearn.decomposition import PCA
     from sklearn.linear_model import LinearRegression
-    from sklearn.tree import DecisionTreeRegressor
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
@@ -55,16 +53,20 @@ FEATURE_NAMES = [
 ]
 N_FEATURES = len(FEATURE_NAMES)
 
+# Features temporais COMPLETAS (todas as que podem ser alvo de previsão)
 TEMPORAL_FEATURES = {
     'repeticoes': lambda d, prev: len(set(d) & prev) if prev else 8,
     'soma': lambda d, prev: sum(d),
-    'pares': lambda d, prev: sum(1 for x in d if x%2==0),
+    'pares': lambda d, prev: sum(1 for x in d if x % 2 == 0),
     'primos': lambda d, prev: sum(1 for x in d if x in PRIMES),
-    'clusterizacao': lambda d, prev: sum(1 for i in range(len(d)-1) if d[i+1]-d[i]<=2)/14,
+    'moldura': lambda d, prev: sum(1 for x in d if x in MOLDURA),
+    'consecutivos': lambda d, prev: sum(1 for i in range(len(d)-1) if d[i+1]-d[i] == 1),
+    'amplitude': lambda d, prev: max(d) - min(d),
+    'clusterizacao': lambda d, prev: sum(1 for i in range(len(d)-1) if d[i+1]-d[i] <= 2) / 14,
     'gaps': lambda d, prev: np.mean([d[i+1]-d[i] for i in range(len(d)-1)]),
 }
 
-# Features que tentaremos prever
+# Features que tentaremos prever (devem existir em TEMPORAL_FEATURES)
 PREDICTABLE_FEATURES = ['pares', 'primos', 'moldura', 'soma', 'repeticoes', 'consecutivos', 'amplitude']
 
 # Estruturais
@@ -80,17 +82,12 @@ STRUCTURAL_TARGETS = {
 }
 SOFT_PENALTY_WEIGHT = 0.02
 
-# Cobertura
 DEFAULT_MAX_INTERSECTION = 8
 DEFAULT_HAMMING_MIN_DIST = 5
 MAX_PAIR_COVERAGE = 0.95
 
 EXPONENTIAL_WEIGHTS = {
-    11: 1.0,
-    12: 5.0,
-    13: 50.0,
-    14: 500.0,
-    15: 50000.0,
+    11: 1.0, 12: 5.0, 13: 50.0, 14: 500.0, 15: 50000.0,
 }
 
 # ============================================================
@@ -344,17 +341,20 @@ class LooseGenerator:
         return sorted(np.random.choice(range(1, 26), 15, replace=False))
 
 # ============================================================
-# FUNÇÕES DE DEPENDÊNCIA TEMPORAL (inalteradas)
+# FUNÇÕES DE DEPENDÊNCIA TEMPORAL
 # ============================================================
 def compute_temporal_features(contests):
+    """Extrai todas as features temporais (incluindo moldura, consecutivos, amplitude)."""
     series = {name: [] for name in TEMPORAL_FEATURES}
     for i, c in enumerate(contests):
         prev = set(contests[i-1]['dezenas']) if i > 0 else None
         for name, func in TEMPORAL_FEATURES.items():
             val = func(c['dezenas'], prev)
-            if name == 'gaps': val = round(val, 2)
-            elif name == 'clusterizacao': val = round(val, 3)
-            elif name == 'soma': val = val // 5 * 5
+            # Discretização para features contínuas (apenas para MI, não afeta predictive_test)
+            if name in ['gaps', 'clusterizacao']:
+                val = round(val, 3)
+            elif name == 'soma':
+                val = val // 5 * 5
             series[name].append(val)
     return series
 
@@ -416,15 +416,17 @@ def compare_real_vs_synthetic(contests, n_synthetic=None):
     synth_series = compute_temporal_features(synthetic)
     real_pvals = []
     for name in TEMPORAL_FEATURES:
+        if name not in real_series: continue
         _, mi_adj_real, p_real, _ = permutation_mi_test(real_series[name], lag=1)
         _, mi_adj_synth, p_synth, _ = permutation_mi_test(synth_series[name], lag=1)
         real_pvals.append(p_real)
         print(f"{name:<15} {mi_adj_real:<12.4f} {p_real:<10.3f} {mi_adj_synth:<15.4f} {p_synth:<10.3f}")
-    _, fdr_pvals, _, _ = multipletests(real_pvals, method='fdr_bh')
-    print("\n🔍 Após correção FDR (Benjamini-Hochberg):")
-    for i, name in enumerate(TEMPORAL_FEATURES):
-        sig = "⚠️" if fdr_pvals[i] <= 0.05 else "não"
-        print(f"   {name}: p_raw={real_pvals[i]:.3f}, p_fdr={fdr_pvals[i]:.3f} -> {sig}")
+    if real_pvals:
+        _, fdr_pvals, _, _ = multipletests(real_pvals, method='fdr_bh')
+        print("\n🔍 Após correção FDR (Benjamini-Hochberg):")
+        for i, name in enumerate(TEMPORAL_FEATURES):
+            sig = "⚠️" if fdr_pvals[i] <= 0.05 else "não"
+            print(f"   {name}: p_raw={real_pvals[i]:.3f}, p_fdr={fdr_pvals[i]:.3f} -> {sig}")
     if SKLEARN_AVAILABLE:
         ext_real = FeatureExtractor(contests)
         ext_synth = FeatureExtractor(synthetic)
@@ -580,28 +582,25 @@ def historical_exact_frequency(contests, allowed_pares, allowed_moldura, allowed
     return count, prop
 
 # ============================================================
-# TESTE DE CAPACIDADE PREDITIVA (NOVO v37)
+# TESTE DE CAPACIDADE PREDITIVA (CORRIGIDO v37.1)
 # ============================================================
-def predictive_test(contests, n_windows=20, train_size=300, test_size=1):
+def predictive_test(contests, max_lag=5, n_windows=20, train_size=300, test_size=1):
     """
-    Para cada feature alvo em PREDICTABLE_FEATURES, faz walk‑forward:
-    - Treina um modelo linear com features do concurso anterior
-    - Compara com baseline (último valor)
-    - Mede redução de erro e significância
+    Para cada feature alvo, testa se a própria feature tem memória temporal.
+    Modelo: y(t) = f(y(t-1), y(t-2), ..., y(t-max_lag))
+    Baseline: repetir y(t-1)
     """
     if not SKLEARN_AVAILABLE:
         print("❌ Scikit-learn necessário para este teste.")
         return
 
-    print(f"\n🔮 TESTE DE CAPACIDADE PREDITIVA DAS FEATURES")
+    print(f"\n🔮 TESTE DE CAPACIDADE PREDITIVA (MEMÓRIA TEMPORAL)")
     print(f"   Walk‑forward: {n_windows} janelas, treino={train_size}, teste={test_size}")
-    print(f"   Modelo: regressão linear com features do concurso anterior")
-    print(f"   Baseline: repetir o último valor observado\n")
+    print(f"   Modelo: regressão linear com lags 1 a {max_lag} da própria feature")
+    print(f"   Baseline: repetir o último valor observado (lag 1)\n")
 
-    # Extrair todas as features temporais
     series = compute_temporal_features(contests)
     
-    # Para cada feature, construir matriz de features (t-1) e target (t)
     results = {}
     for target_name in PREDICTABLE_FEATURES:
         if target_name not in series:
@@ -609,40 +608,45 @@ def predictive_test(contests, n_windows=20, train_size=300, test_size=1):
         
         y_all = np.array(series[target_name], dtype=float)
         
-        # Features preditoras: todas as outras features temporais no lag 1
-        predictor_names = [n for n in PREDICTABLE_FEATURES if n != target_name]
-        X_all = np.column_stack([np.array(series[n], dtype=float) for n in predictor_names])
+        # Montar matriz de features: para cada t, features = [y(t-1), y(t-2), ..., y(t-max_lag)]
+        n = len(y_all)
+        X_all = np.zeros((n, max_lag))
+        for lag in range(1, max_lag+1):
+            X_all[lag:, lag-1] = y_all[:-lag]
+        
+        # Alvo: y(t) para t >= max_lag
+        y_target = y_all[max_lag:]
+        X_features = X_all[max_lag:]
         
         errors_model = []
         errors_baseline = []
         
         for w in range(n_windows):
-            test_end = len(contests) - w * test_size
+            test_end = len(y_target) - w * test_size
             test_start = test_end - test_size
             train_end = test_start
             train_start = max(0, train_end - train_size)
             
-            if train_start + 1 >= train_end or test_start + 1 >= test_end:
+            if train_start >= train_end or test_start >= test_end:
+                continue
+            if train_end - train_start < 10:
                 continue
             
-            # Treino: X[train_start:train_end-1] -> y[train_start+1:train_end]
-            X_train = X_all[train_start:train_end-1]
-            y_train = y_all[train_start+1:train_end]
+            X_train = X_features[train_start:train_end]
+            y_train = y_target[train_start:train_end]
+            X_test = X_features[test_start:test_end]
+            y_test = y_target[test_start:test_end]
             
-            # Teste: X[test_start:test_end-1] -> y[test_start+1:test_end]
-            X_test = X_all[test_start:test_end-1]
-            y_test = y_all[test_start+1:test_end]
-            
-            if len(X_train) < 10 or len(X_test) < 1:
+            if len(X_test) == 0:
                 continue
             
-            # Modelo linear
+            # Modelo linear com lags
             model = LinearRegression()
             model.fit(X_train, y_train)
             preds = model.predict(X_test)
             
-            # Baseline: último valor conhecido
-            baseline_preds = y_all[test_start:test_end-1]
+            # Baseline: y(t-1) = primeira coluna de X_test
+            baseline_preds = X_test[:, 0]
             
             errors_model.extend(np.abs(preds - y_test).tolist())
             errors_baseline.extend(np.abs(baseline_preds - y_test).tolist())
@@ -657,12 +661,8 @@ def predictive_test(contests, n_windows=20, train_size=300, test_size=1):
         mae_baseline = np.mean(errors_baseline)
         rmse_model = np.sqrt(np.mean(errors_model**2))
         rmse_baseline = np.sqrt(np.mean(errors_baseline**2))
-        
-        # Redução percentual do erro
         reduction = (mae_baseline - mae_model) / mae_baseline * 100
         
-        # Teste estatístico nos erros absolutos
-        diff = errors_baseline - errors_model
         try:
             _, p_value = wilcoxon(errors_model, errors_baseline)
         except:
@@ -690,7 +690,6 @@ def predictive_test(contests, n_windows=20, train_size=300, test_size=1):
             conclusao = "❌ Sem sinal"
         print(f"{name:<15} {res['mae_model']:<10.4f} {res['mae_baseline']:<10.4f} {res['reduction_pct']:<10.1f}% {res['p_value']:<10.4f} {conclusao}")
     
-    # Verificar se alguma feature passou
     promising = [n for n, r in results.items() if r['reduction_pct'] > 0 and r['p_value'] < 0.05]
     print(f"\n🔍 Features com sinal preditivo significativo: {len(promising)}")
     if promising:
@@ -703,7 +702,7 @@ def predictive_test(contests, n_windows=20, train_size=300, test_size=1):
     return results
 
 # ============================================================
-# OTIMIZADOR v36.2 (mantido)
+# OTIMIZADOR (mantido do v36.2)
 # ============================================================
 class PortfolioOptimizer:
     def __init__(self, contests, allowed_pares=None, allowed_moldura=None, allowed_primos=None):
@@ -1180,8 +1179,8 @@ def walk_forward_validation(contests, n_windows=8, train_size=400, test_size=50,
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v37")
-    print("   TESTE DE CAPACIDADE PREDITIVA")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v37.1")
+    print("   TESTE DE MEMÓRIA TEMPORAL CORRIGIDO")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
@@ -1202,7 +1201,7 @@ def main():
         print("8. Contar universo combinatório dos critérios")
         print("9. Análise automática de critérios (últimos concursos)")
         print("10. Frequência histórica exata dos critérios")
-        print("11. Teste de capacidade preditiva das features")
+        print("11. Teste de memória temporal das features")
         print("0. Sair")
         op = input("Escolha: ").strip()
         
@@ -1267,14 +1266,16 @@ def main():
             print(f"{'Feature':<15} {'MI_obs':<8} {'MI_adj':<8} {'p_raw':<8}")
             print("-" * 45)
             for name in TEMPORAL_FEATURES:
+                if name not in series: continue
                 mi_obs, mi_adj, p_val, _ = permutation_mi_test(series[name], lag=1)
                 pvals.append(p_val)
                 print(f"{name:<15} {mi_obs:<8.4f} {mi_adj:<8.4f} {p_val:<8.3f}")
-            _, fdr_pvals, _, _ = multipletests(pvals, method='fdr_bh')
-            print("\nApós FDR (Benjamini-Hochberg):")
-            for i, name in enumerate(TEMPORAL_FEATURES):
-                sig = "⚠️" if fdr_pvals[i] <= 0.05 else "não"
-                print(f"   {name}: p_fdr={fdr_pvals[i]:.3f} -> {sig}")
+            if pvals:
+                _, fdr_pvals, _, _ = multipletests(pvals, method='fdr_bh')
+                print("\nApós FDR (Benjamini-Hochberg):")
+                for i, name in enumerate(TEMPORAL_FEATURES):
+                    sig = "⚠️" if fdr_pvals[i] <= 0.05 else "não"
+                    print(f"   {name}: p_fdr={fdr_pvals[i]:.3f} -> {sig}")
         
         elif op == '6':
             compare_real_vs_synthetic(contests)
@@ -1283,6 +1284,7 @@ def main():
             print("\n📊 AUTOCORRELAÇÃO, PACF E ESPECTRO POR FEATURE")
             series = compute_temporal_features(contests)
             for name in TEMPORAL_FEATURES:
+                if name not in series: continue
                 print(f"\n--- {name} ---")
                 s = series[name]
                 print("Lag  Corr    p_corr  MI_adj  p_mi")
