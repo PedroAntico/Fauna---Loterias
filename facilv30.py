@@ -2,14 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v34.3
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v36
 
-CORREÇÕES:
-✅ Benchmark de cobertura corrigido (gera portfólios aleatórios completos)
-✅ Híbrido agora garante 5 jogos (fallback com restrições relaxadas)
-✅ Verificação de tamanho da carteira no walk‑forward
-✅ MAX_INTERSECTION = 8, HAMMING_MIN_DIST = 5 mantidos
-✅ Mantém todas as ferramentas estatísticas (MI, FDR, PACF, FFT, RNG)
+NOVO:
+✅ Contagem do universo combinatório para critérios (opção 8)
+✅ Análise automática de frequência histórica e sugestão de critérios (opção 9)
+✅ Backtest de critérios com interpretação explícita (teto teórico)
+✅ Walk‑forward com critérios sugeridos ou manuais
+✅ Mantém todos os testes de dependência temporal e benchmark robusto
 """
 
 import numpy as np
@@ -19,7 +19,7 @@ from scipy.signal import periodogram
 from statsmodels.tsa.stattools import pacf
 from statsmodels.stats.multitest import multipletests
 from collections import Counter
-from itertools import combinations
+from itertools import combinations, product
 import os, random, time, warnings
 from math import comb
 from tqdm import tqdm
@@ -62,7 +62,7 @@ TEMPORAL_FEATURES = {
     'gaps': lambda d, prev: np.mean([d[i+1]-d[i] for i in range(len(d)-1)]),
 }
 
-# Estruturais – relaxadas com penalidade suave
+# Estruturais – relaxadas
 MAX_CONSECUTIVOS_RUN = 7
 STRUCTURAL_TARGETS = {
     'pares': (7.5, 3.0, 0.5),
@@ -73,7 +73,7 @@ STRUCTURAL_TARGETS = {
     'consecutivos': (5.5, 5.0, 0.1),
     'amplitude': (22.0, 6.0, 0.1),
 }
-SOFT_PENALTY_WEIGHT = 0.03
+SOFT_PENALTY_WEIGHT = 0.02
 
 # Cobertura
 MAX_PAIR_COVERAGE = 0.95
@@ -82,9 +82,9 @@ HAMMING_MIN_DIST = 5
 
 EXPONENTIAL_WEIGHTS = {
     11: 1.0,
-    12: 4.0,
-    13: 25.0,
-    14: 400.0,
+    12: 5.0,
+    13: 50.0,
+    14: 500.0,
     15: 50000.0,
 }
 
@@ -134,7 +134,7 @@ def load_all_contests(csv_file='resultados_lotofacil.csv'):
     return contests
 
 # ============================================================
-# EXTRATOR DE FEATURES
+# EXTRATOR DE FEATURES (mantido)
 # ============================================================
 class FeatureExtractor:
     def __init__(self, contests):
@@ -264,14 +264,15 @@ class FeatureExtractor:
         return penalty
 
 # ============================================================
-# GERADOR
+# GERADOR COM CRITÉRIOS
 # ============================================================
 class LooseGenerator:
     def __init__(self, extractor=None):
         self.extractor = extractor
-    def generate_one(self, max_penalty=30):
-        for _ in range(50):
-            game = self._generate_raw()
+
+    def generate_one(self, max_penalty=30, allowed_pares=None, allowed_moldura=None, allowed_primos=None):
+        for _ in range(100):
+            game = self._generate_raw(allowed_pares, allowed_moldura, allowed_primos)
             if self.extractor is not None:
                 pen = self.extractor.compute_structural_penalty(game)
                 if pen <= max_penalty:
@@ -279,7 +280,28 @@ class LooseGenerator:
             else:
                 return game
         return self._generate_raw()
-    def _generate_raw(self):
+
+    def _generate_raw(self, allowed_pares=None, allowed_moldura=None, allowed_primos=None):
+        if allowed_pares is None and allowed_moldura is None and allowed_primos is None:
+            return self._generate_raw_old()
+        for _ in range(200):
+            game = sorted(np.random.choice(range(1, 26), 15, replace=False))
+            if allowed_pares is not None:
+                pares = sum(1 for x in game if x % 2 == 0)
+                if pares not in allowed_pares:
+                    continue
+            if allowed_moldura is not None:
+                mol = sum(1 for x in game if x in MOLDURA)
+                if mol not in allowed_moldura:
+                    continue
+            if allowed_primos is not None:
+                prim = sum(1 for x in game if x in PRIMES)
+                if prim not in allowed_primos:
+                    continue
+            return game
+        return sorted(np.random.choice(range(1, 26), 15, replace=False))
+
+    def _generate_raw_old(self):
         game = set()
         available = set(range(1, 26))
         while len(game) < 15 and available:
@@ -307,11 +329,12 @@ class LooseGenerator:
             else: chosen = random.choice(candidates)
             game.add(chosen); available.remove(chosen)
         return sorted(game)[:15]
+
     def generate_pure_random(self):
         return sorted(np.random.choice(range(1, 26), 15, replace=False))
 
 # ============================================================
-# FUNÇÕES DE DEPENDÊNCIA TEMPORAL
+# FUNÇÕES DE DEPENDÊNCIA TEMPORAL (inalteradas)
 # ============================================================
 def compute_temporal_features(contests):
     series = {name: [] for name in TEMPORAL_FEATURES}
@@ -437,14 +460,126 @@ def pca_analysis(feature_matrix):
     return pca.explained_variance_ratio_[:3]
 
 # ============================================================
-# OTIMIZADOR v34.3 – CORRIGIDO
+# NOVAS FUNÇÕES DO v36
+# ============================================================
+def count_universe(allowed_pares=None, allowed_moldura=None, allowed_primos=None):
+    """
+    Estima o número de combinações que atendem aos critérios.
+    Como a enumeração completa é impossível, usamos amostragem.
+    """
+    print(f"\n📊 ESTIMATIVA DO UNIVERSO COMBINATÓRIO")
+    print(f"   Critérios: Pares={allowed_pares}, Moldura={allowed_moldura}, Primos={allowed_primos}")
+    
+    # Amostra grande para estimar a proporção
+    n_amostra = 500000
+    count_valid = 0
+    for _ in tqdm(range(n_amostra), desc="Estimando universo"):
+        game = sorted(np.random.choice(range(1, 26), 15, replace=False))
+        valid = True
+        if allowed_pares is not None:
+            if sum(1 for x in game if x % 2 == 0) not in allowed_pares:
+                valid = False
+        if allowed_moldura is not None and valid:
+            if sum(1 for x in game if x in MOLDURA) not in allowed_moldura:
+                valid = False
+        if allowed_primos is not None and valid:
+            if sum(1 for x in game if x in PRIMES) not in allowed_primos:
+                valid = False
+        if valid:
+            count_valid += 1
+    
+    proporcao = count_valid / n_amostra
+    total_universe = comb(25, 15)
+    estimativa = int(total_universe * proporcao)
+    
+    print(f"   Proporção na amostra: {proporcao:.4%}")
+    print(f"   Universo total (C(25,15)): {total_universe:,}")
+    print(f"   Universo estimado com critérios: {estimativa:,}")
+    print(f"   Redução: {(1 - proporcao)*100:.1f}%")
+    if estimativa < 50000:
+        print("   ⚠️ Universo pequeno – critérios muito restritivos podem limitar cobertura")
+    elif estimativa > 500000:
+        print("   ℹ️ Universo ainda grande – critérios pouco restritivos")
+    
+    return estimativa, proporcao
+
+def analyze_historical_criteria(contests, n_recent=500, coverage_pct=0.80):
+    """
+    Analisa os últimos n_recent concursos e sugere critérios que cobrem
+    pelo menos coverage_pct do histórico.
+    """
+    print(f"\n📊 ANÁLISE DE CRITÉRIOS NOS ÚLTIMOS {n_recent} CONCURSOS")
+    recent = contests[-n_recent:] if n_recent < len(contests) else contests
+    
+    # Distribuição de pares
+    pares_dist = Counter()
+    moldura_dist = Counter()
+    primos_dist = Counter()
+    
+    for c in recent:
+        d = c['dezenas']
+        pares_dist[sum(1 for x in d if x % 2 == 0)] += 1
+        moldura_dist[sum(1 for x in d if x in MOLDURA)] += 1
+        primos_dist[sum(1 for x in d if x in PRIMES)] += 1
+    
+    total = len(recent)
+    
+    print("\n📈 DISTRIBUIÇÃO DE PARES:")
+    for k in sorted(pares_dist.keys()):
+        pct = pares_dist[k] / total * 100
+        bar = "█" * int(pct / 2)
+        print(f"   {k} pares: {pares_dist[k]:4d} ({pct:5.1f}%) {bar}")
+    
+    print("\n📈 DISTRIBUIÇÃO DE MOLDURA:")
+    for k in sorted(moldura_dist.keys()):
+        pct = moldura_dist[k] / total * 100
+        bar = "█" * int(pct / 2)
+        print(f"   {k} moldura: {moldura_dist[k]:4d} ({pct:5.1f}%) {bar}")
+    
+    print("\n📈 DISTRIBUIÇÃO DE PRIMOS:")
+    for k in sorted(primos_dist.keys()):
+        pct = primos_dist[k] / total * 100
+        bar = "█" * int(pct / 2)
+        print(f"   {k} primos: {primos_dist[k]:4d} ({pct:5.1f}%) {bar}")
+    
+    # Sugerir critérios que cobrem coverage_pct
+    def suggest(values_dist, name):
+        sorted_items = sorted(values_dist.items(), key=lambda x: x[1], reverse=True)
+        cumulative = 0
+        suggested = []
+        for val, count in sorted_items:
+            cumulative += count
+            suggested.append(val)
+            if cumulative / total >= coverage_pct:
+                break
+        return sorted(suggested)
+    
+    suggested_pares = suggest(pares_dist, "pares")
+    suggested_moldura = suggest(moldura_dist, "moldura")
+    suggested_primos = suggest(primos_dist, "primos")
+    
+    print(f"\n💡 SUGESTÃO DE CRITÉRIOS (cobertura ≥ {coverage_pct*100:.0f}%):")
+    print(f"   Pares: {suggested_pares}")
+    print(f"   Moldura: {suggested_moldura}")
+    print(f"   Primos: {suggested_primos}")
+    
+    # Estimar universo com essas sugestões
+    count_universe(suggested_pares, suggested_moldura, suggested_primos)
+    
+    return suggested_pares, suggested_moldura, suggested_primos
+
+# ============================================================
+# OTIMIZADOR v36
 # ============================================================
 class PortfolioOptimizer:
-    def __init__(self, contests):
+    def __init__(self, contests, allowed_pares=None, allowed_moldura=None, allowed_primos=None):
         self.contests = contests
         self.extractor = FeatureExtractor(contests)
         self.last = contests[-1]['dezenas'] if contests else None
         self.generator = LooseGenerator(self.extractor)
+        self.allowed_pares = allowed_pares
+        self.allowed_moldura = allowed_moldura
+        self.allowed_primos = allowed_primos
         self.historical_masks = draw_masks_to_array([c['dezenas'] for c in self.contests])
         if len(self.historical_masks) < 100:
             extra = [sorted(np.random.choice(range(1,26),15,replace=False)) for _ in range(500-len(self.historical_masks))]
@@ -526,8 +661,8 @@ class PortfolioOptimizer:
         mc_norm = max(0.0, min(1.0, (raw_mc - p5) / (p95 - p5 + 1e-10)))
         avg_penalty = np.mean([c.penalty for c in portfolio])
         overlap_penalty = max(0, max_overlap - MAX_INTERSECTION) * 0.3
-        return (triple_score * 0.25 + quad_score * 0.25 + ent_score * 0.15 +
-                decade_cov * 0.10 + avg_rarity * 0.10 + mc_norm * 0.05 -
+        return (triple_score * 0.20 + quad_score * 0.20 + ent_score * 0.15 +
+                decade_cov * 0.10 + mc_norm * 0.25 + avg_rarity * 0.10 -
                 redundancy * 0.5 - avg_penalty * SOFT_PENALTY_WEIGHT - overlap_penalty)
 
     def _compute_mc_bounds(self):
@@ -535,16 +670,14 @@ class PortfolioOptimizer:
         scores = np.array(scores)
         return np.percentile(scores, 5), np.percentile(scores, 95)
 
-    # ---------- FARTHEST-POINT CORRIGIDO ----------
     def _select_max_diversity(self, candidates, n_select):
-        # Remove duplicatas
         unique = {}
         for c in candidates:
             if c.mask not in unique:
                 unique[c.mask] = c
         cand_unique = list(unique.values())
         if len(cand_unique) < n_select:
-            cand_unique = candidates[:n_select]  # fallback
+            cand_unique = candidates[:n_select]
         masks = np.array([c.mask for c in cand_unique], dtype=np.uint32)
         n = len(cand_unique)
         selected_idx = [0]
@@ -580,14 +713,29 @@ class PortfolioOptimizer:
         return selected
 
     def optimize(self, n_games=5, n_candidates=30000):
-        print(f"\n🧩 CARTEIRA DE COBERTURA MÁXIMA (max diversity, MAX_INTERSECTION={MAX_INTERSECTION})")
+        print(f"\n🧩 CARTEIRA COM CRITÉRIOS: {n_games} jogos")
+        if self.allowed_pares: print(f"   Pares permitidos: {self.allowed_pares}")
+        if self.allowed_moldura: print(f"   Moldura permitida: {self.allowed_moldura}")
+        if self.allowed_primos: print(f"   Primos permitidos: {self.allowed_primos}")
         t0 = time.time()
         raw_pool, seen = [], set()
         for _ in tqdm(range(n_candidates), desc="Gerando pool"):
-            g = self.generator.generate_one()
+            g = self.generator.generate_one(
+                allowed_pares=self.allowed_pares,
+                allowed_moldura=self.allowed_moldura,
+                allowed_primos=self.allowed_primos
+            )
             key = tuple(g)
             if key not in seen:
                 seen.add(key); raw_pool.append(g)
+        print(f"   Pool gerado: {len(raw_pool)} jogos")
+        if len(raw_pool) < n_games:
+            print("⚠️ Poucos jogos no pool. Relaxando critérios...")
+            for _ in tqdm(range(n_candidates), desc="Gerando pool extra"):
+                g = self.generator.generate_one()
+                key = tuple(g)
+                if key not in seen:
+                    seen.add(key); raw_pool.append(g)
         pool = raw_pool[:5000]
         fmat = self.extractor.extract_features_batch(pool, self.last)
         r_scores, pcts, m_dists = self.extractor.compute_rarity_scores_batch(fmat)
@@ -619,79 +767,28 @@ class PortfolioOptimizer:
         print(f"   Máxima interseção entre jogos: {self._max_overlap(portfolio)}")
         return [c.game for c in portfolio], best_score
 
-    # ---------- HÍBRIDO COM GARANTIA DE 5 JOGOS ----------
-    def hybrid_portfolio(self, n_central=1, n_extreme=0, n_balanced=4, n_candidates=30000, use_anti_central=True):
-        target = n_central + n_extreme + n_balanced
-        print(f"\n🎯 CARTEIRA HÍBRIDA: {n_central} central + {n_extreme} extremos + {n_balanced} balanceados")
-        if use_anti_central:
-            print("   Modo anti‑central: balanceados por distância ao percentil 0.50")
-        t0 = time.time()
-        raw_pool, seen = [], set()
-        for _ in tqdm(range(n_candidates), desc="Gerando pool"):
-            g = self.generator.generate_one(max_penalty=40)
-            key = tuple(g)
-            if key not in seen:
-                seen.add(key); raw_pool.append(g)
-        pool = raw_pool[:5000]
-        fmat = self.extractor.extract_features_batch(pool, self.last)
-        r_scores, pcts, m_dists = self.extractor.compute_rarity_scores_batch(fmat)
-        candidates = []
-        for i, game in enumerate(pool):
-            mask = BITMASK_CACHE.get_mask(game)
-            pen = self.extractor.compute_structural_penalty(game)
-            candidates.append(GameCandidate(game, mask, fmat[i], r_scores[i], r_scores[i], m_dists[i], pcts[i], pen))
-        
-        candidates.sort(key=lambda c: c.central_score, reverse=True)
-        centrais = candidates[:n_central*100]
-        candidates_by_mahal = sorted(candidates, key=lambda c: c.mahalanobis_dist, reverse=True)
-        extremos = candidates_by_mahal[:n_extreme*100] if n_extreme > 0 else []
-        
-        if use_anti_central:
-            anti_centrais = sorted(candidates, key=lambda c: abs(c.rarity_percentile - 0.50))
-            used_masks = {c.mask for c in centrais[:n_central] + extremos[:n_extreme]}
-            anti_centrais = [c for c in anti_centrais if c.mask not in used_masks]
-            balanceados = anti_centrais[:n_balanced*100]
-        else:
-            mid_idx = len(candidates) // 2
-            balanceados = candidates[mid_idx:mid_idx+200]
-        
-        selected = []
-        sel_cent = self._select_diverse_portfolio(centrais, n_central, use_hamming=True, use_max_diversity=True)
-        selected.extend(sel_cent)
-        masks_sel = [c.mask for c in selected]
-        
-        if n_extreme > 0:
-            sel_ext = []
-            for c in extremos:
-                if len(sel_ext) >= n_extreme: break
-                if any(mask_intersection(c.mask, m) > MAX_INTERSECTION for m in masks_sel): continue
-                if sel_ext and any(hamming_distance(c.game, x.game) < HAMMING_MIN_DIST for x in sel_ext): continue
-                sel_ext.append(c); masks_sel.append(c.mask)
-            selected.extend(sel_ext)
-        
-        sel_bal = self._select_diverse_portfolio(balanceados, n_balanced, use_hamming=True, use_max_diversity=True)
-        for c in sel_bal:
-            if len(selected) >= target: break
-            if any(mask_intersection(c.mask, m) > MAX_INTERSECTION for m in masks_sel): continue
-            selected.append(c); masks_sel.append(c.mask)
-        
-        # Se ainda não completou, complete com os melhores restantes (apenas restrição MAX_INTERSECTION)
-        if len(selected) < target:
-            for c in candidates:
-                if len(selected) >= target: break
-                if c in selected: continue
-                if any(mask_intersection(c.mask, m) > MAX_INTERSECTION for m in masks_sel): continue
-                selected.append(c); masks_sel.append(c.mask)
-        
-        # Último recurso: adicionar sem restrições (mas evitando duplicatas)
-        for c in candidates:
-            if len(selected) >= target: break
-            if c not in selected:
-                selected.append(c)
-        
-        print(f"✅ Carteira híbrida gerada em {time.time()-t0:.1f}s")
-        print(f"   Máxima interseção entre jogos: {self._max_overlap(selected)}")
-        return [c.game for c in selected]
+    def backtest(self, portfolio, test_draws):
+        n_success = total_premio = 0
+        total_custo = len(portfolio) * len(test_draws) * CUSTO_APOSTA
+        portfolio_masks = np.array([BITMASK_CACHE.get_mask(g) for g in portfolio], dtype=np.uint32)
+        hit_counts = {k:0 for k in range(11,16)}
+        for draw in test_draws:
+            dm = BITMASK_CACHE.get_mask(draw['dezenas'])
+            for pm in portfolio_masks:
+                hits = mask_intersection(pm, dm)
+                if hits >= 11:
+                    n_success += 1
+                    total_premio += PREMIO_VALORES.get(hits, 0)
+                    hit_counts[hits] += 1
+        prob = n_success/(len(portfolio)*len(test_draws)) if test_draws else 0
+        p_single = sum(HYPE_PROBS[k] for k in range(11,16))
+        theo_prob = 1 - (1-p_single)**len(portfolio)
+        return {'empirical': prob, 'theoretical': theo_prob,
+                'lift': prob/theo_prob if theo_prob>0 else 1.0,
+                'n_test': len(test_draws), 'n_success': n_success,
+                'total_premio': total_premio, 'total_custo': total_custo,
+                'roi': (total_premio-total_custo)/total_custo*100 if total_custo>0 else 0,
+                'hit_distribution': hit_counts}
 
     def diagnostic_distribution(self, portfolio, test_draws):
         n_jogos = len(portfolio)
@@ -722,73 +819,83 @@ class PortfolioOptimizer:
         for k in range(11,16):
             count = sum(1 for h in max_hits if h == k)
             print(f"   {k} pontos: {count} concursos (máximo entre os {n_jogos} jogos)")
-        ratio_13 = hit_counts.get(13,0)/expected[13] if expected[13] > 0 else 0
-        if ratio_13 < 0.5:
-            print("\n🔍 ALERTA: 13 pontos muito abaixo do esperado.")
-            print("   Possível compressão de variância.")
         return hit_counts, expected
 
-    def backtest(self, portfolio, test_draws):
-        n_success = total_premio = 0
-        total_custo = len(portfolio) * len(test_draws) * CUSTO_APOSTA
-        portfolio_masks = np.array([BITMASK_CACHE.get_mask(g) for g in portfolio], dtype=np.uint32)
-        hit_counts = {k:0 for k in range(11,16)}
-        for draw in test_draws:
+    def backtest_criteria(self, allowed_pares, allowed_moldura, allowed_primos, test_draws=None):
+        """
+        Backtest dos critérios: mede o TETO TEÓRICO do subconjunto.
+        ATENÇÃO: não mede capacidade de seleção, apenas se EXISTE algum jogo
+        com determinada pontuação dentro do subconjunto.
+        """
+        if test_draws is None:
+            test_draws = self.contests[-200:]
+        print(f"\n📊 BACKTEST DE CRITÉRIOS – TETO TEÓRICO (últimos {len(test_draws)} concursos)")
+        print(f"   ⚠️ Interpretação: mostra o MÁXIMO que alguém conseguiria se soubesse")
+        print(f"      exatamente qual jogo jogar DENTRO do subconjunto. Não é uma estratégia.")
+        print(f"   Pares: {allowed_pares}")
+        print(f"   Moldura: {allowed_moldura}")
+        print(f"   Primos: {allowed_primos}")
+        print(f"   Gerando 5000 jogos com esses critérios para cada concurso...")
+
+        pool_jogos = []
+        seen = set()
+        for _ in range(10000):
+            g = self.generator.generate_one(
+                allowed_pares=allowed_pares,
+                allowed_moldura=allowed_moldura,
+                allowed_primos=allowed_primos
+            )
+            key = tuple(g)
+            if key not in seen:
+                seen.add(key)
+                pool_jogos.append(g)
+            if len(pool_jogos) >= 5000:
+                break
+        pool_masks = np.array([BITMASK_CACHE.get_mask(g) for g in pool_jogos], dtype=np.uint32)
+        print(f"   Pool de {len(pool_jogos)} jogos únicos gerados")
+
+        hit_counts = {k: 0 for k in range(11, 16)}
+        max_hits = []
+        total_premio = 0.0
+        for draw in tqdm(test_draws, desc="Backtest"):
             dm = BITMASK_CACHE.get_mask(draw['dezenas'])
-            for pm in portfolio_masks:
+            best_hit = 0
+            for pm in pool_masks:
                 hits = mask_intersection(pm, dm)
+                if hits > best_hit:
+                    best_hit = hits
                 if hits >= 11:
-                    n_success += 1
-                    total_premio += PREMIO_VALORES.get(hits, 0)
                     hit_counts[hits] += 1
-        prob = n_success/(len(portfolio)*len(test_draws)) if test_draws else 0
-        p_single = sum(HYPE_PROBS[k] for k in range(11,16))
-        theo_prob = 1 - (1-p_single)**len(portfolio)
-        return {'empirical': prob, 'theoretical': theo_prob,
-                'lift': prob/theo_prob if theo_prob>0 else 1.0,
-                'n_test': len(test_draws), 'n_success': n_success,
-                'total_premio': total_premio, 'total_custo': total_custo,
-                'roi': (total_premio-total_custo)/total_custo*100 if total_custo>0 else 0,
-                'hit_distribution': hit_counts}
+                    total_premio += PREMIO_VALORES.get(hits, 0)
+            max_hits.append(best_hit)
 
-    def ensemble_optimize(self, n_carteiras=3, n_games_por_carteira=5, n_candidates=30000):
-        print(f"\n🎯 GERANDO ENSEMBLE DE {n_carteiras} CARTEIRAS")
-        ensembles = []
-        print("   Carteira 1: cobertura máxima (max diversity)")
-        port1, _ = self.optimize(n_games_por_carteira, n_candidates)
-        ensembles.append(port1)
-        print("   Carteira 2: foco em pares")
-        old_score = self._portfolio_score
-        self._portfolio_score = lambda p: -self._pair_redundancy(p)
-        port2, _ = self.optimize(n_games_por_carteira, n_candidates)
-        self._portfolio_score = old_score
-        ensembles.append(port2)
-        print("   Carteira 3: máxima entropia")
-        self._portfolio_score = lambda p: self._portfolio_entropy(p)
-        port3, _ = self.optimize(n_games_por_carteira, n_candidates)
-        self._portfolio_score = old_score
-        ensembles.append(port3)
-        print("✅ Ensemble gerado.")
-        return ensembles
+        total_sim = len(pool_jogos) * len(test_draws)
+        expected = {k: total_sim * HYPE_PROBS.get(k, 0) for k in range(11, 16)}
+        total_custo = len(pool_jogos) * len(test_draws) * CUSTO_APOSTA
 
-    def backtest_ensemble(self, ensemble, test_draws):
-        total_success = 0; total_premio = 0.0
-        total_custo = sum(len(port) for port in ensemble) * len(test_draws) * CUSTO_APOSTA
-        hit_counts_total = {k:0 for k in range(11,16)}
-        for portfolio in ensemble:
-            bt = self.backtest(portfolio, test_draws)
-            total_success += bt['n_success']; total_premio += bt['total_premio']
-            for k in range(11,16): hit_counts_total[k] += bt['hit_distribution'][k]
-        prob = total_success / (sum(len(p) for p in ensemble) * len(test_draws)) if test_draws else 0
-        p_single = sum(HYPE_PROBS[k] for k in range(11,16))
-        total_jogos = sum(len(p) for p in ensemble)
-        theo_prob = 1 - (1-p_single)**total_jogos
-        return {'empirical': prob, 'theoretical': theo_prob,
-                'lift': prob/theo_prob if theo_prob>0 else 1.0,
-                'n_test': len(test_draws), 'n_success': total_success,
-                'total_premio': total_premio, 'total_custo': total_custo,
-                'roi': (total_premio-total_custo)/total_custo*100 if total_custo>0 else 0,
-                'hit_distribution': hit_counts_total}
+        print(f"\n📊 RESULTADOS (amostra de {len(pool_jogos)} jogos por concurso):")
+        print(f"{'Acertos':<8} {'Observado':<10} {'Esperado':<10} {'Razão O/E':<10}")
+        print("-" * 40)
+        for k in range(11, 16):
+            obs = hit_counts.get(k, 0)
+            exp = expected[k]
+            ratio = obs/exp if exp > 0 else float('inf')
+            print(f"{k:<8} {obs:<10} {exp:<10.1f} {ratio:<10.2f}")
+
+        print(f"\n📊 MAX_HIT POR CONCURSO (melhor acerto entre os {len(pool_jogos)} jogos):")
+        for k in range(11, 16):
+            count = sum(1 for h in max_hits if h == k)
+            print(f"   {k} pontos: {count} concursos")
+
+        print(f"\n💰 RESUMO FINANCEIRO (se jogasse TODOS os {len(pool_jogos)} jogos):")
+        print(f"   Custo total: R$ {total_custo:,.2f}")
+        print(f"   Prêmio total: R$ {total_premio:,.2f}")
+        print(f"   ROI: {((total_premio - total_custo) / total_custo * 100):+.1f}%")
+        print(f"\n⚠️ LEMBRE-SE: isto é um TETO TEÓRICO, não uma estratégia viável.")
+        print(f"   Para chegar perto disso, seria necessário selecionar os melhores jogos")
+        print(f"   dentro do subconjunto a cada concurso – o que é equivalente a prever o sorteio.")
+
+        return hit_counts, max_hits
 
 class GameCandidate:
     __slots__ = ('game','mask','features','rarity_score','central_score',
@@ -801,13 +908,17 @@ class GameCandidate:
         self.penalty = penalty
 
 # ============================================================
-# WALK-FORWARD COM BENCHMARK ROBUSTO CORRIGIDO
+# WALK-FORWARD (mantido do v35)
 # ============================================================
 def walk_forward_validation(contests, n_windows=8, train_size=400, test_size=50, n_games=5,
-                            use_ensemble=False, use_hybrid=False, n_random_benchmark=100):
-    label = "ENSEMBLE" if use_ensemble else ("HÍBRIDO" if use_hybrid else "padrão")
+                            use_hybrid=False, n_random_benchmark=100,
+                            allowed_pares=None, allowed_moldura=None, allowed_primos=None):
+    label = "HÍBRIDO" if use_hybrid else "padrão"
     print(f"\n🔬 WALK-FORWARD ({n_windows} janelas) {label}")
     print(f"   Benchmark robusto: {n_random_benchmark} carteiras aleatórias por janela")
+    if allowed_pares: print(f"   Critérios: Pares={allowed_pares}")
+    if allowed_moldura: print(f"   Critérios: Moldura={allowed_moldura}")
+    if allowed_primos: print(f"   Critérios: Primos={allowed_primos}")
     results = []
     for w in range(n_windows):
         test_end = len(contests) - w * test_size
@@ -818,18 +929,11 @@ def walk_forward_validation(contests, n_windows=8, train_size=400, test_size=50,
         train_data = contests[train_start:train_end]
         test_data = contests[test_start:test_end]
         if len(train_data) < 100 or len(test_data) < 5: continue
-        opt = PortfolioOptimizer(train_data)
+        opt = PortfolioOptimizer(train_data, allowed_pares, allowed_moldura, allowed_primos)
 
-        # Gera a carteira estratégica
-        if use_ensemble:
-            portfolio = opt.ensemble_optimize(n_carteiras=3, n_games_por_carteira=5, n_candidates=10000)
-            bt = opt.backtest_ensemble(portfolio, test_data)
-            total_random_games = sum(len(p) for p in portfolio)
-            strat_games = [game for sublist in portfolio for game in sublist]  # lista plana para cobertura
-        elif use_hybrid:
+        if use_hybrid:
             portfolio = opt.hybrid_portfolio(n_central=1, n_extreme=0, n_balanced=4, n_candidates=10000, use_anti_central=True)
-            # Verifica tamanho
-            assert len(portfolio) == 5, f"Híbrido retornou {len(portfolio)} jogos, esperado 5"
+            assert len(portfolio) == 5, f"Híbrido retornou {len(portfolio)} jogos"
             bt = opt.backtest(portfolio, test_data)
             total_random_games = n_games
             strat_games = portfolio
@@ -839,9 +943,7 @@ def walk_forward_validation(contests, n_windows=8, train_size=400, test_size=50,
             total_random_games = n_games
             strat_games = portfolio
 
-        # Benchmark robusto: múltiplas carteiras aleatórias
         rand_lifts = []
-        # Para cobertura, vamos acumular pares/triplas/quadras das carteiras aleatórias
         rand_pairs_list = []
         rand_triples_list = []
         rand_quads_list = []
@@ -849,7 +951,6 @@ def walk_forward_validation(contests, n_windows=8, train_size=400, test_size=50,
             rand_port = [opt.generator.generate_pure_random() for _ in range(total_random_games)]
             bt_rand = opt.backtest(rand_port, test_data)
             rand_lifts.append(bt_rand['lift'])
-            # Cobertura
             pairs = set(p for game in rand_port for p in combinations(sorted(game), 2))
             triples = set(t for game in rand_port for t in combinations(sorted(game), 3))
             quads = set(q for game in rand_port for q in combinations(sorted(game), 4))
@@ -863,7 +964,6 @@ def walk_forward_validation(contests, n_windows=8, train_size=400, test_size=50,
         z_score = (bt['lift'] - mean_rand_lift) / std_rand_lift if std_rand_lift > 0 else 0.0
         pct_rank = np.mean(rand_lifts <= bt['lift'])
 
-        # Cobertura da estratégia
         strat_pairs = len(set(p for game in strat_games for p in combinations(sorted(game), 2)))
         strat_triples = len(set(t for game in strat_games for t in combinations(sorted(game), 3)))
         strat_quads = len(set(q for game in strat_games for q in combinations(sorted(game), 4)))
@@ -912,8 +1012,8 @@ def walk_forward_validation(contests, n_windows=8, train_size=400, test_size=50,
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v34.3")
-    print("   BENCHMARK CORRIGIDO + HÍBRIDO GARANTIDO")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v36")
+    print("   ANÁLISE DE CRITÉRIOS + UNIVERSO COMBINATÓRIO")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
@@ -924,19 +1024,28 @@ def main():
 
     while True:
         print("\nOpções:")
-        print("1. Gerar carteira de cobertura máxima")
-        print("2. Gerar carteira híbrida (central + anti‑central)")
-        print("3. Walk‑forward padrão (com benchmark robusto)")
-        print("4. Walk‑forward híbrido (com benchmark robusto)")
-        print("5. Walk‑forward ensemble (com benchmark robusto)")
-        print("6. Diagnóstico de distribuição (backtest + max_hit)")
-        print("7. Análise de dependência temporal (MI + FDR)")
-        print("8. Comparar real vs. sintético (RNG)")
-        print("9. Autocorrelação, PACF e espectro")
+        print("1. Gerar carteira com critérios (pares, moldura, primos)")
+        print("2. Backtest de critérios (teto teórico)")
+        print("3. Walk‑forward com critérios")
+        print("4. Diagnóstico de distribuição (backtest + max_hit)")
+        print("5. Análise de dependência temporal (MI + FDR)")
+        print("6. Comparar real vs. sintético (RNG)")
+        print("7. Autocorrelação, PACF e espectro")
+        print("8. Contar universo combinatório dos critérios")
+        print("9. Análise automática de critérios (últimos concursos)")
         print("0. Sair")
         op = input("Escolha: ").strip()
+        
         if op == '1':
-            opt = PortfolioOptimizer(contests)
+            print("\n📝 CRITÉRIOS PARA GERAÇÃO DA CARTEIRA")
+            print("   Digite os valores permitidos (separados por espaço) ou ENTER para sem restrição")
+            pares_str = input("   Pares (ex: 6 8 9): ").strip()
+            moldura_str = input("   Moldura (ex: 8 9 10): ").strip()
+            primos_str = input("   Primos (ex: 4 5 6): ").strip()
+            allowed_pares = [int(x) for x in pares_str.split()] if pares_str else None
+            allowed_moldura = [int(x) for x in moldura_str.split()] if moldura_str else None
+            allowed_primos = [int(x) for x in primos_str.split()] if primos_str else None
+            opt = PortfolioOptimizer(contests, allowed_pares, allowed_moldura, allowed_primos)
             portfolio, score = opt.optimize(5, 10000)
             last = contests[-1]['dezenas']
             for i, g in enumerate(portfolio, 1):
@@ -951,34 +1060,38 @@ def main():
                 bt = opt.backtest(portfolio, contests[-200:])
                 print(f"\n🔬 BACKTEST (últimos 200): Lift={bt['lift']:.2f}x | ROI={bt['roi']:+.1f}%")
                 print(f"   Dist: 11={bt['hit_distribution'].get(11,0)} 12={bt['hit_distribution'].get(12,0)} 13={bt['hit_distribution'].get(13,0)} 14={bt['hit_distribution'].get(14,0)} 15={bt['hit_distribution'].get(15,0)}")
+        
         elif op == '2':
+            print("\n📝 CRITÉRIOS PARA BACKTEST (TETO TEÓRICO)")
+            print("   ⚠️ Mostra o MÁXIMO possível, não uma estratégia real")
+            pares_str = input("   Pares (ex: 6 8 9): ").strip()
+            moldura_str = input("   Moldura (ex: 8 9 10): ").strip()
+            primos_str = input("   Primos (ex: 4 5 6): ").strip()
+            allowed_pares = [int(x) for x in pares_str.split()] if pares_str else None
+            allowed_moldura = [int(x) for x in moldura_str.split()] if moldura_str else None
+            allowed_primos = [int(x) for x in primos_str.split()] if primos_str else None
             opt = PortfolioOptimizer(contests)
-            portfolio = opt.hybrid_portfolio(n_central=1, n_extreme=0, n_balanced=4, n_candidates=30000, use_anti_central=True)
-            last = contests[-1]['dezenas']
-            for i, g in enumerate(portfolio, 1):
-                p = sum(1 for d in g if d%2==0); pr = sum(1 for d in g if d in PRIMES)
-                m = sum(1 for d in g if d in MOLDURA); rep = len(set(g) & set(last))
-                cons = sum(1 for j in range(len(g)-1) if g[j+1]-g[j]==1)
-                feat = opt.extractor.extract_features(g, last).reshape(1, -1)
-                r_score, r_pct, r_mahal = opt.extractor.compute_rarity_scores_batch(feat)
-                pen = opt.extractor.compute_structural_penalty(g)
-                print(f" {i:2d}. {g} | P:{p} Pr:{pr} M:{m} Rep:{rep} Cons:{cons} Rarity:{r_score[0]:.2f} Pct:{r_pct[0]:.2f} Mahal:{r_mahal[0]:.1f} Pen:{pen:.1f}")
-            if len(contests) > 200:
-                bt = opt.backtest(portfolio, contests[-200:])
-                opt.diagnostic_distribution(portfolio, contests[-200:])
-                print(f"\n   Lift={bt['lift']:.2f}x | ROI={bt['roi']:+.1f}%")
+            opt.backtest_criteria(allowed_pares, allowed_moldura, allowed_primos, contests[-200:])
+        
         elif op == '3':
-            walk_forward_validation(contests, n_windows=8, train_size=400, test_size=50, n_games=5, n_random_benchmark=100)
+            print("\n📝 CRITÉRIOS PARA WALK‑FORWARD (opcional)")
+            pares_str = input("   Pares (ex: 6 8 9 ou ENTER): ").strip()
+            moldura_str = input("   Moldura (ex: 8 9 10 ou ENTER): ").strip()
+            primos_str = input("   Primos (ex: 4 5 6 ou ENTER): ").strip()
+            allowed_pares = [int(x) for x in pares_str.split()] if pares_str else None
+            allowed_moldura = [int(x) for x in moldura_str.split()] if moldura_str else None
+            allowed_primos = [int(x) for x in primos_str.split()] if primos_str else None
+            walk_forward_validation(contests, n_windows=8, train_size=400, test_size=50, n_games=5,
+                                    n_random_benchmark=100, allowed_pares=allowed_pares,
+                                    allowed_moldura=allowed_moldura, allowed_primos=allowed_primos)
+        
         elif op == '4':
-            walk_forward_validation(contests, n_windows=8, train_size=400, test_size=50, n_games=5, use_hybrid=True, n_random_benchmark=100)
-        elif op == '5':
-            walk_forward_validation(contests, n_windows=8, train_size=400, test_size=50, n_games=5, use_ensemble=True, n_random_benchmark=100)
-        elif op == '6':
             opt = PortfolioOptimizer(contests)
             portfolio, _ = opt.optimize(5, 10000)
             print("Carteira gerada. Executando diagnóstico...")
             opt.diagnostic_distribution(portfolio, contests[-200:])
-        elif op == '7':
+        
+        elif op == '5':
             print("\n📊 INFORMAÇÃO MÚTUA AJUSTADA (lag=1) + CORREÇÃO FDR")
             series = compute_temporal_features(contests)
             pvals = []
@@ -993,9 +1106,11 @@ def main():
             for i, name in enumerate(TEMPORAL_FEATURES):
                 sig = "⚠️" if fdr_pvals[i] <= 0.05 else "não"
                 print(f"   {name}: p_fdr={fdr_pvals[i]:.3f} -> {sig}")
-        elif op == '8':
+        
+        elif op == '6':
             compare_real_vs_synthetic(contests)
-        elif op == '9':
+        
+        elif op == '7':
             print("\n📊 AUTOCORRELAÇÃO, PACF E ESPECTRO POR FEATURE")
             series = compute_temporal_features(contests)
             for name in TEMPORAL_FEATURES:
@@ -1010,8 +1125,27 @@ def main():
                 print(f"PACF (lags 1-5): {np.array2string(pacf_vals[1:], precision=3, separator=', ')}")
                 freq_dom, pow_dom, freqs, power = fft_analysis(s)
                 print(f"Espectro: freq dominante = {freq_dom:.4f} (período ≈ {1/freq_dom if freq_dom>0 else np.inf:.1f}), potência = {pow_dom:.4f}")
+        
+        elif op == '8':
+            print("\n📝 CRITÉRIOS PARA CONTAGEM DO UNIVERSO")
+            pares_str = input("   Pares (ex: 6 8 9): ").strip()
+            moldura_str = input("   Moldura (ex: 8 9 10): ").strip()
+            primos_str = input("   Primos (ex: 4 5 6): ").strip()
+            allowed_pares = [int(x) for x in pares_str.split()] if pares_str else None
+            allowed_moldura = [int(x) for x in moldura_str.split()] if moldura_str else None
+            allowed_primos = [int(x) for x in primos_str.split()] if primos_str else None
+            count_universe(allowed_pares, allowed_moldura, allowed_primos)
+        
+        elif op == '9':
+            n_recent = input("   Quantos concursos analisar? [500]: ").strip()
+            n_recent = int(n_recent) if n_recent else 500
+            coverage = input("   Cobertura desejada (ex: 0.80 para 80%) [0.80]: ").strip()
+            coverage = float(coverage) if coverage else 0.80
+            analyze_historical_criteria(contests, n_recent, coverage)
+        
         elif op == '0':
             break
+        
         else:
             print("Opção inválida.")
 
