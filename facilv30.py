@@ -2,13 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v36.2
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v37
+TESTE DE CAPACIDADE PREDITIVA DAS FEATURES
 
-CORREÇÕES:
-✅ _create_candidate aceita validate=False para MC bounds
-✅ generate_one nunca retorna jogo inválido (levanta exceção se falhar)
-✅ _compute_mc_bounds usa validate=False (normalização independe dos critérios)
-✅ Mantém todas as funcionalidades do v36.1
+NOVO:
+✅ Opção 11: Teste de capacidade preditiva (walk‑forward com modelo)
+   - Para cada feature alvo, treina um modelo linear e compara com baseline
+   - Métricas: RMSE, MAE, redução vs. baseline, significância estatística
+✅ Mantém todas as funcionalidades do v36.2
 """
 
 import numpy as np
@@ -29,10 +30,12 @@ try:
     from sklearn.covariance import LedoitWolf
     from sklearn.preprocessing import StandardScaler
     from sklearn.decomposition import PCA
+    from sklearn.linear_model import LinearRegression
+    from sklearn.tree import DecisionTreeRegressor
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
-    print("⚠️ Scikit-learn não instalado. PCA indisponível.")
+    print("⚠️ Scikit-learn não instalado. Algumas funções estarão indisponíveis.")
 
 # ============================================================
 # CONSTANTES GERAIS
@@ -61,7 +64,10 @@ TEMPORAL_FEATURES = {
     'gaps': lambda d, prev: np.mean([d[i+1]-d[i] for i in range(len(d)-1)]),
 }
 
-# Estruturais – relaxadas
+# Features que tentaremos prever
+PREDICTABLE_FEATURES = ['pares', 'primos', 'moldura', 'soma', 'repeticoes', 'consecutivos', 'amplitude']
+
+# Estruturais
 MAX_CONSECUTIVOS_RUN = 7
 STRUCTURAL_TARGETS = {
     'pares': (7.5, 3.0, 0.5),
@@ -74,7 +80,7 @@ STRUCTURAL_TARGETS = {
 }
 SOFT_PENALTY_WEIGHT = 0.02
 
-# Cobertura – valores padrão (podem ser relaxados automaticamente)
+# Cobertura
 DEFAULT_MAX_INTERSECTION = 8
 DEFAULT_HAMMING_MIN_DIST = 5
 MAX_PAIR_COVERAGE = 0.95
@@ -263,15 +269,14 @@ class FeatureExtractor:
         return penalty
 
 # ============================================================
-# GERADOR COM CRITÉRIOS (CORRIGIDO)
+# GERADOR COM CRITÉRIOS
 # ============================================================
 class LooseGenerator:
     def __init__(self, extractor=None):
         self.extractor = extractor
 
     def generate_one(self, max_penalty=30, allowed_pares=None, allowed_moldura=None, allowed_primos=None):
-        """Gera um jogo que atende aos critérios. Levanta exceção se falhar."""
-        for _ in range(500):  # aumentado para 500 tentativas
+        for _ in range(500):
             game = self._generate_raw(allowed_pares, allowed_moldura, allowed_primos)
             if game is None:
                 continue
@@ -281,14 +286,12 @@ class LooseGenerator:
                     return game
             else:
                 return game
-        # Se chegou aqui, não conseguiu gerar
         raise RuntimeError(
             f"Não foi possível gerar jogo com os critérios: "
             f"pares={allowed_pares}, moldura={allowed_moldura}, primos={allowed_primos}"
         )
 
     def _generate_raw(self, allowed_pares=None, allowed_moldura=None, allowed_primos=None):
-        """Retorna um jogo válido ou None se falhar após tentativas."""
         if allowed_pares is None and allowed_moldura is None and allowed_primos is None:
             return self._generate_raw_old()
         for _ in range(200):
@@ -306,7 +309,7 @@ class LooseGenerator:
                 if prim not in allowed_primos:
                     continue
             return game
-        return None  # falhou
+        return None
 
     def _generate_raw_old(self):
         game = set()
@@ -577,7 +580,130 @@ def historical_exact_frequency(contests, allowed_pares, allowed_moldura, allowed
     return count, prop
 
 # ============================================================
-# OTIMIZADOR v36.2 – CORRIGIDO
+# TESTE DE CAPACIDADE PREDITIVA (NOVO v37)
+# ============================================================
+def predictive_test(contests, n_windows=20, train_size=300, test_size=1):
+    """
+    Para cada feature alvo em PREDICTABLE_FEATURES, faz walk‑forward:
+    - Treina um modelo linear com features do concurso anterior
+    - Compara com baseline (último valor)
+    - Mede redução de erro e significância
+    """
+    if not SKLEARN_AVAILABLE:
+        print("❌ Scikit-learn necessário para este teste.")
+        return
+
+    print(f"\n🔮 TESTE DE CAPACIDADE PREDITIVA DAS FEATURES")
+    print(f"   Walk‑forward: {n_windows} janelas, treino={train_size}, teste={test_size}")
+    print(f"   Modelo: regressão linear com features do concurso anterior")
+    print(f"   Baseline: repetir o último valor observado\n")
+
+    # Extrair todas as features temporais
+    series = compute_temporal_features(contests)
+    
+    # Para cada feature, construir matriz de features (t-1) e target (t)
+    results = {}
+    for target_name in PREDICTABLE_FEATURES:
+        if target_name not in series:
+            continue
+        
+        y_all = np.array(series[target_name], dtype=float)
+        
+        # Features preditoras: todas as outras features temporais no lag 1
+        predictor_names = [n for n in PREDICTABLE_FEATURES if n != target_name]
+        X_all = np.column_stack([np.array(series[n], dtype=float) for n in predictor_names])
+        
+        errors_model = []
+        errors_baseline = []
+        
+        for w in range(n_windows):
+            test_end = len(contests) - w * test_size
+            test_start = test_end - test_size
+            train_end = test_start
+            train_start = max(0, train_end - train_size)
+            
+            if train_start + 1 >= train_end or test_start + 1 >= test_end:
+                continue
+            
+            # Treino: X[train_start:train_end-1] -> y[train_start+1:train_end]
+            X_train = X_all[train_start:train_end-1]
+            y_train = y_all[train_start+1:train_end]
+            
+            # Teste: X[test_start:test_end-1] -> y[test_start+1:test_end]
+            X_test = X_all[test_start:test_end-1]
+            y_test = y_all[test_start+1:test_end]
+            
+            if len(X_train) < 10 or len(X_test) < 1:
+                continue
+            
+            # Modelo linear
+            model = LinearRegression()
+            model.fit(X_train, y_train)
+            preds = model.predict(X_test)
+            
+            # Baseline: último valor conhecido
+            baseline_preds = y_all[test_start:test_end-1]
+            
+            errors_model.extend(np.abs(preds - y_test).tolist())
+            errors_baseline.extend(np.abs(baseline_preds - y_test).tolist())
+        
+        if len(errors_model) == 0:
+            continue
+        
+        errors_model = np.array(errors_model)
+        errors_baseline = np.array(errors_baseline)
+        
+        mae_model = np.mean(errors_model)
+        mae_baseline = np.mean(errors_baseline)
+        rmse_model = np.sqrt(np.mean(errors_model**2))
+        rmse_baseline = np.sqrt(np.mean(errors_baseline**2))
+        
+        # Redução percentual do erro
+        reduction = (mae_baseline - mae_model) / mae_baseline * 100
+        
+        # Teste estatístico nos erros absolutos
+        diff = errors_baseline - errors_model
+        try:
+            _, p_value = wilcoxon(errors_model, errors_baseline)
+        except:
+            p_value = 1.0
+        
+        results[target_name] = {
+            'mae_model': mae_model,
+            'mae_baseline': mae_baseline,
+            'rmse_model': rmse_model,
+            'rmse_baseline': rmse_baseline,
+            'reduction_pct': reduction,
+            'p_value': p_value,
+            'n_tests': len(errors_model)
+        }
+    
+    # Exibir resultados
+    print(f"{'Feature':<15} {'MAE model':<10} {'MAE base':<10} {'Redução':<10} {'p-valor':<10} {'Conclusão'}")
+    print("-" * 70)
+    for name, res in sorted(results.items(), key=lambda x: x[1]['reduction_pct'], reverse=True):
+        if res['reduction_pct'] > 0 and res['p_value'] < 0.05:
+            conclusao = "🔍 Promissor"
+        elif res['reduction_pct'] > 0:
+            conclusao = "📊 Leve (não sig.)"
+        else:
+            conclusao = "❌ Sem sinal"
+        print(f"{name:<15} {res['mae_model']:<10.4f} {res['mae_baseline']:<10.4f} {res['reduction_pct']:<10.1f}% {res['p_value']:<10.4f} {conclusao}")
+    
+    # Verificar se alguma feature passou
+    promising = [n for n, r in results.items() if r['reduction_pct'] > 0 and r['p_value'] < 0.05]
+    print(f"\n🔍 Features com sinal preditivo significativo: {len(promising)}")
+    if promising:
+        print(f"   {promising}")
+    else:
+        print("   Nenhuma feature mostrou capacidade preditiva robusta fora da amostra.")
+        print("   Isso reforça a hipótese de que a Lotofácil se comporta como um processo")
+        print("   pseudoaleatório sem dependência temporal explorável.")
+    
+    return results
+
+# ============================================================
+# OTIMIZADOR v36.2 (mantido)
 # ============================================================
 class PortfolioOptimizer:
     def __init__(self, contests, allowed_pares=None, allowed_moldura=None, allowed_primos=None):
@@ -594,7 +720,6 @@ class PortfolioOptimizer:
             self.historical_masks = np.concatenate([self.historical_masks, draw_masks_to_array(extra)])
 
     def _validate_game(self, game):
-        """Verifica se o jogo atende aos critérios definidos."""
         d = sorted(game)
         pares = sum(1 for x in d if x % 2 == 0)
         mol = sum(1 for x in d if x in MOLDURA)
@@ -690,17 +815,14 @@ class PortfolioOptimizer:
                 redundancy * 0.5 - avg_penalty * SOFT_PENALTY_WEIGHT - overlap_penalty)
 
     def _compute_mc_bounds(self):
-        """Normalização do Monte Carlo – ignora validação de critérios."""
         scores = []
         for _ in range(30):
-            # Usamos generate_pure_random (qualquer jogo) e validate=False
             rand_games = [self.generator.generate_pure_random() for _ in range(5)]
             rand_candidates = [self._create_candidate(g, validate=False) for g in rand_games]
             scores.append(self._monte_carlo_score(rand_candidates, 300))
         scores = np.array(scores)
         return np.percentile(scores, 5), np.percentile(scores, 95)
 
-    # ---------- SELEÇÃO COM RELAXAMENTO ----------
     def _select_max_diversity(self, candidates, n_select, max_inter, hamming_min):
         unique = {}
         for c in candidates:
@@ -788,7 +910,7 @@ class PortfolioOptimizer:
                 if key not in seen:
                     seen.add(key); raw_pool.append(g)
             except RuntimeError:
-                break  # não conseguiu gerar mais
+                break
         print(f"   Pool gerado: {len(raw_pool)} jogos")
         if len(raw_pool) < n_games * 10:
             print("⚠️ Pool pequeno. Gerando jogos extras (mantendo critérios)...")
@@ -804,7 +926,6 @@ class PortfolioOptimizer:
                         seen.add(key); raw_pool.append(g)
                 except RuntimeError:
                     break
-        # Garantir que todos os jogos no pool respeitam os critérios
         pool = []
         for g in raw_pool:
             if self._validate_game(g):
@@ -823,7 +944,6 @@ class PortfolioOptimizer:
             candidates.append(GameCandidate(game, mask, fmat[i], r_scores[i], r_scores[i], m_dists[i], pcts[i], pen))
         candidates.sort(key=lambda c: c.central_score - c.penalty * 0.1, reverse=True)
         portfolio = self._build_portfolio_with_relaxation(candidates, n_games)
-        # Validação final
         for c in portfolio:
             if not self._validate_game(c.game):
                 raise RuntimeError(f"Jogo inválido no portfólio final: {c.game}")
@@ -1060,8 +1180,8 @@ def walk_forward_validation(contests, n_windows=8, train_size=400, test_size=50,
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v36.2")
-    print("   CORRIGIDO: MC bounds sem validação + gerador à prova de falhas")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v37")
+    print("   TESTE DE CAPACIDADE PREDITIVA")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
@@ -1082,6 +1202,7 @@ def main():
         print("8. Contar universo combinatório dos critérios")
         print("9. Análise automática de critérios (últimos concursos)")
         print("10. Frequência histórica exata dos critérios")
+        print("11. Teste de capacidade preditiva das features")
         print("0. Sair")
         op = input("Escolha: ").strip()
         
@@ -1210,6 +1331,12 @@ def main():
                 print("   🔍 A região parece sub-representada nos concursos reais.")
             else:
                 print("   ✅ A frequência é compatível com o tamanho do universo.")
+        
+        elif op == '11':
+            if not SKLEARN_AVAILABLE:
+                print("❌ Scikit-learn é necessário para este teste. Instale com: pip install scikit-learn")
+            else:
+                predictive_test(contests)
         
         elif op == '0':
             break
