@@ -2,13 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v37.1
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v37.2
 
-CORREÇÕES:
-✅ TEMPORAL_FEATURES agora inclui moldura, consecutivos, amplitude
-✅ predictive_test() reformulado: testa memória temporal da própria feature
-   usando y(t-1), y(t-2), ..., y(t-5) como preditores
-✅ Mantém todas as funcionalidades do v37
+MELHORIAS:
+✅ Teste preditivo reforçado: 50 janelas, teste=5, correção FDR
+✅ Opção 12: busca intensiva em subconjuntos pequenos
+✅ Opção 10 mantida (frequência histórica exata)
+✅ Mantém todas as funcionalidades do v37.1
 """
 
 import numpy as np
@@ -53,7 +53,7 @@ FEATURE_NAMES = [
 ]
 N_FEATURES = len(FEATURE_NAMES)
 
-# Features temporais COMPLETAS (todas as que podem ser alvo de previsão)
+# Features temporais COMPLETAS
 TEMPORAL_FEATURES = {
     'repeticoes': lambda d, prev: len(set(d) & prev) if prev else 8,
     'soma': lambda d, prev: sum(d),
@@ -66,7 +66,6 @@ TEMPORAL_FEATURES = {
     'gaps': lambda d, prev: np.mean([d[i+1]-d[i] for i in range(len(d)-1)]),
 }
 
-# Features que tentaremos prever (devem existir em TEMPORAL_FEATURES)
 PREDICTABLE_FEATURES = ['pares', 'primos', 'moldura', 'soma', 'repeticoes', 'consecutivos', 'amplitude']
 
 # Estruturais
@@ -344,13 +343,11 @@ class LooseGenerator:
 # FUNÇÕES DE DEPENDÊNCIA TEMPORAL
 # ============================================================
 def compute_temporal_features(contests):
-    """Extrai todas as features temporais (incluindo moldura, consecutivos, amplitude)."""
     series = {name: [] for name in TEMPORAL_FEATURES}
     for i, c in enumerate(contests):
         prev = set(contests[i-1]['dezenas']) if i > 0 else None
         for name, func in TEMPORAL_FEATURES.items():
             val = func(c['dezenas'], prev)
-            # Discretização para features contínuas (apenas para MI, não afeta predictive_test)
             if name in ['gaps', 'clusterizacao']:
                 val = round(val, 3)
             elif name == 'soma':
@@ -472,7 +469,7 @@ def pca_analysis(feature_matrix):
     return pca.explained_variance_ratio_[:3]
 
 # ============================================================
-# NOVAS FUNÇÕES DO v36 (mantidas)
+# FUNÇÕES AUXILIARES
 # ============================================================
 def count_universe(allowed_pares=None, allowed_moldura=None, allowed_primos=None):
     print(f"\n📊 ESTIMATIVA DO UNIVERSO COMBINATÓRIO")
@@ -582,13 +579,13 @@ def historical_exact_frequency(contests, allowed_pares, allowed_moldura, allowed
     return count, prop
 
 # ============================================================
-# TESTE DE CAPACIDADE PREDITIVA (CORRIGIDO v37.1)
+# TESTE DE CAPACIDADE PREDITIVA (REFORÇADO v37.2)
 # ============================================================
-def predictive_test(contests, max_lag=5, n_windows=20, train_size=300, test_size=1):
+def predictive_test(contests, max_lag=5, n_windows=50, train_size=500, test_size=5):
     """
-    Para cada feature alvo, testa se a própria feature tem memória temporal.
-    Modelo: y(t) = f(y(t-1), y(t-2), ..., y(t-max_lag))
-    Baseline: repetir y(t-1)
+    Teste de memória temporal com:
+    - 50 janelas, 500 treino, 5 teste → 250 previsões
+    - Correção FDR nos p-valores
     """
     if not SKLEARN_AVAILABLE:
         print("❌ Scikit-learn necessário para este teste.")
@@ -596,6 +593,7 @@ def predictive_test(contests, max_lag=5, n_windows=20, train_size=300, test_size
 
     print(f"\n🔮 TESTE DE CAPACIDADE PREDITIVA (MEMÓRIA TEMPORAL)")
     print(f"   Walk‑forward: {n_windows} janelas, treino={train_size}, teste={test_size}")
+    print(f"   Total de previsões ≈ {n_windows * test_size}")
     print(f"   Modelo: regressão linear com lags 1 a {max_lag} da própria feature")
     print(f"   Baseline: repetir o último valor observado (lag 1)\n")
 
@@ -608,13 +606,12 @@ def predictive_test(contests, max_lag=5, n_windows=20, train_size=300, test_size
         
         y_all = np.array(series[target_name], dtype=float)
         
-        # Montar matriz de features: para cada t, features = [y(t-1), y(t-2), ..., y(t-max_lag)]
+        # Montar matriz de features: y(t-1), ..., y(t-max_lag)
         n = len(y_all)
         X_all = np.zeros((n, max_lag))
         for lag in range(1, max_lag+1):
             X_all[lag:, lag-1] = y_all[:-lag]
         
-        # Alvo: y(t) para t >= max_lag
         y_target = y_all[max_lag:]
         X_features = X_all[max_lag:]
         
@@ -640,12 +637,10 @@ def predictive_test(contests, max_lag=5, n_windows=20, train_size=300, test_size
             if len(X_test) == 0:
                 continue
             
-            # Modelo linear com lags
             model = LinearRegression()
             model.fit(X_train, y_train)
             preds = model.predict(X_test)
             
-            # Baseline: y(t-1) = primeira coluna de X_test
             baseline_preds = X_test[:, 0]
             
             errors_model.extend(np.abs(preds - y_test).tolist())
@@ -678,22 +673,31 @@ def predictive_test(contests, max_lag=5, n_windows=20, train_size=300, test_size
             'n_tests': len(errors_model)
         }
     
-    # Exibir resultados
-    print(f"{'Feature':<15} {'MAE model':<10} {'MAE base':<10} {'Redução':<10} {'p-valor':<10} {'Conclusão'}")
-    print("-" * 70)
+    # Aplicar correção FDR
+    pvals_raw = [res['p_value'] for res in results.values()]
+    _, pvals_fdr, _, _ = multipletests(pvals_raw, method='fdr_bh')
+    
+    # Atualizar resultados com p-valor ajustado
+    for i, (name, res) in enumerate(results.items()):
+        res['p_fdr'] = pvals_fdr[i]
+    
+    # Exibir resultados ordenados por redução
+    print(f"{'Feature':<15} {'MAE model':<10} {'MAE base':<10} {'Redução':<10} {'p-raw':<10} {'p-FDR':<10} {'Conclusão'}")
+    print("-" * 80)
     for name, res in sorted(results.items(), key=lambda x: x[1]['reduction_pct'], reverse=True):
-        if res['reduction_pct'] > 0 and res['p_value'] < 0.05:
+        if res['reduction_pct'] > 0 and res['p_fdr'] < 0.05:
             conclusao = "🔍 Promissor"
         elif res['reduction_pct'] > 0:
             conclusao = "📊 Leve (não sig.)"
         else:
             conclusao = "❌ Sem sinal"
-        print(f"{name:<15} {res['mae_model']:<10.4f} {res['mae_baseline']:<10.4f} {res['reduction_pct']:<10.1f}% {res['p_value']:<10.4f} {conclusao}")
+        print(f"{name:<15} {res['mae_model']:<10.4f} {res['mae_baseline']:<10.4f} {res['reduction_pct']:<10.1f}% {res['p_value']:<10.4f} {res['p_fdr']:<10.4f} {conclusao}")
     
-    promising = [n for n, r in results.items() if r['reduction_pct'] > 0 and r['p_value'] < 0.05]
-    print(f"\n🔍 Features com sinal preditivo significativo: {len(promising)}")
+    promising = [n for n, r in results.items() if r['reduction_pct'] > 0 and r['p_fdr'] < 0.05]
+    print(f"\n🔍 Features com sinal preditivo significativo (pós-FDR): {len(promising)}")
     if promising:
         print(f"   {promising}")
+        print("   ⚠️ Lembre-se: regressão à média pode gerar falsa impressão de previsibilidade.")
     else:
         print("   Nenhuma feature mostrou capacidade preditiva robusta fora da amostra.")
         print("   Isso reforça a hipótese de que a Lotofácil se comporta como um processo")
@@ -702,7 +706,91 @@ def predictive_test(contests, max_lag=5, n_windows=20, train_size=300, test_size
     return results
 
 # ============================================================
-# OTIMIZADOR (mantido do v36.2)
+# BUSCA INTENSIVA EM SUBCONJUNTOS (NOVO v37.2)
+# ============================================================
+def intensive_search(contests, allowed_pares, allowed_moldura, allowed_primos, n_jogos=5000):
+    """
+    Para um subconjunto pequeno, gera muitos jogos e faz backtest histórico.
+    Identifica quais jogos mais acertaram 13+ pontos.
+    """
+    print(f"\n🔎 BUSCA INTENSIVA NO SUBCONJUNTO")
+    print(f"   Critérios: Pares={allowed_pares}, Moldura={allowed_moldura}, Primos={allowed_primos}")
+    print(f"   Gerando {n_jogos} jogos...")
+    
+    generator = LooseGenerator()
+    pool = []
+    seen = set()
+    for _ in tqdm(range(n_jogos * 2), desc="Gerando jogos"):
+        try:
+            g = generator.generate_one(
+                allowed_pares=allowed_pares,
+                allowed_moldura=allowed_moldura,
+                allowed_primos=allowed_primos
+            )
+            key = tuple(g)
+            if key not in seen:
+                seen.add(key)
+                pool.append(g)
+            if len(pool) >= n_jogos:
+                break
+        except RuntimeError:
+            break
+    
+    print(f"   Jogos únicos gerados: {len(pool)}")
+    
+    # Backtest nos últimos 200 concursos
+    test_draws = contests[-200:]
+    pool_masks = np.array([BITMASK_CACHE.get_mask(g) for g in pool], dtype=np.uint32)
+    
+    # Para cada jogo, contar acertos de 11+
+    jogo_scores = []
+    for idx, g in enumerate(pool):
+        score = 0
+        acertos_13 = 0
+        acertos_14 = 0
+        acertos_15 = 0
+        for draw in test_draws:
+            dm = BITMASK_CACHE.get_mask(draw['dezenas'])
+            hits = mask_intersection(pool_masks[idx], dm)
+            if hits >= 11:
+                score += EXPONENTIAL_WEIGHTS.get(hits, 0)
+                if hits == 13: acertos_13 += 1
+                if hits == 14: acertos_14 += 1
+                if hits == 15: acertos_15 += 1
+        jogo_scores.append((score, acertos_13, acertos_14, acertos_15, g))
+    
+    # Ordenar por score
+    jogo_scores.sort(key=lambda x: x[0], reverse=True)
+    
+    # Exibir os top 20
+    print(f"\n🏆 TOP 20 JOGOS (últimos 200 concursos):")
+    print(f"{'Rank':<5} {'Jogo':<50} {'Score':<10} {'13pts':<8} {'14pts':<8} {'15pts':<8}")
+    print("-" * 95)
+    for rank, (score, a13, a14, a15, g) in enumerate(jogo_scores[:20], 1):
+        print(f"{rank:<5} {str(g):<50} {score:<10.1f} {a13:<8} {a14:<8} {a15:<8}")
+    
+    # Agrupar os top 5 em uma carteira e fazer backtest
+    top5 = [js[4] for js in jogo_scores[:5]]
+    
+    print(f"\n📊 CARTEIRA COM TOP 5:")
+    for i, g in enumerate(top5, 1):
+        p = sum(1 for x in g if x % 2 == 0)
+        pr = sum(1 for x in g if x in PRIMES)
+        m = sum(1 for x in g if x in MOLDURA)
+        print(f" {i}. {g} | P:{p} Pr:{pr} M:{m}")
+    
+    # Backtest da carteira top 5
+    opt = PortfolioOptimizer(contests)
+    bt = opt.backtest(top5, test_draws)
+    print(f"\n🔬 BACKTEST (últimos 200):")
+    print(f"   Lift={bt['lift']:.2f}x | ROI={bt['roi']:+.1f}%")
+    print(f"   Dist: 11={bt['hit_distribution'].get(11,0)} 12={bt['hit_distribution'].get(12,0)} "
+          f"13={bt['hit_distribution'].get(13,0)} 14={bt['hit_distribution'].get(14,0)} 15={bt['hit_distribution'].get(15,0)}")
+    
+    return top5, jogo_scores
+
+# ============================================================
+# OTIMIZADOR (mantido do v37.1)
 # ============================================================
 class PortfolioOptimizer:
     def __init__(self, contests, allowed_pares=None, allowed_moldura=None, allowed_primos=None):
@@ -1009,8 +1097,6 @@ class PortfolioOptimizer:
         if test_draws is None:
             test_draws = self.contests[-200:]
         print(f"\n📊 BACKTEST DE CRITÉRIOS – TETO TEÓRICO (últimos {len(test_draws)} concursos)")
-        print(f"   ⚠️ Interpretação: mostra o MÁXIMO que alguém conseguiria se soubesse")
-        print(f"      exatamente qual jogo jogar DENTRO do subconjunto. Não é uma estratégia.")
         print(f"   Pares: {allowed_pares}")
         print(f"   Moldura: {allowed_moldura}")
         print(f"   Primos: {allowed_primos}")
@@ -1067,7 +1153,6 @@ class PortfolioOptimizer:
         print(f"   Custo total: R$ {total_custo:,.2f}")
         print(f"   Prêmio total: R$ {total_premio:,.2f}")
         print(f"   ROI: {((total_premio - total_custo) / total_custo * 100):+.1f}%")
-        print(f"\n⚠️ LEMBRE-SE: isto é um TETO TEÓRICO, não uma estratégia viável.")
         return hit_counts, max_hits
 
 class GameCandidate:
@@ -1179,8 +1264,8 @@ def walk_forward_validation(contests, n_windows=8, train_size=400, test_size=50,
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v37.1")
-    print("   TESTE DE MEMÓRIA TEMPORAL CORRIGIDO")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v37.2")
+    print("   TESTE PREDITIVO REFORÇADO + BUSCA INTENSIVA")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
@@ -1201,7 +1286,8 @@ def main():
         print("8. Contar universo combinatório dos critérios")
         print("9. Análise automática de critérios (últimos concursos)")
         print("10. Frequência histórica exata dos critérios")
-        print("11. Teste de memória temporal das features")
+        print("11. Teste de memória temporal (reforçado + FDR)")
+        print("12. Busca intensiva em subconjunto")
         print("0. Sair")
         op = input("Escolha: ").strip()
         
@@ -1339,6 +1425,18 @@ def main():
                 print("❌ Scikit-learn é necessário para este teste. Instale com: pip install scikit-learn")
             else:
                 predictive_test(contests)
+        
+        elif op == '12':
+            print("\n📝 CRITÉRIOS PARA BUSCA INTENSIVA")
+            pares_str = input("   Pares (ex: 8): ").strip()
+            moldura_str = input("   Moldura (ex: 11): ").strip()
+            primos_str = input("   Primos (ex: 4): ").strip()
+            allowed_pares = [int(x) for x in pares_str.split()] if pares_str else None
+            allowed_moldura = [int(x) for x in moldura_str.split()] if moldura_str else None
+            allowed_primos = [int(x) for x in primos_str.split()] if primos_str else None
+            n_jogos_str = input("   Quantos jogos gerar? [5000]: ").strip()
+            n_jogos = int(n_jogos_str) if n_jogos_str else 5000
+            intensive_search(contests, allowed_pares, allowed_moldura, allowed_primos, n_jogos)
         
         elif op == '0':
             break
