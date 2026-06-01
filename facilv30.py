@@ -2,14 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v36.1
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v36.2
 
-CORREÇÕES E MELHORIAS:
-✅ Validação obrigatória dos critérios em todos os jogos do portfólio
-✅ Relaxamento adaptativo da diversidade (MAX_INTERSECTION, HAMMING_MIN_DIST)
-   quando o universo é pequeno, sem nunca violar os critérios
-✅ Nova opção 10: frequência histórica exata dos critérios
-✅ Mantém todas as funcionalidades do v36 (análise temporal, benchmark, cobertura)
+CORREÇÕES:
+✅ _create_candidate aceita validate=False para MC bounds
+✅ generate_one nunca retorna jogo inválido (levanta exceção se falhar)
+✅ _compute_mc_bounds usa validate=False (normalização independe dos critérios)
+✅ Mantém todas as funcionalidades do v36.1
 """
 
 import numpy as np
@@ -264,24 +263,32 @@ class FeatureExtractor:
         return penalty
 
 # ============================================================
-# GERADOR COM CRITÉRIOS
+# GERADOR COM CRITÉRIOS (CORRIGIDO)
 # ============================================================
 class LooseGenerator:
     def __init__(self, extractor=None):
         self.extractor = extractor
 
     def generate_one(self, max_penalty=30, allowed_pares=None, allowed_moldura=None, allowed_primos=None):
-        for _ in range(100):
+        """Gera um jogo que atende aos critérios. Levanta exceção se falhar."""
+        for _ in range(500):  # aumentado para 500 tentativas
             game = self._generate_raw(allowed_pares, allowed_moldura, allowed_primos)
+            if game is None:
+                continue
             if self.extractor is not None:
                 pen = self.extractor.compute_structural_penalty(game)
                 if pen <= max_penalty:
                     return game
             else:
                 return game
-        return self._generate_raw()
+        # Se chegou aqui, não conseguiu gerar
+        raise RuntimeError(
+            f"Não foi possível gerar jogo com os critérios: "
+            f"pares={allowed_pares}, moldura={allowed_moldura}, primos={allowed_primos}"
+        )
 
     def _generate_raw(self, allowed_pares=None, allowed_moldura=None, allowed_primos=None):
+        """Retorna um jogo válido ou None se falhar após tentativas."""
         if allowed_pares is None and allowed_moldura is None and allowed_primos is None:
             return self._generate_raw_old()
         for _ in range(200):
@@ -299,7 +306,7 @@ class LooseGenerator:
                 if prim not in allowed_primos:
                     continue
             return game
-        return sorted(np.random.choice(range(1, 26), 15, replace=False))
+        return None  # falhou
 
     def _generate_raw_old(self):
         game = set()
@@ -542,16 +549,9 @@ def analyze_historical_criteria(contests, n_recent=500, coverage_pct=0.80):
     return suggested_pares, suggested_moldura, suggested_primos
 
 def historical_exact_frequency(contests, allowed_pares, allowed_moldura, allowed_primos):
-    """
-    Calcula a proporção de concursos que satisfazem EXATAMENTE os critérios
-    (um valor específico para cada, não lista). Considera apenas se cada lista
-    tem um único valor; se tiver múltiplos, conta como qualquer um da lista.
-    """
-    # Se forem listas com múltiplos valores, verificamos se o valor pertence à lista
     single_pares = allowed_pares if (allowed_pares and len(allowed_pares)==1) else None
     single_mol = allowed_moldura if (allowed_moldura and len(allowed_moldura)==1) else None
     single_prim = allowed_primos if (allowed_primos and len(allowed_primos)==1) else None
-
     count = 0
     for c in contests:
         d = c['dezenas']
@@ -577,7 +577,7 @@ def historical_exact_frequency(contests, allowed_pares, allowed_moldura, allowed
     return count, prop
 
 # ============================================================
-# OTIMIZADOR v36.1 – CORRIGIDO
+# OTIMIZADOR v36.2 – CORRIGIDO
 # ============================================================
 class PortfolioOptimizer:
     def __init__(self, contests, allowed_pares=None, allowed_moldura=None, allowed_primos=None):
@@ -607,8 +607,8 @@ class PortfolioOptimizer:
             return False
         return True
 
-    def _create_candidate(self, game, rarity_score=None, percentile=None, mahal_dist=None):
-        if not self._validate_game(game):
+    def _create_candidate(self, game, rarity_score=None, percentile=None, mahal_dist=None, validate=True):
+        if validate and not self._validate_game(game):
             raise ValueError(f"Jogo inválido gerado: {game}")
         mask = BITMASK_CACHE.get_mask(game)
         features = self.extractor.extract_features(game, self.last)
@@ -690,7 +690,13 @@ class PortfolioOptimizer:
                 redundancy * 0.5 - avg_penalty * SOFT_PENALTY_WEIGHT - overlap_penalty)
 
     def _compute_mc_bounds(self):
-        scores = [self._monte_carlo_score([self._create_candidate(self.generator.generate_pure_random()) for _ in range(5)], 300) for _ in range(30)]
+        """Normalização do Monte Carlo – ignora validação de critérios."""
+        scores = []
+        for _ in range(30):
+            # Usamos generate_pure_random (qualquer jogo) e validate=False
+            rand_games = [self.generator.generate_pure_random() for _ in range(5)]
+            rand_candidates = [self._create_candidate(g, validate=False) for g in rand_games]
+            scores.append(self._monte_carlo_score(rand_candidates, 300))
         scores = np.array(scores)
         return np.percentile(scores, 5), np.percentile(scores, 95)
 
@@ -720,12 +726,10 @@ class PortfolioOptimizer:
             next_idx = valid[np.argmax(min_dists[valid])]
             selected_idx.append(next_idx)
         selected = [cand_unique[i] for i in selected_idx]
-        # Se ainda não completou, tenta preencher com os restantes que não violam max_inter
         if len(selected) < n_select:
             for c in candidates:
                 if len(selected) >= n_select: break
                 if c in selected: continue
-                # verifica interseção máxima com todos os já selecionados
                 if any(mask_intersection(c.mask, s.mask) > max_inter for s in selected): continue
                 selected.append(c)
         return selected[:n_select]
@@ -736,8 +740,6 @@ class PortfolioOptimizer:
             port = self._select_max_diversity(candidates, n_games, max_inter, hamming_min)
             if len(port) == n_games:
                 return port
-            # Se não completou, relaxa
-        # Guloso com restrições
         selected, masks, games = [], [], []
         for c in candidates:
             if len(selected) >= n_games: break
@@ -752,28 +754,20 @@ class PortfolioOptimizer:
         return selected
 
     def _build_portfolio_with_relaxation(self, candidates, n_games):
-        """
-        Tenta construir um portfólio com as restrições de diversidade padrão.
-        Se falhar, relaxa progressivamente MAX_INTERSECTION e HAMMING_MIN_DIST.
-        """
-        # Tentativa 1: padrão
         portfolio = self._select_diverse_portfolio(candidates, n_games,
                                                    use_hamming=True, use_max_diversity=True,
                                                    max_inter=DEFAULT_MAX_INTERSECTION,
                                                    hamming_min=DEFAULT_HAMMING_MIN_DIST)
         if len(portfolio) == n_games:
             return portfolio
-
-        # Relaxamento progressivo
-        for max_inter in range(DEFAULT_MAX_INTERSECTION+1, 12):  # até 11
-            for hamming_min in range(DEFAULT_HAMMING_MIN_DIST-1, 2, -1):  # até 3
+        for max_inter in range(DEFAULT_MAX_INTERSECTION+1, 12):
+            for hamming_min in range(DEFAULT_HAMMING_MIN_DIST-1, 2, -1):
                 portfolio = self._select_diverse_portfolio(candidates, n_games,
                                                            use_hamming=True, use_max_diversity=True,
                                                            max_inter=max_inter, hamming_min=hamming_min)
                 if len(portfolio) == n_games:
                     print(f"   ⚠️ Restrições de diversidade relaxadas: MAX_INTERSECTION={max_inter}, HAMMING_MIN_DIST={hamming_min}")
                     return portfolio
-        # Fallback: apenas pegar os primeiros n_games (todos válidos)
         return candidates[:n_games]
 
     def optimize(self, n_games=5, n_candidates=30000):
@@ -784,19 +778,7 @@ class PortfolioOptimizer:
         t0 = time.time()
         raw_pool, seen = [], set()
         for _ in tqdm(range(n_candidates), desc="Gerando pool"):
-            g = self.generator.generate_one(
-                allowed_pares=self.allowed_pares,
-                allowed_moldura=self.allowed_moldura,
-                allowed_primos=self.allowed_primos
-            )
-            key = tuple(g)
-            if key not in seen:
-                seen.add(key); raw_pool.append(g)
-        print(f"   Pool gerado: {len(raw_pool)} jogos")
-        # Se o pool for insuficiente, gera extra sem critérios (mas depois filtra)
-        if len(raw_pool) < n_games * 10:
-            print("⚠️ Pool pequeno. Gerando jogos extras (mantendo critérios)...")
-            for _ in tqdm(range(n_candidates), desc="Gerando pool extra"):
+            try:
                 g = self.generator.generate_one(
                     allowed_pares=self.allowed_pares,
                     allowed_moldura=self.allowed_moldura,
@@ -805,6 +787,23 @@ class PortfolioOptimizer:
                 key = tuple(g)
                 if key not in seen:
                     seen.add(key); raw_pool.append(g)
+            except RuntimeError:
+                break  # não conseguiu gerar mais
+        print(f"   Pool gerado: {len(raw_pool)} jogos")
+        if len(raw_pool) < n_games * 10:
+            print("⚠️ Pool pequeno. Gerando jogos extras (mantendo critérios)...")
+            for _ in tqdm(range(n_candidates), desc="Gerando pool extra"):
+                try:
+                    g = self.generator.generate_one(
+                        allowed_pares=self.allowed_pares,
+                        allowed_moldura=self.allowed_moldura,
+                        allowed_primos=self.allowed_primos
+                    )
+                    key = tuple(g)
+                    if key not in seen:
+                        seen.add(key); raw_pool.append(g)
+                except RuntimeError:
+                    break
         # Garantir que todos os jogos no pool respeitam os critérios
         pool = []
         for g in raw_pool:
@@ -823,8 +822,6 @@ class PortfolioOptimizer:
             pen = self.extractor.compute_structural_penalty(game)
             candidates.append(GameCandidate(game, mask, fmat[i], r_scores[i], r_scores[i], m_dists[i], pcts[i], pen))
         candidates.sort(key=lambda c: c.central_score - c.penalty * 0.1, reverse=True)
-
-        # Selecionar portfólio com relaxamento
         portfolio = self._build_portfolio_with_relaxation(candidates, n_games)
         # Validação final
         for c in portfolio:
@@ -902,16 +899,19 @@ class PortfolioOptimizer:
         pool_jogos = []
         seen = set()
         for _ in range(10000):
-            g = self.generator.generate_one(
-                allowed_pares=allowed_pares,
-                allowed_moldura=allowed_moldura,
-                allowed_primos=allowed_primos
-            )
-            key = tuple(g)
-            if key not in seen:
-                seen.add(key)
-                pool_jogos.append(g)
-            if len(pool_jogos) >= 5000:
+            try:
+                g = self.generator.generate_one(
+                    allowed_pares=allowed_pares,
+                    allowed_moldura=allowed_moldura,
+                    allowed_primos=allowed_primos
+                )
+                key = tuple(g)
+                if key not in seen:
+                    seen.add(key)
+                    pool_jogos.append(g)
+                if len(pool_jogos) >= 5000:
+                    break
+            except RuntimeError:
                 break
         pool_masks = np.array([BITMASK_CACHE.get_mask(g) for g in pool_jogos], dtype=np.uint32)
         print(f"   Pool de {len(pool_jogos)} jogos únicos gerados")
@@ -1060,8 +1060,8 @@ def walk_forward_validation(contests, n_windows=8, train_size=400, test_size=50,
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v36.1")
-    print("   CORRIGIDO: critérios rígidos + relaxamento adaptativo")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v36.2")
+    print("   CORRIGIDO: MC bounds sem validação + gerador à prova de falhas")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
@@ -1200,7 +1200,6 @@ def main():
             allowed_moldura = [int(x) for x in moldura_str.split()] if moldura_str else None
             allowed_primos = [int(x) for x in primos_str.split()] if primos_str else None
             count, prop = historical_exact_frequency(contests, allowed_pares, allowed_moldura, allowed_primos)
-            # Estimar universo
             univ_est, univ_prop = count_universe(allowed_pares, allowed_moldura, allowed_primos)
             print(f"\n📊 FREQUÊNCIA NOS {len(contests)} CONCURSOS:")
             print(f"   Concursos que atendem exatamente: {count} ({prop*100:.2f}%)")
