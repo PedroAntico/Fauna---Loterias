@@ -2,19 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v34.2
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v34.3
 
-CORREÇÕES E MELHORIAS:
-✅ _select_max_diversity: filtro de máscaras únicas e proibição de duplicatas
-✅ MAX_INTERSECTION relaxado para 8 (restritivo mas viável)
-✅ Walk‑forward com benchmark robusto (100 carteiras aleatórias, z‑score)
-✅ Relatório de cobertura (pares, triplas, quadras) vs. aleatório
-✅ Penalidade explícita por sobreposição máxima mantida
-✅ Híbrido padrão: 1 central + 0 extremos + 4 anti‑centrais
+CORREÇÕES:
+✅ Benchmark de cobertura corrigido (gera portfólios aleatórios completos)
+✅ Híbrido agora garante 5 jogos (fallback com restrições relaxadas)
+✅ Verificação de tamanho da carteira no walk‑forward
+✅ MAX_INTERSECTION = 8, HAMMING_MIN_DIST = 5 mantidos
 ✅ Mantém todas as ferramentas estatísticas (MI, FDR, PACF, FFT, RNG)
-
-FILOSOFIA:
-Sem evidência de dependência temporal → otimizar cobertura da região histórica.
 """
 
 import numpy as np
@@ -80,12 +75,11 @@ STRUCTURAL_TARGETS = {
 }
 SOFT_PENALTY_WEIGHT = 0.03
 
-# Cobertura – INTERSEÇÃO RELAXADA para 8
+# Cobertura
 MAX_PAIR_COVERAGE = 0.95
-MAX_INTERSECTION = 8          # era 5, agora viável
+MAX_INTERSECTION = 8
 HAMMING_MIN_DIST = 5
 
-# Pesos MC
 EXPONENTIAL_WEIGHTS = {
     11: 1.0,
     12: 4.0,
@@ -443,7 +437,7 @@ def pca_analysis(feature_matrix):
     return pca.explained_variance_ratio_[:3]
 
 # ============================================================
-# OTIMIZADOR v34.2 – SELEÇÃO CORRIGIDA + RELAXAMENTO
+# OTIMIZADOR v34.3 – CORRIGIDO
 # ============================================================
 class PortfolioOptimizer:
     def __init__(self, contests):
@@ -531,7 +525,6 @@ class PortfolioOptimizer:
         p5, p95 = self._mc_bounds
         mc_norm = max(0.0, min(1.0, (raw_mc - p5) / (p95 - p5 + 1e-10)))
         avg_penalty = np.mean([c.penalty for c in portfolio])
-        # Penalidade por sobreposição máxima (violação do limite)
         overlap_penalty = max(0, max_overlap - MAX_INTERSECTION) * 0.3
         return (triple_score * 0.25 + quad_score * 0.25 + ent_score * 0.15 +
                 decade_cov * 0.10 + avg_rarity * 0.10 + mc_norm * 0.05 -
@@ -542,21 +535,16 @@ class PortfolioOptimizer:
         scores = np.array(scores)
         return np.percentile(scores, 5), np.percentile(scores, 95)
 
-    # ---------- FARTHEST-POINT CORRIGIDO (v34.2) ----------
+    # ---------- FARTHEST-POINT CORRIGIDO ----------
     def _select_max_diversity(self, candidates, n_select):
-        """
-        Seleciona n_select jogos maximizando a menor distância (farthest‑point clássico).
-        Filtra máscaras duplicadas e força MAX_INTERSECTION.
-        """
-        # 1. Remove duplicatas (mesma máscara)
+        # Remove duplicatas
         unique = {}
         for c in candidates:
             if c.mask not in unique:
                 unique[c.mask] = c
         cand_unique = list(unique.values())
         if len(cand_unique) < n_select:
-            # Se não houver suficientes, completa com os melhores restantes
-            cand_unique = candidates[:n_select]
+            cand_unique = candidates[:n_select]  # fallback
         masks = np.array([c.mask for c in cand_unique], dtype=np.uint32)
         n = len(cand_unique)
         selected_idx = [0]
@@ -565,11 +553,8 @@ class PortfolioOptimizer:
             for idx in selected_idx:
                 intersect = np.array([mask_intersection(masks[i], masks[idx]) for i in range(n)])
                 dist = 15.0 - intersect
-                # Penaliza candidatos que violam MAX_INTERSECTION
                 dist[intersect > MAX_INTERSECTION] = -999.0
-                # Mantém a menor distância para cada candidato
                 min_dists = np.minimum(min_dists, dist)
-            # Não escolhe os já selecionados nem os inválidos
             min_dists[selected_idx] = -1.0
             valid = np.where(min_dists >= 0)[0]
             if len(valid) == 0:
@@ -581,7 +566,6 @@ class PortfolioOptimizer:
     def _select_diverse_portfolio(self, candidates, n_games, use_hamming=True, use_max_diversity=True):
         if use_max_diversity and len(candidates) >= n_games:
             return self._select_max_diversity(candidates, n_games)
-        # Guloso com restrições (fallback)
         selected, masks, games = [], [], []
         for c in candidates:
             if len(selected) >= n_games: break
@@ -596,7 +580,7 @@ class PortfolioOptimizer:
         return selected
 
     def optimize(self, n_games=5, n_candidates=30000):
-        print(f"\n🧩 CARTEIRA DE COBERTURA MÁXIMA (max diversity corrigido, MAX_INTERSECTION={MAX_INTERSECTION})")
+        print(f"\n🧩 CARTEIRA DE COBERTURA MÁXIMA (max diversity, MAX_INTERSECTION={MAX_INTERSECTION})")
         t0 = time.time()
         raw_pool, seen = [], set()
         for _ in tqdm(range(n_candidates), desc="Gerando pool"):
@@ -635,7 +619,9 @@ class PortfolioOptimizer:
         print(f"   Máxima interseção entre jogos: {self._max_overlap(portfolio)}")
         return [c.game for c in portfolio], best_score
 
+    # ---------- HÍBRIDO COM GARANTIA DE 5 JOGOS ----------
     def hybrid_portfolio(self, n_central=1, n_extreme=0, n_balanced=4, n_candidates=30000, use_anti_central=True):
+        target = n_central + n_extreme + n_balanced
         print(f"\n🎯 CARTEIRA HÍBRIDA: {n_central} central + {n_extreme} extremos + {n_balanced} balanceados")
         if use_anti_central:
             print("   Modo anti‑central: balanceados por distância ao percentil 0.50")
@@ -685,9 +671,23 @@ class PortfolioOptimizer:
         
         sel_bal = self._select_diverse_portfolio(balanceados, n_balanced, use_hamming=True, use_max_diversity=True)
         for c in sel_bal:
-            if len(selected) >= n_central + n_extreme + n_balanced: break
+            if len(selected) >= target: break
             if any(mask_intersection(c.mask, m) > MAX_INTERSECTION for m in masks_sel): continue
             selected.append(c); masks_sel.append(c.mask)
+        
+        # Se ainda não completou, complete com os melhores restantes (apenas restrição MAX_INTERSECTION)
+        if len(selected) < target:
+            for c in candidates:
+                if len(selected) >= target: break
+                if c in selected: continue
+                if any(mask_intersection(c.mask, m) > MAX_INTERSECTION for m in masks_sel): continue
+                selected.append(c); masks_sel.append(c.mask)
+        
+        # Último recurso: adicionar sem restrições (mas evitando duplicatas)
+        for c in candidates:
+            if len(selected) >= target: break
+            if c not in selected:
+                selected.append(c)
         
         print(f"✅ Carteira híbrida gerada em {time.time()-t0:.1f}s")
         print(f"   Máxima interseção entre jogos: {self._max_overlap(selected)}")
@@ -801,7 +801,7 @@ class GameCandidate:
         self.penalty = penalty
 
 # ============================================================
-# WALK-FORWARD COM BENCHMARK ROBUSTO
+# WALK-FORWARD COM BENCHMARK ROBUSTO CORRIGIDO
 # ============================================================
 def walk_forward_validation(contests, n_windows=8, train_size=400, test_size=50, n_games=5,
                             use_ensemble=False, use_hybrid=False, n_random_benchmark=100):
@@ -819,39 +819,57 @@ def walk_forward_validation(contests, n_windows=8, train_size=400, test_size=50,
         test_data = contests[test_start:test_end]
         if len(train_data) < 100 or len(test_data) < 5: continue
         opt = PortfolioOptimizer(train_data)
+
         # Gera a carteira estratégica
         if use_ensemble:
             portfolio = opt.ensemble_optimize(n_carteiras=3, n_games_por_carteira=5, n_candidates=10000)
             bt = opt.backtest_ensemble(portfolio, test_data)
             total_random_games = sum(len(p) for p in portfolio)
+            strat_games = [game for sublist in portfolio for game in sublist]  # lista plana para cobertura
         elif use_hybrid:
             portfolio = opt.hybrid_portfolio(n_central=1, n_extreme=0, n_balanced=4, n_candidates=10000, use_anti_central=True)
+            # Verifica tamanho
+            assert len(portfolio) == 5, f"Híbrido retornou {len(portfolio)} jogos, esperado 5"
             bt = opt.backtest(portfolio, test_data)
             total_random_games = n_games
+            strat_games = portfolio
         else:
             portfolio, _ = opt.optimize(n_games, n_candidates=10000)
             bt = opt.backtest(portfolio, test_data)
             total_random_games = n_games
+            strat_games = portfolio
 
         # Benchmark robusto: múltiplas carteiras aleatórias
         rand_lifts = []
+        # Para cobertura, vamos acumular pares/triplas/quadras das carteiras aleatórias
+        rand_pairs_list = []
+        rand_triples_list = []
+        rand_quads_list = []
         for _ in range(n_random_benchmark):
             rand_port = [opt.generator.generate_pure_random() for _ in range(total_random_games)]
             bt_rand = opt.backtest(rand_port, test_data)
             rand_lifts.append(bt_rand['lift'])
+            # Cobertura
+            pairs = set(p for game in rand_port for p in combinations(sorted(game), 2))
+            triples = set(t for game in rand_port for t in combinations(sorted(game), 3))
+            quads = set(q for game in rand_port for q in combinations(sorted(game), 4))
+            rand_pairs_list.append(len(pairs))
+            rand_triples_list.append(len(triples))
+            rand_quads_list.append(len(quads))
+
         rand_lifts = np.array(rand_lifts)
         mean_rand_lift = np.mean(rand_lifts)
         std_rand_lift = np.std(rand_lifts)
         z_score = (bt['lift'] - mean_rand_lift) / std_rand_lift if std_rand_lift > 0 else 0.0
         pct_rank = np.mean(rand_lifts <= bt['lift'])
 
-        # Estatísticas de cobertura
-        strat_pairs = len(set(p for c in (portfolio if not use_ensemble else [j for sub in portfolio for j in sub]) for p in combinations(sorted(c), 2)))
-        strat_triples = len(set(p for c in (portfolio if not use_ensemble else [j for sub in portfolio for j in sub]) for p in combinations(sorted(c), 3)))
-        strat_quads = len(set(p for c in (portfolio if not use_ensemble else [j for sub in portfolio for j in sub]) for p in combinations(sorted(c), 4)))
-        rand_pairs_avg = np.mean([len(set(p for c in rand_port for p in combinations(sorted(c), 2))) for rand_port in [opt.generator.generate_pure_random() for _ in range(100)]])
-        rand_triples_avg = np.mean([len(set(p for c in rand_port for p in combinations(sorted(c), 3))) for rand_port in [opt.generator.generate_pure_random() for _ in range(100)]])
-        rand_quads_avg = np.mean([len(set(p for c in rand_port for p in combinations(sorted(c), 4))) for rand_port in [opt.generator.generate_pure_random() for _ in range(100)]])
+        # Cobertura da estratégia
+        strat_pairs = len(set(p for game in strat_games for p in combinations(sorted(game), 2)))
+        strat_triples = len(set(t for game in strat_games for t in combinations(sorted(game), 3)))
+        strat_quads = len(set(q for game in strat_games for q in combinations(sorted(game), 4)))
+        mean_rand_pairs = np.mean(rand_pairs_list)
+        mean_rand_triples = np.mean(rand_triples_list)
+        mean_rand_quads = np.mean(rand_quads_list)
 
         results.append({
             'window': w,
@@ -864,12 +882,12 @@ def walk_forward_validation(contests, n_windows=8, train_size=400, test_size=50,
             'strat_pairs': strat_pairs,
             'strat_triples': strat_triples,
             'strat_quads': strat_quads,
-            'rand_pairs': rand_pairs_avg,
-            'rand_triples': rand_triples_avg,
-            'rand_quads': rand_quads_avg,
+            'rand_pairs': mean_rand_pairs,
+            'rand_triples': mean_rand_triples,
+            'rand_quads': mean_rand_quads,
         })
         print(f"   Janela {w}: lift={bt['lift']:.3f} | z={z_score:+.2f} | rank={pct_rank:.2f} | 14pts={bt['hit_distribution'].get(14,0)}")
-        print(f"      Cobertura: Pares {strat_pairs}/{rand_pairs_avg:.0f}, Triplas {strat_triples}/{rand_triples_avg:.0f}, Quadras {strat_quads}/{rand_quads_avg:.0f}")
+        print(f"      Cobertura: Pares {strat_pairs}/{mean_rand_pairs:.0f}, Triplas {strat_triples}/{mean_rand_triples:.0f}, Quadras {strat_quads}/{mean_rand_quads:.0f}")
 
     if results:
         print(f"\n📊 RESUMO FINAL:")
@@ -881,7 +899,6 @@ def walk_forward_validation(contests, n_windows=8, train_size=400, test_size=50,
         print(f"   Cobertura Triplas: {np.mean([r['strat_triples'] for r in results]):.0f} vs {np.mean([r['rand_triples'] for r in results]):.0f} (aleatório)")
         print(f"   Cobertura Quadras: {np.mean([r['strat_quads'] for r in results]):.0f} vs {np.mean([r['rand_quads'] for r in results]):.0f} (aleatório)")
         print(f"   14pts total: Estratégia={sum(r['strat_14'] for r in results)}")
-        # Teste de Wilcoxon nos lifts vs baseline aleatório
         diffs = [r['strat_lift'] - r['mean_rand_lift'] for r in results]
         try:
             _, p = wilcoxon(diffs)
@@ -895,8 +912,8 @@ def walk_forward_validation(contests, n_windows=8, train_size=400, test_size=50,
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v34.2")
-    print("   SELEÇÃO CORRIGIDA + BENCHMARK ROBUSTO")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v34.3")
+    print("   BENCHMARK CORRIGIDO + HÍBRIDO GARANTIDO")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
@@ -907,11 +924,11 @@ def main():
 
     while True:
         print("\nOpções:")
-        print("1. Gerar carteira de cobertura máxima (max diversity corrigido)")
+        print("1. Gerar carteira de cobertura máxima")
         print("2. Gerar carteira híbrida (central + anti‑central)")
-        print("3. Walk-forward padrão (com benchmark robusto)")
-        print("4. Walk-forward híbrido (com benchmark robusto)")
-        print("5. Walk-forward ensemble (com benchmark robusto)")
+        print("3. Walk‑forward padrão (com benchmark robusto)")
+        print("4. Walk‑forward híbrido (com benchmark robusto)")
+        print("5. Walk‑forward ensemble (com benchmark robusto)")
         print("6. Diagnóstico de distribuição (backtest + max_hit)")
         print("7. Análise de dependência temporal (MI + FDR)")
         print("8. Comparar real vs. sintético (RNG)")
