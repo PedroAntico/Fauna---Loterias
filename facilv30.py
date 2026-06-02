@@ -474,7 +474,7 @@ def pca_analysis(feature_matrix):
 def count_universe(allowed_pares=None, allowed_moldura=None, allowed_primos=None):
     print(f"\n📊 ESTIMATIVA DO UNIVERSO COMBINATÓRIO")
     print(f"   Critérios: Pares={allowed_pares}, Moldura={allowed_moldura}, Primos={allowed_primos}")
-    n_amostra = 500000
+    n_amostra = 1000000
     count_valid = 0
     for _ in tqdm(range(n_amostra), desc="Estimando universo"):
         game = sorted(np.random.choice(range(1, 26), 15, replace=False))
@@ -497,9 +497,9 @@ def count_universe(allowed_pares=None, allowed_moldura=None, allowed_primos=None
     print(f"   Universo total (C(25,15)): {total_universe:,}")
     print(f"   Universo estimado com critérios: {estimativa:,}")
     print(f"   Redução: {(1 - proporcao)*100:.1f}%")
-    if estimativa < 50000:
+    if estimativa < 100000:
         print("   ⚠️ Universo pequeno – critérios muito restritivos podem limitar cobertura")
-    elif estimativa > 500000:
+    elif estimativa > 1000000:
         print("   ℹ️ Universo ainda grande – critérios pouco restritivos")
     return estimativa, proporcao
 
@@ -708,7 +708,7 @@ def predictive_test(contests, max_lag=5, n_windows=50, train_size=500, test_size
 # ============================================================
 # BUSCA INTENSIVA EM SUBCONJUNTOS (NOVO v37.2)
 # ============================================================
-def intensive_search(contests, allowed_pares, allowed_moldura, allowed_primos, n_jogos=5000):
+def intensive_search(contests, allowed_pares, allowed_moldura, allowed_primos, n_jogos=10000):
     """
     Para um subconjunto pequeno, gera muitos jogos e faz backtest histórico.
     Identifica quais jogos mais acertaram 13+ pontos.
@@ -1017,7 +1017,7 @@ class PortfolioOptimizer:
         for g in raw_pool:
             if self._validate_game(g):
                 pool.append(g)
-            if len(pool) >= 5000:
+            if len(pool) >= 10000:
                 break
         if len(pool) < n_games:
             raise RuntimeError("Não foi possível gerar jogos suficientes com os critérios fornecidos.")
@@ -1100,7 +1100,7 @@ class PortfolioOptimizer:
         print(f"   Pares: {allowed_pares}")
         print(f"   Moldura: {allowed_moldura}")
         print(f"   Primos: {allowed_primos}")
-        print(f"   Gerando 5000 jogos com esses critérios para cada concurso...")
+        print(f"   Gerando 10000 jogos com esses critérios para cada concurso...")
         pool_jogos = []
         seen = set()
         for _ in range(10000):
@@ -1114,7 +1114,7 @@ class PortfolioOptimizer:
                 if key not in seen:
                     seen.add(key)
                     pool_jogos.append(g)
-                if len(pool_jogos) >= 5000:
+                if len(pool_jogos) >= 10000:
                     break
             except RuntimeError:
                 break
@@ -1434,8 +1434,8 @@ def main():
             allowed_pares = [int(x) for x in pares_str.split()] if pares_str else None
             allowed_moldura = [int(x) for x in moldura_str.split()] if moldura_str else None
             allowed_primos = [int(x) for x in primos_str.split()] if primos_str else None
-            n_jogos_str = input("   Quantos jogos gerar? [5000]: ").strip()
-            n_jogos = int(n_jogos_str) if n_jogos_str else 5000
+            n_jogos_str = input("   Quantos jogos gerar? [10000]: ").strip()
+            n_jogos = int(n_jogos_str) if n_jogos_str else 10000
             intensive_search(contests, allowed_pares, allowed_moldura, allowed_primos, n_jogos)
         
         elif op == '0':
