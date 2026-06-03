@@ -2,16 +2,16 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v39
-FIXAS, SEMIFIXAS E COBERTURA CONDICIONAL
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v40
+BUSCA AUTOMÁTICA DE FIXAS + SEMIFIXAS COM INTERVALO
 
-MUDANÇA DE FILOSOFIA:
-✅ Foco em dezenas fixas e semifixas
-✅ Geração de jogos condicionados às fixas
-✅ Backtest histórico com avaliação de taxa de acerto das fixas
+NOVO:
+✅ Opção 5: busca automática das melhores combinações de fixas (2, 3, 4 dezenas)
+✅ Semifixas agora com intervalo (min_semifixed e max_semifixed)
+✅ Gerador respeita o intervalo de semifixas
+✅ Análise de frequência histórica das fixas
 ✅ Walk‑forward condicional
-✅ Análise de ROI condicionado ao acerto das fixas
-✅ Abandona filtros rígidos de pares/moldura/primos (opcionais)
+✅ Cobertura condicionada às fixas
 """
 
 import numpy as np
@@ -75,28 +75,27 @@ def load_all_contests(csv_file='resultados_lotofacil.csv'):
     return contests
 
 # ============================================================
-# GERADOR COM FIXAS E SEMIFIXAS
+# GERADOR COM FIXAS E SEMIFIXAS (INTERVALO)
 # ============================================================
 class LooseGenerator:
     def __init__(self):
         pass
 
-    def generate_one(self, fixed=None, semifixed=None, min_semifixed=0,
+    def generate_one(self, fixed=None, semifixed=None, min_semifixed=0, max_semifixed=None,
                      allowed_pares=None, allowed_moldura=None, allowed_primos=None):
         """
         Gera um jogo respeitando:
-        - fixed: dezenas obrigatórias em todos os jogos
-        - semifixed: dezenas das quais pelo menos min_semifixed devem aparecer
-        - allowed_pares, allowed_moldura, allowed_primos: filtros opcionais
+        - fixed: dezenas obrigatórias
+        - semifixed: dezenas das quais entre min_semifixed e max_semifixed devem aparecer
         """
         for _ in range(500):
-            game = self._generate_raw(fixed, semifixed, min_semifixed,
+            game = self._generate_raw(fixed, semifixed, min_semifixed, max_semifixed,
                                       allowed_pares, allowed_moldura, allowed_primos)
             if game is not None:
                 return game
         raise RuntimeError("Não foi possível gerar jogo com os parâmetros fornecidos.")
 
-    def _generate_raw(self, fixed, semifixed, min_semifixed,
+    def _generate_raw(self, fixed, semifixed, min_semifixed, max_semifixed,
                       allowed_pares, allowed_moldura, allowed_primos):
         if fixed is None:
             fixed = []
@@ -109,9 +108,21 @@ class LooseGenerator:
         todas = set(range(1, 26))
         restantes = list(todas - proibidas)
         
-        # Número de dezenas a escolher das restantes
         n_fixas = len(fixed_set)
-        n_semifixed_escolher = random.randint(min_semifixed, min(len(semifixed_set), 15 - n_fixas))
+        
+        # Limite superior de semifixas
+        if max_semifixed is None:
+            max_semi = len(semifixed_set)
+        else:
+            max_semi = min(max_semifixed, len(semifixed_set))
+        
+        # Limite inferior
+        min_semi = max(min_semifixed, 0)
+        if min_semi > max_semi:
+            return None
+        
+        # Número de semifixas a escolher (aleatório dentro do intervalo)
+        n_semifixed_escolher = random.randint(min_semi, max_semi)
         n_restantes = 15 - n_fixas - n_semifixed_escolher
         
         if n_restantes < 0 or n_restantes > len(restantes):
@@ -120,13 +131,13 @@ class LooseGenerator:
         for _ in range(200):
             # Escolhe semifixas
             if n_semifixed_escolher > 0 and len(semifixed_set) > 0:
-                chosen_semi = set(random.sample(list(semifixed_set), n_semifixed_escolher))
+                chosen_semi = set(random.sample(list(semifixed_set), min(n_semifixed_escolher, len(semifixed_set))))
             else:
                 chosen_semi = set()
             
             # Escolhe restantes
             if n_restantes > 0:
-                chosen_rest = set(random.sample(restantes, n_restantes))
+                chosen_rest = set(random.sample(restantes, min(n_restantes, len(restantes))))
             else:
                 chosen_rest = set()
             
@@ -157,19 +168,19 @@ class LooseGenerator:
 # OTIMIZADOR DE CARTEIRA COM FIXAS
 # ============================================================
 class PortfolioOptimizer:
-    def __init__(self, contests, fixed=None, semifixed=None, min_semifixed=0,
+    def __init__(self, contests, fixed=None, semifixed=None, min_semifixed=0, max_semifixed=None,
                  allowed_pares=None, allowed_moldura=None, allowed_primos=None):
         self.contests = contests
         self.generator = LooseGenerator()
         self.fixed = fixed if fixed else []
         self.semifixed = semifixed if semifixed else []
         self.min_semifixed = min_semifixed
+        self.max_semifixed = max_semifixed
         self.allowed_pares = allowed_pares
         self.allowed_moldura = allowed_moldura
         self.allowed_primos = allowed_primos
 
     def generate_pool(self, n_candidates):
-        """Gera pool de jogos respeitando fixas e semifixas."""
         pool = []
         seen = set()
         for _ in tqdm(range(n_candidates), desc="Gerando pool"):
@@ -178,6 +189,7 @@ class PortfolioOptimizer:
                     fixed=self.fixed,
                     semifixed=self.semifixed,
                     min_semifixed=self.min_semifixed,
+                    max_semifixed=self.max_semifixed,
                     allowed_pares=self.allowed_pares,
                     allowed_moldura=self.allowed_moldura,
                     allowed_primos=self.allowed_primos
@@ -191,7 +203,6 @@ class PortfolioOptimizer:
         return pool
 
     def select_diverse(self, candidates, n_select):
-        """Seleciona n_select jogos maximizando diversidade (farthest‑point)."""
         if len(candidates) < n_select:
             raise ValueError(f"Pool insuficiente: {len(candidates)} < {n_select}")
         
@@ -212,7 +223,6 @@ class PortfolioOptimizer:
             next_idx = valid[np.argmax(min_dists[valid])]
             selected_idx.append(next_idx)
         
-        # Completa se necessário
         for i in range(n):
             if len(selected_idx) >= n_select:
                 break
@@ -226,7 +236,8 @@ class PortfolioOptimizer:
         if self.fixed:
             print(f"   Fixas: {self.fixed}")
         if self.semifixed:
-            print(f"   Semifixas: {self.semifixed} (mín. {self.min_semifixed} por jogo)")
+            intervalo = f"{self.min_semifixed} a {self.max_semifixed if self.max_semifixed else len(self.semifixed)}"
+            print(f"   Semifixas: {self.semifixed} ({intervalo} por jogo)")
         if self.allowed_pares: print(f"   Pares permitidos: {self.allowed_pares}")
         if self.allowed_moldura: print(f"   Moldura permitida: {self.allowed_moldura}")
         if self.allowed_primos: print(f"   Primos permitidos: {self.allowed_primos}")
@@ -266,9 +277,6 @@ class PortfolioOptimizer:
                 'hit_distribution': hit_counts}
 
     def analyze_fixed_accuracy(self, test_draws=None):
-        """
-        Analisa a taxa de acerto das fixas e semifixas nos concursos históricos.
-        """
         if test_draws is None:
             test_draws = self.contests
         
@@ -278,11 +286,8 @@ class PortfolioOptimizer:
         results = {
             'total': len(test_draws),
             'fixed_hit_all': 0,
-            'fixed_hit_any': 0,
-            'semifixed_hit_min': 0,
-            'semifixed_hit_any': 0,
+            'semifixed_in_range': 0,
             'all_conditions_met': 0,
-            'conditional_performance': []
         }
         
         for draw in test_draws:
@@ -292,45 +297,131 @@ class PortfolioOptimizer:
             
             if fixed_hit == len(fixed_set):
                 results['fixed_hit_all'] += 1
-            if fixed_hit > 0:
-                results['fixed_hit_any'] += 1
-            if semifixed_hit >= self.min_semifixed:
-                results['semifixed_hit_min'] += 1
-            if semifixed_hit > 0:
-                results['semifixed_hit_any'] += 1
             
-            # Condição ideal: todas as fixas e pelo menos min_semifixed semifixas
-            if fixed_hit == len(fixed_set) and semifixed_hit >= self.min_semifixed:
+            max_semi = self.max_semifixed if self.max_semifixed else len(semifixed_set)
+            if self.min_semifixed <= semifixed_hit <= max_semi:
+                results['semifixed_in_range'] += 1
+            
+            if fixed_hit == len(fixed_set) and self.min_semifixed <= semifixed_hit <= max_semi:
                 results['all_conditions_met'] += 1
         
         print(f"\n📊 ANÁLISE DE ACERTO DAS FIXAS ({len(test_draws)} concursos):")
         if self.fixed:
             print(f"   Fixas: {self.fixed}")
-            print(f"   Acerto total ({len(self.fixed)}/{len(self.fixed)}): {results['fixed_hit_all']} "
+            print(f"   Acerto total: {results['fixed_hit_all']} "
                   f"({results['fixed_hit_all']/results['total']*100:.1f}%)")
-            print(f"   Acerto parcial (≥1): {results['fixed_hit_any']} "
-                  f"({results['fixed_hit_any']/results['total']*100:.1f}%)")
         if self.semifixed:
-            print(f"   Semifixas: {self.semifixed} (mín. {self.min_semifixed})")
-            print(f"   Acerto mínimo ({self.min_semifixed}+): {results['semifixed_hit_min']} "
-                  f"({results['semifixed_hit_min']/results['total']*100:.1f}%)")
-            print(f"   Acerto parcial (≥1): {results['semifixed_hit_any']} "
-                  f"({results['semifixed_hit_any']/results['total']*100:.1f}%)")
+            intervalo = f"{self.min_semifixed} a {self.max_semifixed if self.max_semifixed else len(self.semifixed)}"
+            print(f"   Semifixas: {self.semifixed} (intervalo: {intervalo})")
+            print(f"   Acerto no intervalo: {results['semifixed_in_range']} "
+                  f"({results['semifixed_in_range']/results['total']*100:.1f}%)")
         if self.fixed or self.semifixed:
-            print(f"   Condições ideais atendidas: {results['all_conditions_met']} "
+            print(f"   Todas as condições: {results['all_conditions_met']} "
                   f"({results['all_conditions_met']/results['total']*100:.1f}%)")
         
         return results
 
 # ============================================================
+# BUSCA AUTOMÁTICA DAS MELHORES FIXAS (NOVO v40)
+# ============================================================
+def search_best_fixed(contests, n_fixed=3, top_n=20, min_freq=0.05):
+    """
+    Testa todas as combinações de n_fixed dezenas e ranqueia por:
+    - Frequência conjunta (quantos concursos contêm TODAS as fixas)
+    - Quantidade de concursos com 13+ pontos quando as fixas acertam
+    """
+    print(f"\n🔎 BUSCANDO MELHORES COMBINAÇÕES DE {n_fixed} DEZENAS FIXAS...")
+    print(f"   Total de combinações: C(25,{n_fixed}) = {comb(25, n_fixed):,}")
+    
+    all_combos = list(combinations(range(1, 26), n_fixed))
+    results = []
+    
+    for fixed_tuple in tqdm(all_combos, desc=f"Testando {n_fixed} fixas"):
+        fixed_set = set(fixed_tuple)
+        total_concursos = len(contests)
+        acertos = 0
+        concursos_13plus = 0
+        concursos_14plus = 0
+        
+        for c in contests:
+            draw_set = set(c['dezenas'])
+            if fixed_set.issubset(draw_set):
+                acertos += 1
+                # Verifica se o concurso tem potencial para 13+ pontos
+                # (pelo menos 13 das 15 dezenas estão no sorteio)
+                # Com as fixas já certas, precisamos de 10+ das outras 12
+                # Simplificamos: conta concursos que fizeram 13+ na história
+                # (Isso é uma aproximação — depende da carteira)
+        
+        freq = acertos / total_concursos
+        
+        if freq >= min_freq:
+            # Agora para esses concursos, verifica quantos tiveram 13+ pontos
+            # (usando uma carteira simples de 1 jogo: as fixas + as outras 12 mais sorteadas)
+            # Para ranqueamento rápido, usamos uma heurística:
+            # conta quantos concursos (dentre os que acertaram as fixas) tiveram
+            # pelo menos 13 dezenas iguais a um "jogo médio"
+            
+            # Cria um jogo de referência: fixas + 12 dezenas mais frequentes do histórico
+            freq_counter = Counter()
+            for c in contests:
+                freq_counter.update(c['dezenas'])
+            # Remove as fixas
+            for d in fixed_set:
+                if d in freq_counter:
+                    del freq_counter[d]
+            top12 = [d for d, _ in freq_counter.most_common(12)]
+            ref_game = sorted(fixed_set | set(top12))
+            ref_mask = BITMASK_CACHE.get_mask(ref_game)
+            
+            for c in contests:
+                draw_set = set(c['dezenas'])
+                if fixed_set.issubset(draw_set):
+                    hits = mask_intersection(ref_mask, BITMASK_CACHE.get_mask(c['dezenas']))
+                    if hits >= 13:
+                        concursos_13plus += 1
+                    if hits >= 14:
+                        concursos_14plus += 1
+            
+            results.append({
+                'fixed': fixed_tuple,
+                'freq': freq,
+                'acertos': acertos,
+                '13plus': concursos_13plus,
+                '14plus': concursos_14plus,
+                'score': freq * (concursos_13plus + 10 * concursos_14plus) / acertos if acertos > 0 else 0
+            })
+    
+    # Ordena por score
+    results.sort(key=lambda x: x['score'], reverse=True)
+    
+    # Exibe os top_n
+    print(f"\n🏆 TOP {top_n} COMBINAÇÕES DE {n_fixed} FIXAS:")
+    print(f"{'Rank':<5} {'Fixas':<20} {'Freq':<8} {'Acertos':<8} {'13+':<8} {'14+':<8} {'Score':<10}")
+    print("-" * 75)
+    for i, res in enumerate(results[:top_n], 1):
+        print(f"{i:<5} {str(res['fixed']):<20} {res['freq']:<8.2%} {res['acertos']:<8} "
+              f"{res['13plus']:<8} {res['14plus']:<8} {res['score']:<10.4f}")
+    
+    # Estatísticas
+    if results:
+        avg_freq = np.mean([r['freq'] for r in results])
+        print(f"\n📊 ESTATÍSTICAS:")
+        print(f"   Média de frequência: {avg_freq:.2%}")
+        print(f"   Melhor: {results[0]['fixed']} ({results[0]['freq']:.2%}, "
+              f"{results[0]['13plus']}×13+, {results[0]['14plus']}×14+)")
+    
+    return results
+
+# ============================================================
 # WALK-FORWARD CONDICIONAL
 # ============================================================
 def walk_forward_conditional(contests, n_windows=8, train_size=400, test_size=50, n_games=5,
-                             fixed=None, semifixed=None, min_semifixed=0,
+                             fixed=None, semifixed=None, min_semifixed=0, max_semifixed=None,
                              allowed_pares=None, allowed_moldura=None, allowed_primos=None):
     print(f"\n🔬 WALK-FORWARD CONDICIONAL ({n_windows} janelas)")
     print(f"   Fixas: {fixed}")
-    if semifixed: print(f"   Semifixas: {semifixed} (mín. {min_semifixed})")
+    if semifixed: print(f"   Semifixas: {semifixed} ({min_semifixed} a {max_semifixed if max_semifixed else len(semifixed)})")
     
     results = []
     for w in range(n_windows):
@@ -347,15 +438,16 @@ def walk_forward_conditional(contests, n_windows=8, train_size=400, test_size=50
         # Verifica quantos concursos de teste atendem às condições
         fixed_set = set(fixed)
         semifixed_set = set(semifixed)
+        max_semi = max_semifixed if max_semifixed else len(semifixed_set)
         cond_met = 0
         for draw in test_data:
             draw_set = set(draw['dezenas'])
-            fixed_hit = len(fixed_set & draw_set) == len(fixed_set)
-            semifixed_hit = len(semifixed_set & draw_set) >= min_semifixed
-            if fixed_hit and semifixed_hit:
+            fixed_hit = fixed_set.issubset(draw_set)
+            semifixed_hit = len(semifixed_set & draw_set)
+            if fixed_hit and min_semifixed <= semifixed_hit <= max_semi:
                 cond_met += 1
         
-        opt = PortfolioOptimizer(train_data, fixed, semifixed, min_semifixed,
+        opt = PortfolioOptimizer(train_data, fixed, semifixed, min_semifixed, max_semifixed,
                                  allowed_pares, allowed_moldura, allowed_primos)
         portfolio = opt.optimize(n_games, n_candidates=10000)
         bt = opt.backtest(portfolio, test_data)
@@ -383,8 +475,8 @@ def walk_forward_conditional(contests, n_windows=8, train_size=400, test_size=50
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v39")
-    print("   FIXAS, SEMIFIXAS E COBERTURA CONDICIONAL")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v40")
+    print("   BUSCA AUTOMÁTICA DE FIXAS + SEMIFIXAS COM INTERVALO")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
@@ -395,10 +487,11 @@ def main():
 
     while True:
         print("\nOpções:")
-        print("1. Gerar carteira com dezenas fixas")
-        print("2. Análise histórica das dezenas fixas")
+        print("1. Gerar carteira com dezenas fixas e semifixas")
+        print("2. Analisar frequência histórica das fixas")
         print("3. Walk‑forward condicional")
         print("4. Backtest nos últimos 200 concursos")
+        print("5. Buscar melhores combinações de fixas")
         print("0. Sair")
         op = input("Escolha: ").strip()
         
@@ -411,12 +504,20 @@ def main():
             semifixed = [int(x) for x in semifixed_str.split()] if semifixed_str else []
             
             min_semi = 0
+            max_semi = None
             if semifixed:
                 try:
-                    min_semi = int(input(f"   Mínimo de semifixas por jogo (1-{len(semifixed)}): ").strip())
-                    min_semi = max(1, min(min_semi, len(semifixed)))
+                    min_semi = int(input(f"   Mínimo de semifixas por jogo (0-{len(semifixed)}): ").strip())
+                    min_semi = max(0, min(min_semi, len(semifixed)))
                 except:
-                    min_semi = 1
+                    min_semi = 0
+                try:
+                    max_str = input(f"   Máximo de semifixas por jogo (ENTER = {len(semifixed)}): ").strip()
+                    if max_str:
+                        max_semi = int(max_str)
+                        max_semi = max(min_semi, min(max_semi, len(semifixed)))
+                except:
+                    max_semi = len(semifixed)
             
             print("\n📝 FILTROS OPCIONAIS (ENTER para pular)")
             pares_str = input("   Pares (ex: 7 8 9): ").strip()
@@ -426,7 +527,7 @@ def main():
             allowed_moldura = [int(x) for x in moldura_str.split()] if moldura_str else None
             allowed_primos = [int(x) for x in primos_str.split()] if primos_str else None
             
-            opt = PortfolioOptimizer(contests, fixed, semifixed, min_semi,
+            opt = PortfolioOptimizer(contests, fixed, semifixed, min_semi, max_semi,
                                      allowed_pares, allowed_moldura, allowed_primos)
             portfolio = opt.optimize(5, 30000)
             for i, g in enumerate(portfolio, 1):
@@ -440,41 +541,48 @@ def main():
         
         elif op == '2':
             print("\n📝 DEFINIÇÃO DE DEZENAS FIXAS PARA ANÁLISE")
-            fixed_str = input("   Dezenas fixas (ex: 2 10 24): ").strip()
+            fixed_str = input("   Dezenas fixas (ex: 15 16 20): ").strip()
             fixed = [int(x) for x in fixed_str.split()] if fixed_str else []
             
             semifixed_str = input("   Dezenas semifixas (ex: 5 13 18): ").strip()
             semifixed = [int(x) for x in semifixed_str.split()] if semifixed_str else []
             
             min_semi = 0
+            max_semi = None
             if semifixed:
                 try:
-                    min_semi = int(input(f"   Mínimo de semifixas (1-{len(semifixed)}): ").strip())
-                    min_semi = max(1, min(min_semi, len(semifixed)))
+                    min_semi = int(input(f"   Mínimo de semifixas (0-{len(semifixed)}): ").strip())
+                    min_semi = max(0, min(min_semi, len(semifixed)))
                 except:
-                    min_semi = 1
+                    min_semi = 0
+                try:
+                    max_str = input(f"   Máximo de semifixas (ENTER = {len(semifixed)}): ").strip()
+                    if max_str:
+                        max_semi = int(max_str)
+                        max_semi = max(min_semi, min(max_semi, len(semifixed)))
+                except:
+                    max_semi = len(semifixed)
             
-            opt = PortfolioOptimizer(contests, fixed, semifixed, min_semi)
+            opt = PortfolioOptimizer(contests, fixed, semifixed, min_semi, max_semi)
             opt.analyze_fixed_accuracy()
             
-            # Pergunta se quer ver o ROI condicionado
             ver_roi = input("\n   Calcular ROI condicionado? (s/n): ").strip().lower()
             if ver_roi == 's':
                 portfolio = opt.optimize(5, 30000)
-                # Filtra concursos onde as condições são atendidas
                 fixed_set = set(fixed)
                 semifixed_set = set(semifixed)
+                max_semi = max_semifixed if max_semifixed else len(semifixed_set)
                 cond_draws = []
                 for draw in contests:
                     draw_set = set(draw['dezenas'])
-                    fixed_hit = len(fixed_set & draw_set) == len(fixed_set)
-                    semifixed_hit = len(semifixed_set & draw_set) >= min_semi
-                    if fixed_hit and semifixed_hit:
+                    fixed_hit = fixed_set.issubset(draw_set)
+                    semifixed_hit = len(semifixed_set & draw_set)
+                    if fixed_hit and min_semifixed <= semifixed_hit <= max_semi:
                         cond_draws.append(draw)
                 
                 if cond_draws:
                     bt = opt.backtest(portfolio, cond_draws)
-                    print(f"\n💰 ROI CONDICIONADO ({len(cond_draws)} concursos onde as fixas acertaram):")
+                    print(f"\n💰 ROI CONDICIONADO ({len(cond_draws)} concursos):")
                     print(f"   Lift={bt['lift']:.2f}x | ROI={bt['roi']:+.1f}%")
                     print(f"   Dist: 11={bt['hit_distribution'].get(11,0)} 12={bt['hit_distribution'].get(12,0)} "
                           f"13={bt['hit_distribution'].get(13,0)} 14={bt['hit_distribution'].get(14,0)} 15={bt['hit_distribution'].get(15,0)}")
@@ -490,38 +598,73 @@ def main():
             semifixed = [int(x) for x in semifixed_str.split()] if semifixed_str else []
             
             min_semi = 0
+            max_semi = None
             if semifixed:
                 try:
-                    min_semi = int(input(f"   Mínimo de semifixas (1-{len(semifixed)}): ").strip())
-                    min_semi = max(1, min(min_semi, len(semifixed)))
+                    min_semi = int(input(f"   Mínimo de semifixas (0-{len(semifixed)}): ").strip())
+                    min_semi = max(0, min(min_semi, len(semifixed)))
                 except:
-                    min_semi = 1
+                    min_semi = 0
+                try:
+                    max_str = input(f"   Máximo de semifixas (ENTER = {len(semifixed)}): ").strip()
+                    if max_str:
+                        max_semi = int(max_str)
+                        max_semi = max(min_semi, min(max_semi, len(semifixed)))
+                except:
+                    max_semi = len(semifixed)
             
-            walk_forward_conditional(contests, fixed=fixed, semifixed=semifixed, min_semifixed=min_semi)
+            walk_forward_conditional(contests, fixed=fixed, semifixed=semifixed,
+                                     min_semifixed=min_semi, max_semifixed=max_semi)
         
         elif op == '4':
             print("\n📝 DEFINIÇÃO DE DEZENAS FIXAS")
-            fixed_str = input("   Dezenas fixas (ex: 2 10 24): ").strip()
+            fixed_str = input("   Dezenas fixas (ex: 15 16 20): ").strip()
             fixed = [int(x) for x in fixed_str.split()] if fixed_str else []
             
             semifixed_str = input("   Dezenas semifixas (ex: 5 13 18): ").strip()
             semifixed = [int(x) for x in semifixed_str.split()] if semifixed_str else []
             
             min_semi = 0
+            max_semi = None
             if semifixed:
                 try:
-                    min_semi = int(input(f"   Mínimo de semifixas (1-{len(semifixed)}): ").strip())
-                    min_semi = max(1, min(min_semi, len(semifixed)))
+                    min_semi = int(input(f"   Mínimo de semifixas (0-{len(semifixed)}): ").strip())
+                    min_semi = max(0, min(min_semi, len(semifixed)))
                 except:
-                    min_semi = 1
+                    min_semi = 0
+                try:
+                    max_str = input(f"   Máximo de semifixas (ENTER = {len(semifixed)}): ").strip()
+                    if max_str:
+                        max_semi = int(max_str)
+                        max_semi = max(min_semi, min(max_semi, len(semifixed)))
+                except:
+                    max_semi = len(semifixed)
             
-            opt = PortfolioOptimizer(contests, fixed, semifixed, min_semi)
+            opt = PortfolioOptimizer(contests, fixed, semifixed, min_semi, max_semi)
             portfolio = opt.optimize(5, 30000)
             bt = opt.backtest(portfolio, contests[-200:])
             print(f"\n🔬 BACKTEST (últimos 200):")
             print(f"   Lift={bt['lift']:.2f}x | ROI={bt['roi']:+.1f}%")
             print(f"   Dist: 11={bt['hit_distribution'].get(11,0)} 12={bt['hit_distribution'].get(12,0)} "
                   f"13={bt['hit_distribution'].get(13,0)} 14={bt['hit_distribution'].get(14,0)} 15={bt['hit_distribution'].get(15,0)}")
+        
+        elif op == '5':
+            print("\n📝 PARÂMETROS DA BUSCA AUTOMÁTICA")
+            try:
+                n_fixed = int(input("   Quantas dezenas fixas (2, 3 ou 4): ").strip())
+                if n_fixed not in [2, 3, 4]:
+                    print("   Valor deve ser 2, 3 ou 4.")
+                    continue
+            except:
+                print("   Valor inválido.")
+                continue
+            
+            try:
+                top_n = int(input("   Quantos resultados exibir? [20]: ").strip() or "20")
+            except:
+                top_n = 20
+            
+            search_best_fixed(contests, n_fixed, top_n)
         
         elif op == '0':
             break
