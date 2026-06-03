@@ -2,15 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v41
-BUSCA AUTOMÁTICA DE FIXAS + RANKING POR BACKTEST REAL
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v42
+TESTE FORA DA AMOSTRA + COBERTURA DE TRIPLAS
 
-EVOLUÇÃO DO v40:
-✅ Opção 5: busca automática com ranking por backtest real (5 jogos)
-✅ Comparação direta entre trincas (15,16,19) vs (15,16,20)
-✅ Geração de carteira por cobertura de pares (greedy pair covering)
-✅ Semifixas com intervalo (min e max)
-✅ Análise de lucro/prejuízo e garantias
+EVOLUÇÃO DO v41:
+✅ Opção 5: busca automática com split treino/teste (fora da amostra)
+✅ Opção 7: cobertura de triplas (triple covering)
+✅ Análise de persistência temporal das dezenas
+✅ Comparação Pair Covering vs Triple Covering
+✅ Mantém fixas, semifixas com intervalo, walk‑forward condicional
 """
 
 import numpy as np
@@ -151,7 +151,7 @@ class LooseGenerator:
         return sorted(np.random.choice(range(1, 26), 15, replace=False))
 
 # ============================================================
-# OTIMIZADOR DE CARTEIRA COM COBERTURA DE PARES
+# OTIMIZADOR DE CARTEIRA COM COBERTURA (PAIRS OU TRIPLES)
 # ============================================================
 class PortfolioOptimizer:
     def __init__(self, contests, fixed=None, semifixed=None, min_semifixed=0, max_semifixed=None,
@@ -185,15 +185,16 @@ class PortfolioOptimizer:
                 break
         return pool
 
-    def select_pair_covering(self, candidates, n_select):
+    def select_covering(self, candidates, n_select, level='pair'):
         """
-        Seleciona n_select jogos maximizando cobertura de pares.
-        Algoritmo guloso: a cada passo, escolhe o jogo que adiciona mais pares novos.
+        Seleciona n_select jogos maximizando cobertura de grupos.
+        level: 'pair' (pares) ou 'triple' (triplas).
         """
         if len(candidates) < n_select:
             raise ValueError(f"Pool insuficiente: {len(candidates)} < {n_select}")
         
-        covered_pairs = set()
+        r = 2 if level == 'pair' else 3
+        covered = set()
         selected = []
         masks = [BITMASK_CACHE.get_mask(c) for c in candidates]
         
@@ -204,18 +205,17 @@ class PortfolioOptimizer:
             for i, c in enumerate(candidates):
                 if i in [candidates.index(s) for s in selected]:
                     continue
-                # Calcula pares deste jogo
-                pairs = set(combinations(sorted(c), 2))
-                new_pairs = len(pairs - covered_pairs)
-                if new_pairs > best_new:
-                    best_new = new_pairs
+                groups = set(combinations(sorted(c), r))
+                new_groups = len(groups - covered)
+                if new_groups > best_new:
+                    best_new = new_groups
                     best_idx = i
             
             if best_idx == -1:
                 break
             
             selected.append(candidates[best_idx])
-            covered_pairs.update(combinations(sorted(candidates[best_idx]), 2))
+            covered.update(combinations(sorted(candidates[best_idx]), r))
         
         return selected
 
@@ -238,43 +238,15 @@ class PortfolioOptimizer:
             raise RuntimeError(f"Pool insuficiente: {len(pool)} < {n_games}.")
         
         if method == 'pair_covering':
-            portfolio = self.select_pair_covering(pool, n_games)
+            portfolio = self.select_covering(pool, n_games, level='pair')
+        elif method == 'triple_covering':
+            portfolio = self.select_covering(pool, n_games, level='triple')
         else:
-            # Diversidade simples
-            portfolio = self.select_diverse(pool, n_games)
+            portfolio = pool[:n_games]
         
         print(f"   Carteira final: {len(portfolio)} jogos")
         print(f"✅ Otimizado em {time.time()-t0:.1f}s")
         return portfolio
-
-    def select_diverse(self, candidates, n_select):
-        if len(candidates) < n_select:
-            raise ValueError(f"Pool insuficiente: {len(candidates)} < {n_select}")
-        
-        masks = np.array([BITMASK_CACHE.get_mask(c) for c in candidates], dtype=np.uint32)
-        n = len(candidates)
-        selected_idx = [0]
-        
-        for _ in range(n_select - 1):
-            min_dists = np.full(n, np.inf, dtype=np.float64)
-            for idx in selected_idx:
-                intersect = np.array([mask_intersection(masks[i], masks[idx]) for i in range(n)])
-                dist = 15.0 - intersect
-                min_dists = np.minimum(min_dists, dist)
-            min_dists[selected_idx] = -1.0
-            valid = np.where(min_dists >= 0)[0]
-            if len(valid) == 0:
-                break
-            next_idx = valid[np.argmax(min_dists[valid])]
-            selected_idx.append(next_idx)
-        
-        for i in range(n):
-            if len(selected_idx) >= n_select:
-                break
-            if i not in selected_idx:
-                selected_idx.append(i)
-        
-        return [candidates[i] for i in selected_idx[:n_select]]
 
     def backtest(self, portfolio, test_draws):
         n_success = total_premio = 0
@@ -345,72 +317,103 @@ class PortfolioOptimizer:
         return results
 
 # ============================================================
-# BUSCA AUTOMÁTICA COM RANKING POR BACKTEST REAL (v41)
+# ANÁLISE DE PERSISTÊNCIA TEMPORAL (NOVO v42)
 # ============================================================
-def search_best_fixed_real(contests, n_fixed=3, top_n=20, min_freq=0.05, n_games=5, n_candidates=10000):
+def analyze_temporal_persistence(contests, dezenas=None):
+    """Analisa a frequência das dezenas em diferentes janelas temporais."""
+    if dezenas is None:
+        dezenas = [10, 11, 13, 14, 20]  # as que apareceram nas melhores trincas
+    
+    print(f"\n📊 PERSISTÊNCIA TEMPORAL DAS DEZENAS")
+    windows = [20, 50, 100, 200, 500]
+    
+    for window in windows:
+        if window > len(contests):
+            continue
+        recent = contests[-window:]
+        freq = Counter()
+        for c in recent:
+            freq.update(c['dezenas'])
+        
+        print(f"\n   Últimos {window} concursos:")
+        for d in sorted(dezenas):
+            f = freq.get(d, 0)
+            pct = f / window * 100
+            bar = "█" * int(pct / 5)
+            print(f"   {d:2d}: {f:3d} ({pct:5.1f}%) {bar}")
+
+# ============================================================
+# BUSCA AUTOMÁTICA COM TESTE FORA DA AMOSTRA (v42)
+# ============================================================
+def search_best_fixed_oos(contests, n_fixed=3, top_n=20, train_size=3500, n_games=5, n_candidates=10000, method='pair_covering'):
     """
-    Testa as melhores combinações de n_fixed dezenas fixas,
-    gerando a carteira real e fazendo backtest.
+    Busca as melhores combinações de n_fixed dezenas fixas,
+    usando treino (primeiros train_size concursos) e teste (restante).
     """
-    print(f"\n🔎 BUSCANDO MELHORES {n_fixed} FIXAS (com backtest real)...")
+    print(f"\n🔎 BUSCANDO MELHORES {n_fixed} FIXAS (OUT-OF-SAMPLE)")
+    print(f"   Treino: concursos 1 a {train_size}")
+    print(f"   Teste: concursos {train_size+1} a {len(contests)}")
+    
+    train_data = contests[:train_size]
+    test_data = contests[train_size:]
+    
     total_comb = comb(25, n_fixed)
     print(f"   Total de combinações: {total_comb:,}")
     
-    # Pré-filtra por frequência para reduzir o espaço
-    print("   Fase 1: filtrando por frequência...")
+    # Fase 1: Filtrar por frequência nos dados de treino
+    print("   Fase 1: filtrando por frequência (treino)...")
     candidates = []
     all_combos = list(combinations(range(1, 26), n_fixed))
     
     for fixed_tuple in tqdm(all_combos, desc="Filtrando"):
         fixed_set = set(fixed_tuple)
-        acertos = sum(1 for c in contests if fixed_set.issubset(set(c['dezenas'])))
-        freq = acertos / len(contests)
-        if freq >= min_freq:
+        acertos = sum(1 for c in train_data if fixed_set.issubset(set(c['dezenas'])))
+        freq = acertos / len(train_data)
+        if freq >= 0.05:  # pelo menos 5%
             candidates.append((fixed_tuple, freq, acertos))
     
     candidates.sort(key=lambda x: x[1], reverse=True)
-    print(f"   {len(candidates)} combinações passaram o filtro (freq ≥ {min_freq:.0%})")
+    print(f"   {len(candidates)} combinações passaram o filtro")
     
-    # Fase 2: backtest real para as top 200
+    # Fase 2: Avaliar as top 200 no teste (fora da amostra)
     top_candidates = candidates[:200]
-    print(f"   Fase 2: backtest real para as {len(top_candidates)} melhores...")
+    print(f"   Fase 2: backtest nas {len(top_candidates)} melhores (TESTE)...")
     
     results = []
-    for fixed_tuple, freq, acertos in tqdm(top_candidates, desc="Backtest"):
+    for fixed_tuple, freq, acertos in tqdm(top_candidates, desc="Backtest OOS"):
         fixed = list(fixed_tuple)
-        opt = PortfolioOptimizer(contests, fixed=fixed)
+        opt = PortfolioOptimizer(train_data, fixed=fixed)
         try:
-            portfolio = opt.optimize(n_games, n_candidates, method='pair_covering')
-            bt = opt.backtest(portfolio, contests[-200:])
+            portfolio = opt.optimize(n_games, n_candidates, method=method)
+            bt = opt.backtest(portfolio, test_data)
             
             results.append({
                 'fixed': fixed_tuple,
-                'freq': freq,
-                'acertos': acertos,
+                'freq_treino': freq,
+                'acertos_treino': acertos,
                 'lift': bt['lift'],
                 'roi': bt['roi'],
                 '14pts': bt['hit_distribution'].get(14, 0),
                 '13pts': bt['hit_distribution'].get(13, 0),
                 '15pts': bt['hit_distribution'].get(15, 0),
-                'portfolio': portfolio
             })
         except Exception as e:
             continue
     
-    # Ordena por ROI
+    # Ordena por ROI (fora da amostra)
     results.sort(key=lambda x: x['roi'], reverse=True)
     
-    print(f"\n🏆 TOP {top_n} FIXAS POR ROI (backtest real):")
-    print(f"{'Rank':<5} {'Fixas':<20} {'Freq':<8} {'Lift':<8} {'ROI':<10} {'13pts':<8} {'14pts':<8} {'15pts':<8}")
+    print(f"\n🏆 TOP {top_n} FIXAS POR ROI (OUT-OF-SAMPLE):")
+    print(f"{'Rank':<5} {'Fixas':<20} {'Freq T':<8} {'Lift T':<8} {'ROI T':<10} {'13pts':<8} {'14pts':<8} {'15pts':<8}")
     print("-" * 85)
     for i, res in enumerate(results[:top_n], 1):
-        print(f"{i:<5} {str(res['fixed']):<20} {res['freq']:<8.2%} {res['lift']:<8.2f} "
+        print(f"{i:<5} {str(res['fixed']):<20} {res['freq_treino']:<8.2%} {res['lift']:<8.2f} "
               f"{res['roi']:<10.1f}% {res['13pts']:<8} {res['14pts']:<8} {res['15pts']:<8}")
     
     # Também ordena por 14pts
     results_by_14 = sorted(results, key=lambda x: x['14pts'], reverse=True)
-    print(f"\n🏆 TOP {min(10, top_n)} FIXAS POR 14 PONTOS:")
-    print(f"{'Rank':<5} {'Fixas':<20} {'14pts':<8} {'13pts':<8} {'ROI':<10}")
+    print(f"\n🏆 TOP {min(10, top_n)} FIXAS POR 14 PONTOS (OUT-OF-SAMPLE):")
+    print(f"{'Rank':<5} {'Fixas':<20} {'14pts':<8} {'13pts':<8} {'ROI T':<10}")
     print("-" * 55)
     for i, res in enumerate(results_by_14[:min(10, top_n)], 1):
         print(f"{i:<5} {str(res['fixed']):<20} {res['14pts']:<8} {res['13pts']:<8} {res['roi']:<10.1f}%")
@@ -418,9 +421,41 @@ def search_best_fixed_real(contests, n_fixed=3, top_n=20, min_freq=0.05, n_games
     return results, results_by_14
 
 # ============================================================
+# COMPARAÇÃO DE MÉTODOS DE COBERTURA
+# ============================================================
+def compare_covering_methods(contests, fixed=None, n_games=5, n_candidates=30000):
+    """Compara pair_covering vs triple_covering."""
+    print(f"\n⚔️ COMPARAÇÃO DE MÉTODOS DE COBERTURA")
+    if fixed:
+        print(f"   Fixas: {fixed}")
+    
+    for method in ['pair_covering', 'triple_covering']:
+        print(f"\n--- {method} ---")
+        opt = PortfolioOptimizer(contests, fixed=fixed)
+        portfolio = opt.optimize(n_games, n_candidates, method=method)
+        
+        # Backtest geral
+        bt = opt.backtest(portfolio, contests[-200:])
+        print(f"   Backtest (200 concursos): Lift={bt['lift']:.2f}x | ROI={bt['roi']:+.1f}%")
+        print(f"   11={bt['hit_distribution'].get(11,0)} 12={bt['hit_distribution'].get(12,0)} "
+              f"13={bt['hit_distribution'].get(13,0)} 14={bt['hit_distribution'].get(14,0)} 15={bt['hit_distribution'].get(15,0)}")
+        
+        # Cobertura de pares/triplas
+        if method == 'pair_covering':
+            pairs = set()
+            for g in portfolio:
+                pairs.update(combinations(sorted(g), 2))
+            print(f"   Pares únicos cobertos: {len(pairs)} / {comb(25,2)}")
+        else:
+            triples = set()
+            for g in portfolio:
+                triples.update(combinations(sorted(g), 3))
+            print(f"   Triplas únicas cobertas: {len(triples)} / {comb(25,3)}")
+
+# ============================================================
 # COMPARAÇÃO DIRETA DE TRINCAS
 # ============================================================
-def compare_trincas(contests, trinca1, trinca2, n_games=5, n_candidates=30000):
+def compare_trincas(contests, trinca1, trinca2, n_games=5, n_candidates=30000, method='pair_covering'):
     """Compara duas trincas de fixas com backtest completo."""
     print(f"\n⚔️ COMPARAÇÃO DE TRINCAS")
     print(f"   Trinca 1: {trinca1}")
@@ -429,7 +464,7 @@ def compare_trincas(contests, trinca1, trinca2, n_games=5, n_candidates=30000):
     for i, trinca in enumerate([trinca1, trinca2], 1):
         print(f"\n--- Trinca {i}: {trinca} ---")
         opt = PortfolioOptimizer(contests, fixed=list(trinca))
-        portfolio = opt.optimize(n_games, n_candidates, method='pair_covering')
+        portfolio = opt.optimize(n_games, n_candidates, method=method)
         
         # Backtest geral
         bt = opt.backtest(portfolio, contests[-200:])
@@ -440,18 +475,20 @@ def compare_trincas(contests, trinca1, trinca2, n_games=5, n_candidates=30000):
         # Backtest condicionado
         fixed_set = set(trinca)
         cond_draws = [c for c in contests if fixed_set.issubset(set(c['dezenas']))]
-        bt_cond = opt.backtest(portfolio, cond_draws)
-        print(f"   Condicionado ({len(cond_draws)} concursos): Lift={bt_cond['lift']:.2f}x | ROI={bt_cond['roi']:+.1f}%")
-        print(f"   11={bt_cond['hit_distribution'].get(11,0)} 12={bt_cond['hit_distribution'].get(12,0)} "
-              f"13={bt_cond['hit_distribution'].get(13,0)} 14={bt_cond['hit_distribution'].get(14,0)} 15={bt_cond['hit_distribution'].get(15,0)}")
+        if cond_draws:
+            bt_cond = opt.backtest(portfolio, cond_draws)
+            print(f"   Condicionado ({len(cond_draws)} concursos): Lift={bt_cond['lift']:.2f}x | ROI={bt_cond['roi']:+.1f}%")
+            print(f"   11={bt_cond['hit_distribution'].get(11,0)} 12={bt_cond['hit_distribution'].get(12,0)} "
+                  f"13={bt_cond['hit_distribution'].get(13,0)} 14={bt_cond['hit_distribution'].get(14,0)} 15={bt_cond['hit_distribution'].get(15,0)}")
 
 # ============================================================
 # WALK-FORWARD CONDICIONAL
 # ============================================================
 def walk_forward_conditional(contests, n_windows=8, train_size=400, test_size=50, n_games=5,
                              fixed=None, semifixed=None, min_semifixed=0, max_semifixed=None,
-                             allowed_pares=None, allowed_moldura=None, allowed_primos=None):
-    print(f"\n🔬 WALK-FORWARD CONDICIONAL ({n_windows} janelas)")
+                             allowed_pares=None, allowed_moldura=None, allowed_primos=None,
+                             method='pair_covering'):
+    print(f"\n🔬 WALK-FORWARD CONDICIONAL ({n_windows} janelas) | método: {method}")
     print(f"   Fixas: {fixed}")
     if semifixed: print(f"   Semifixas: {semifixed} ({min_semifixed} a {max_semifixed if max_semifixed else len(semifixed)})")
     
@@ -476,7 +513,7 @@ def walk_forward_conditional(contests, n_windows=8, train_size=400, test_size=50
         
         opt = PortfolioOptimizer(train_data, fixed, semifixed, min_semifixed, max_semifixed,
                                  allowed_pares, allowed_moldura, allowed_primos)
-        portfolio = opt.optimize(n_games, n_candidates=10000, method='pair_covering')
+        portfolio = opt.optimize(n_games, n_candidates=10000, method=method)
         bt = opt.backtest(portfolio, test_data)
         
         results.append({
@@ -498,8 +535,8 @@ def walk_forward_conditional(contests, n_windows=8, train_size=400, test_size=50
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v41")
-    print("   RANKING POR BACKTEST REAL + COBERTURA DE PARES")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v42")
+    print("   TESTE FORA DA AMOSTRA + COBERTURA DE TRIPLAS")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
@@ -510,12 +547,14 @@ def main():
 
     while True:
         print("\nOpções:")
-        print("1. Gerar carteira com dezenas fixas e semifixas")
+        print("1. Gerar carteira com fixas (pair ou triple covering)")
         print("2. Analisar frequência histórica das fixas")
         print("3. Walk‑forward condicional")
         print("4. Backtest nos últimos 200 concursos")
-        print("5. Buscar melhores fixas (backtest real)")
+        print("5. Buscar melhores fixas (out‑of‑sample)")
         print("6. Comparar duas trincas de fixas")
+        print("7. Comparar Pair vs Triple Covering")
+        print("8. Persistência temporal das dezenas")
         print("0. Sair")
         op = input("Escolha: ").strip()
         
@@ -543,6 +582,12 @@ def main():
                 except:
                     max_semi = len(semifixed)
             
+            print("\n📝 MÉTODO DE COBERTURA")
+            print("   1. Pair Covering (pares)")
+            print("   2. Triple Covering (triplas)")
+            metodo = input("   Escolha [1]: ").strip() or "1"
+            method = 'pair_covering' if metodo == '1' else 'triple_covering'
+            
             print("\n📝 FILTROS OPCIONAIS (ENTER para pular)")
             pares_str = input("   Pares (ex: 7 8 9): ").strip()
             moldura_str = input("   Moldura (ex: 9 10): ").strip()
@@ -553,7 +598,7 @@ def main():
             
             opt = PortfolioOptimizer(contests, fixed, semifixed, min_semi, max_semi,
                                      allowed_pares, allowed_moldura, allowed_primos)
-            portfolio = opt.optimize(5, 30000, method='pair_covering')
+            portfolio = opt.optimize(5, 30000, method=method)
             for i, g in enumerate(portfolio, 1):
                 p = sum(1 for x in g if x % 2 == 0)
                 pr = sum(1 for x in g if x in PRIMES)
@@ -626,16 +671,29 @@ def main():
                 except:
                     max_semi = len(semifixed)
             
+            print("\n📝 MÉTODO DE COBERTURA")
+            print("   1. Pair Covering")
+            print("   2. Triple Covering")
+            metodo = input("   Escolha [1]: ").strip() or "1"
+            method = 'pair_covering' if metodo == '1' else 'triple_covering'
+            
             walk_forward_conditional(contests, fixed=fixed, semifixed=semifixed,
-                                     min_semifixed=min_semi, max_semifixed=max_semi)
+                                     min_semifixed=min_semi, max_semifixed=max_semi,
+                                     method=method)
         
         elif op == '4':
             print("\n📝 DEFINIÇÃO DE DEZENAS FIXAS")
             fixed_str = input("   Dezenas fixas (ex: 15 16 19): ").strip()
             fixed = [int(x) for x in fixed_str.split()] if fixed_str else []
             
+            print("\n📝 MÉTODO DE COBERTURA")
+            print("   1. Pair Covering")
+            print("   2. Triple Covering")
+            metodo = input("   Escolha [1]: ").strip() or "1"
+            method = 'pair_covering' if metodo == '1' else 'triple_covering'
+            
             opt = PortfolioOptimizer(contests, fixed=fixed)
-            portfolio = opt.optimize(5, 30000, method='pair_covering')
+            portfolio = opt.optimize(5, 30000, method=method)
             bt = opt.backtest(portfolio, contests[-200:])
             print(f"\n🔬 BACKTEST (últimos 200):")
             print(f"   Lift={bt['lift']:.2f}x | ROI={bt['roi']:+.1f}%")
@@ -658,7 +716,18 @@ def main():
             except:
                 top_n = 20
             
-            search_best_fixed_real(contests, n_fixed, top_n)
+            try:
+                train_size = int(input(f"   Tamanho do treino (ex: 3500) [3500]: ").strip() or "3500")
+            except:
+                train_size = 3500
+            
+            print("\n📝 MÉTODO DE COBERTURA")
+            print("   1. Pair Covering")
+            print("   2. Triple Covering")
+            metodo = input("   Escolha [1]: ").strip() or "1"
+            method = 'pair_covering' if metodo == '1' else 'triple_covering'
+            
+            search_best_fixed_oos(contests, n_fixed, top_n, train_size, method=method)
         
         elif op == '6':
             print("\n📝 COMPARAÇÃO DE DUAS TRINCAS")
@@ -674,7 +743,25 @@ def main():
                 print("   Valores inválidos.")
                 continue
             
-            compare_trincas(contests, trinca1, trinca2)
+            print("\n📝 MÉTODO DE COBERTURA")
+            print("   1. Pair Covering")
+            print("   2. Triple Covering")
+            metodo = input("   Escolha [1]: ").strip() or "1"
+            method = 'pair_covering' if metodo == '1' else 'triple_covering'
+            
+            compare_trincas(contests, trinca1, trinca2, method=method)
+        
+        elif op == '7':
+            print("\n📝 COMPARAÇÃO DE MÉTODOS DE COBERTURA")
+            fixed_str = input("   Dezenas fixas (ex: 15 16 19 ou ENTER): ").strip()
+            fixed = [int(x) for x in fixed_str.split()] if fixed_str else None
+            compare_covering_methods(contests, fixed=fixed)
+        
+        elif op == '8':
+            print("\n📝 DEZENAS PARA ANÁLISE DE PERSISTÊNCIA")
+            dezenas_str = input("   Dezenas (ex: 10 11 13 14 20 ou ENTER para padrão): ").strip()
+            dezenas = [int(x) for x in dezenas_str.split()] if dezenas_str else None
+            analyze_temporal_persistence(contests, dezenas)
         
         elif op == '0':
             break
