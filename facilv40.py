@@ -2,30 +2,19 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v48
-COMPARAÇÃO LIMPA DE ESTRATÉGIAS PURAS EM WALK‑FORWARD
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v49
+TESTE DE SIGNIFICÂNCIA DA TRINCA (15,16,20) vs. TRINCAS ALEATÓRIAS
 
-ESTRATÉGIAS COMPARADAS:
-✅ Carteira A: 5 jogos totalmente aleatórios (baseline)
-✅ Carteira B: 5 jogos com Pair Covering (sem filtros)
-✅ Carteira C: 5 jogos com Triple Covering (sem filtros)
-✅ Carteira D: 5 jogos com trinca fixa (15,16,20) + Pair Covering (sem outros filtros)
-
-MÉTRICAS:
-- Lift médio por concurso
-- ROI médio
-- Total de 13 pontos
-- Total de 14 pontos
-
-VALIDADE:
-- Walk‑forward completo (treino 500, teste 50, passo 50)
-- Nenhuma filtragem estrutural adicional
-- Comparação direta contra baseline aleatório
+OBJETIVO:
+✅ Comparar a trinca 15‑16‑20 com 100 trincas aleatórias em walk‑forward
+✅ Medir quantos acertos de 14 pontos cada trinca produz
+✅ Análise detalhada dos dois concursos onde 15‑16‑20 fez 14 pontos
+✅ Determinar se a trinca é especial ou apenas teve sorte
 """
 
 import numpy as np
 from scipy.stats import hypergeom
-from collections import Counter
+from collections import Counter, defaultdict
 from itertools import combinations
 import os, random, time, warnings
 from math import comb
@@ -82,25 +71,19 @@ def load_all_contests(csv_file='resultados_lotofacil.csv'):
     return contests
 
 # ============================================================
-# GERADOR DE JOGOS (SIMPLES, SEM FILTROS)
+# GERADOR
 # ============================================================
 class LooseGenerator:
-    def __init__(self):
-        pass
-
     def generate_random(self):
-        """Gera um jogo completamente aleatório (15 dezenas distintas)."""
         return sorted(np.random.choice(range(1, 26), 15, replace=False))
-
     def generate_with_fixed(self, fixed):
-        """Gera um jogo que contém as dezenas fixas, completando com aleatórias."""
         fixed_set = set(fixed)
         restantes = list(set(range(1, 26)) - fixed_set)
         complemento = np.random.choice(restantes, 15 - len(fixed_set), replace=False)
         return sorted(fixed_set | set(complemento))
 
 # ============================================================
-# OTIMIZADOR DE CARTEIRAS (COBERTURA PURA)
+# OTIMIZADOR DE CARTEIRA (PAIR COVERING)
 # ============================================================
 class PortfolioOptimizer:
     def __init__(self, contests):
@@ -108,7 +91,6 @@ class PortfolioOptimizer:
         self.generator = LooseGenerator()
 
     def generate_pool(self, n_candidates, fixed=None):
-        """Gera um pool de jogos aleatórios (com fixas opcionais)."""
         pool = []
         seen = set()
         for _ in range(n_candidates):
@@ -123,7 +105,6 @@ class PortfolioOptimizer:
         return pool
 
     def select_pair_covering(self, candidates, n_select):
-        """Seleciona n_select jogos maximizando a cobertura de pares distintos."""
         if len(candidates) < n_select:
             raise ValueError(f"Pool insuficiente: {len(candidates)} < {n_select}")
         covered = set()
@@ -145,129 +126,148 @@ class PortfolioOptimizer:
             covered.update(combinations(sorted(candidates[best_idx]), 2))
         return selected
 
-    def select_triple_covering(self, candidates, n_select):
-        """Seleciona n_select jogos maximizando a cobertura de triplas distintas."""
-        if len(candidates) < n_select:
-            raise ValueError(f"Pool insuficiente: {len(candidates)} < {n_select}")
-        covered = set()
-        selected = []
-        for _ in range(n_select):
-            best_idx = -1
-            best_new = -1
-            for i, c in enumerate(candidates):
-                if c in selected:
-                    continue
-                triples = set(combinations(sorted(c), 3))
-                new_triples = len(triples - covered)
-                if new_triples > best_new:
-                    best_new = new_triples
-                    best_idx = i
-            if best_idx == -1:
-                break
-            selected.append(candidates[best_idx])
-            covered.update(combinations(sorted(candidates[best_idx]), 3))
-        return selected
-
     def backtest(self, portfolio, test_draws):
-        """Calcula métricas de desempenho da carteira nos concursos de teste."""
         n_success = total_premio = 0
         total_custo = len(portfolio) * len(test_draws) * CUSTO_APOSTA
         portfolio_masks = np.array([BITMASK_CACHE.get_mask(g) for g in portfolio], dtype=np.uint32)
         hit_counts = {k:0 for k in range(11,16)}
-        for draw in test_draws:
+        best_per_draw = {}  # guarda o melhor jogo para cada concurso
+        for idx, draw in enumerate(test_draws):
             dm = BITMASK_CACHE.get_mask(draw['dezenas'])
-            for pm in portfolio_masks:
+            best_hit = 0
+            best_game = None
+            for i, pm in enumerate(portfolio_masks):
                 hits = mask_intersection(pm, dm)
+                if hits > best_hit:
+                    best_hit = hits
+                    best_game = portfolio[i]
                 if hits >= 11:
                     n_success += 1
                     total_premio += PREMIO_VALORES.get(hits, 0)
                     hit_counts[hits] += 1
+            if best_hit >= 14:
+                best_per_draw[draw['concurso']] = (best_hit, best_game)
         prob = n_success / (len(portfolio) * len(test_draws)) if test_draws else 0
         p_single = sum(HYPE_PROBS[k] for k in range(11,16))
         theo_prob = 1 - (1 - p_single) ** len(portfolio)
         lift = prob / theo_prob if theo_prob > 0 else 1.0
         roi = (total_premio - total_custo) / total_custo * 100 if total_custo > 0 else 0
-        return {'lift': lift, 'roi': roi, 'hit_counts': hit_counts}
+        return {'lift': lift, 'roi': roi, 'hit_counts': hit_counts, 'best_per_draw': best_per_draw}
 
 # ============================================================
-# WALK‑FORWARD COMPARATIVO
+# WALK‑FORWARD PARA UMA TRINCA
 # ============================================================
-def walk_forward_comparison(contests, train_size=500, test_size=50, step=50, n_games=5):
-    """
-    Executa walk‑forward para 4 estratégias:
-    A: Aleatório
-    B: Pair Covering
-    C: Triple Covering
-    D: Trinca fixa (15,16,20) + Pair Covering
-    """
-    strategies = {
-        'A (Aleatório)': {'method': 'random', 'fixed': None},
-        'B (Pair Covering)': {'method': 'pair_covering', 'fixed': None},
-        'C (Triple Covering)': {'method': 'triple_covering', 'fixed': None},
-        'D (Fixas 15,16,20 + Pair)': {'method': 'pair_covering', 'fixed': [15, 16, 20]},
-    }
-
-    results = {name: {'lift': [], 'roi': [], '13pts': [], '14pts': []} for name in strategies}
-
+def walk_forward_single_trinca(contests, trinca, train_size=500, test_size=50, step=50, n_games=5):
+    """Retorna total de 14pts, lista de concursos com 14pts e detalhes."""
+    total_14 = 0
+    detalhes_14 = []  # (concurso, jogo vencedor, dezenas sorteadas)
     start = train_size
     while start + test_size <= len(contests):
-        train_data = contests[start - train_size:start]
-        test_data = contests[start:start + test_size]
-
+        train_data = contests[start-train_size:start]
+        test_data = contests[start:start+test_size]
         opt = PortfolioOptimizer(train_data)
-
-        for name, cfg in strategies.items():
-            try:
-                if cfg['method'] == 'random':
-                    # Carteira aleatória pura
-                    portfolio = [opt.generator.generate_random() for _ in range(n_games)]
-                elif cfg['method'] == 'pair_covering':
-                    pool = opt.generate_pool(2000, fixed=cfg['fixed'])
-                    portfolio = opt.select_pair_covering(pool, n_games)
-                elif cfg['method'] == 'triple_covering':
-                    pool = opt.generate_pool(2000, fixed=cfg['fixed'])
-                    portfolio = opt.select_triple_covering(pool, n_games)
-                else:
-                    continue
-
-                bt = opt.backtest(portfolio, test_data)
-                results[name]['lift'].append(bt['lift'])
-                results[name]['roi'].append(bt['roi'])
-                results[name]['13pts'].append(bt['hit_counts'].get(13, 0))
-                results[name]['14pts'].append(bt['hit_counts'].get(14, 0))
-            except Exception as e:
-                # Em caso de erro (ex.: pool insuficiente), registrar como zero
-                results[name]['lift'].append(0)
-                results[name]['roi'].append(0)
-                results[name]['13pts'].append(0)
-                results[name]['14pts'].append(0)
-
+        try:
+            pool = opt.generate_pool(2000, fixed=list(trinca))
+            portfolio = opt.select_pair_covering(pool, n_games)
+            bt = opt.backtest(portfolio, test_data)
+            count_14 = bt['hit_counts'].get(14, 0)
+            total_14 += count_14
+            # Guardar detalhes dos concursos com 14 pontos
+            for concurso, (hits, game) in bt['best_per_draw'].items():
+                # Encontrar as dezenas sorteadas
+                draw = next(d for d in test_data if d['concurso'] == concurso)
+                detalhes_14.append({
+                    'concurso': concurso,
+                    'dezenas_sorteadas': draw['dezenas'],
+                    'jogo_vencedor': game,
+                    'hits': hits,
+                    'trinca_presente': sum(1 for d in trinca if d in game)
+                })
+        except Exception as e:
+            pass
         start += step
+    return total_14, detalhes_14
 
-    # Exibir resultados comparativos
+# ============================================================
+# TESTE PRINCIPAL
+# ============================================================
+def test_trinca_significance(contests, n_random_trincas=100):
     print("\n" + "="*70)
-    print("📊 RESULTADOS DO WALK‑FORWARD (COMPARAÇÃO LIMPA)")
+    print("🔬 TESTE DE SIGNIFICÂNCIA DA TRINCA (15,16,20)")
     print("="*70)
-    print(f"{'Estratégia':<30} {'Lift Médio':<12} {'ROI Médio':<12} {'13pts Total':<12} {'14pts Total':<12}")
-    print("-"*70)
-    for name in strategies:
-        lifts = results[name]['lift']
-        rois = results[name]['roi']
-        total_13 = sum(results[name]['13pts'])
-        total_14 = sum(results[name]['14pts'])
-        avg_lift = np.mean(lifts) if lifts else 0
-        avg_roi = np.mean(rois) if rois else 0
-        print(f"{name:<30} {avg_lift:<12.3f} {avg_roi:<12.1f}% {total_13:<12} {total_14:<12}")
+    print(f"   Comparando contra {n_random_trincas} trincas aleatórias em walk‑forward")
+    print("   (Treino 500, Teste 50, Passo 50)\n")
 
-    return results
+    # 1. Testar a trinca 15-16-20
+    print("Testando trinca (15,16,20)...")
+    t0 = time.time()
+    count_15_16_20, detalhes_15_16_20 = walk_forward_single_trinca(contests, (15,16,20))
+    print(f"   ✅ 14 pontos obtidos: {count_15_16_20} (tempo: {time.time()-t0:.1f}s)")
+
+    # 2. Gerar n_random_trincas trincas aleatórias (sem repetir a original)
+    todas_trincas = list(combinations(range(1, 26), 3))
+    # Remover a trinca original se estiver presente
+    if (15,16,20) in todas_trincas:
+        todas_trincas.remove((15,16,20))
+    random.shuffle(todas_trincas)
+    trincas_aleatorias = todas_trincas[:n_random_trincas]
+
+    resultados_aleatorios = []
+    print(f"\nTestando {n_random_trincas} trincas aleatórias...")
+    for i, trinca in enumerate(tqdm(trincas_aleatorias, desc="Progresso"), 1):
+        total_14, _ = walk_forward_single_trinca(contests, trinca)
+        resultados_aleatorios.append(total_14)
+
+    # 3. Análise estatística
+    resultados_aleatorios = np.array(resultados_aleatorios)
+    media_aleatoria = np.mean(resultados_aleatorios)
+    std_aleatoria = np.std(resultados_aleatorios)
+    pct_rank = np.mean(resultados_aleatorios <= count_15_16_20) * 100  # percentil
+
+    print("\n" + "="*70)
+    print("📊 RESULTADOS DA COMPARAÇÃO")
+    print("="*70)
+    print(f"   Trinca (15,16,20): {count_15_16_20} acertos de 14 pontos")
+    print(f"   Média das aleatórias: {media_aleatoria:.2f}")
+    print(f"   Desvio padrão das aleatórias: {std_aleatoria:.2f}")
+    print(f"   Mínimo / Máximo: {resultados_aleatorios.min()} / {resultados_aleatorios.max()}")
+    print(f"   Percentil da trinca (15,16,20): {pct_rank:.1f}%")
+    if pct_rank >= 95:
+        print("   🔍 Resultado no top 5% — possível sinal.")
+    elif pct_rank >= 80:
+        print("   📊 Acima da média, mas não extremo.")
+    else:
+        print("   📊 Desempenho dentro do esperado ao acaso.")
+
+    # 4. Análise detalhada dos concursos com 14 pontos
+    if detalhes_15_16_20:
+        print("\n" + "="*70)
+        print("🔎 ANÁLISE DOS CONCURSOS COM 14 PONTOS (TRINCA 15,16,20)")
+        print("="*70)
+        for d in detalhes_15_16_20:
+            print(f"\n   Concurso {d['concurso']}:")
+            print(f"   Dezenas sorteadas: {d['dezenas_sorteadas']}")
+            print(f"   Jogo vencedor:    {d['jogo_vencedor']}")
+            print(f"   Acertos: {d['hits']}")
+            print(f"   Dezenas da trinca no jogo: {d['trinca_presente']}/3")
+            # Verificar quantas da trinca estavam no sorteio
+            trinca_set = set((15,16,20))
+            acertou_trinca = trinca_set.issubset(set(d['dezenas_sorteadas']))
+            print(f"   A trinca inteira estava no sorteio? {'Sim' if acertou_trinca else 'Não'}")
+            # Jogo sem a trinca: quantas seriam substituídas?
+            jogo_sem_trinca = [x for x in d['jogo_vencedor'] if x not in trinca_set]
+            print(f"   Jogo sem as fixas: {len(jogo_sem_trinca)} dezenas restantes: {jogo_sem_trinca[:5]}...")
+
+    print("\n✅ Teste concluído.")
+    return count_15_16_20, media_aleatoria, pct_rank, detalhes_15_16_20
 
 # ============================================================
 # INTERFACE PRINCIPAL
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v48")
-    print("   COMPARAÇÃO LIMPA DE ESTRATÉGIAS PURAS")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v49")
+    print("   TESTE DE SIGNIFICÂNCIA DA TRINCA (15,16,20)")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
@@ -276,15 +276,9 @@ def main():
     print(f"\n📂 {len(contests)} concursos")
     print(f"📌 Último: {contests[-1]['concurso']} - {contests[-1]['dezenas']}")
 
-    print("\nIniciando walk‑forward comparativo...")
-    print("   (Treino 500, Teste 50, Passo 50)")
-    results = walk_forward_comparison(contests)
-
-    print("\n✅ Walk‑forward concluído.")
-    print("\n🔍 Interpretação:")
-    print("   A estratégia com maior lift (acima de 1.0) seria a mais eficiente.")
-    print("   Valores de lift abaixo de 1.0 indicam desempenho pior que o aleatório teórico.")
-    print("   Observe também o total de 13 e 14 pontos para avaliar capacidade de acertos altos.")
+    # Número de trincas aleatórias (pode ser ajustado)
+    n_random = 100
+    test_trinca_significance(contests, n_random)
 
 if __name__ == "__main__":
     main()
