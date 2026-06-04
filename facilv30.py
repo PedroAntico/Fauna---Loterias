@@ -2,16 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v46
-STRUCTURAL PREDICTOR + TESTE DE REVERSÃO/TENDÊNCIA + SIGNIFICÂNCIA
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v47
+CONTROLE MONTE CARLO + TESTE CONCURSO A CONCURSO + WALK‑FORWARD DO PREDITOR
 
-EVOLUÇÃO DO v45:
-✅ Teste de duas estratégias: reversão e tendência
-✅ Múltiplos tamanhos de bloco (50, 100, 200, 500)
-✅ Significância estatística (p-value via binomial)
-✅ StructuralPredictor: previsão de faixas para filtros estruturais
-✅ Geração de pool condicionada às faixas previstas
-✅ Mantém cobertura, walk‑forward, busca OOS
+EVOLUÇÃO DO v46:
+✅ Opção 10: Controle Monte Carlo (baseline aleatório)
+✅ Opção 11: Teste preditivo concurso a concurso
+✅ Opção 12: Walk‑forward do Structural Predictor
+✅ Ranking com comparação real vs. simulado
+✅ Mantém cobertura, busca OOS, fixas, semifixas
 """
 
 import numpy as np
@@ -75,7 +74,7 @@ def load_all_contests(csv_file='resultados_lotofacil.csv'):
     return contests
 
 # ============================================================
-# GERADOR COM FIXAS E SEMIFIXAS
+# GERADOR COM FIXAS, SEMIFIXAS E FAIXAS
 # ============================================================
 class LooseGenerator:
     def __init__(self):
@@ -140,7 +139,6 @@ class LooseGenerator:
             if len(game) != 15:
                 continue
             
-            # Filtros por lista (valores exatos)
             if allowed_pares is not None:
                 if sum(1 for x in game if x % 2 == 0) not in allowed_pares:
                     continue
@@ -151,7 +149,6 @@ class LooseGenerator:
                 if sum(1 for x in game if x in PRIMES) not in allowed_primos:
                     continue
             
-            # Filtros por faixa (range)
             pares = sum(1 for x in game if x % 2 == 0)
             mol = sum(1 for x in game if x in MOLDURA)
             prim = sum(1 for x in game if x in PRIMES)
@@ -305,33 +302,33 @@ class PortfolioOptimizer:
                 'hit_distribution': hit_counts}
 
 # ============================================================
-# RANKING DE PODER PREDITIVO (VERSÃO ROBUSTA)
+# FUNÇÕES DE EXTRAÇÃO DE FILTROS
+# ============================================================
+def extract_filter(dezenas, filter_name):
+    d = sorted(dezenas)
+    if filter_name == 'pares':
+        return sum(1 for x in d if x % 2 == 0)
+    elif filter_name == 'moldura':
+        return sum(1 for x in d if x in MOLDURA)
+    elif filter_name == 'primos':
+        return sum(1 for x in d if x in PRIMES)
+    elif filter_name == 'soma':
+        return sum(d)
+    elif filter_name == 'consecutivos':
+        return sum(1 for i in range(len(d)-1) if d[i+1]-d[i] == 1)
+    elif filter_name == 'amplitude':
+        return max(d) - min(d)
+    return 0
+
+# ============================================================
+# RANKING DE PODER PREDITIVO (COM BASELINE MONTE CARLO)
 # ============================================================
 class PredictiveRanking:
     def __init__(self, contests):
         self.contests = contests
     
-    def _extract_filter(self, dezenas, filter_name):
-        d = sorted(dezenas)
-        if filter_name == 'pares':
-            return sum(1 for x in d if x % 2 == 0)
-        elif filter_name == 'moldura':
-            return sum(1 for x in d if x in MOLDURA)
-        elif filter_name == 'primos':
-            return sum(1 for x in d if x in PRIMES)
-        elif filter_name == 'soma':
-            return sum(d)
-        elif filter_name == 'consecutivos':
-            return sum(1 for i in range(len(d)-1) if d[i+1]-d[i] == 1)
-        elif filter_name == 'amplitude':
-            return max(d) - min(d)
-        return 0
-    
     def rank_predictive_power(self, block_sizes=None):
-        """
-        Testa reversão e tendência para múltiplos tamanhos de bloco.
-        Calcula significância via teste binomial.
-        """
+        """Testa reversão e tendência para múltiplos tamanhos de bloco."""
         if block_sizes is None:
             block_sizes = [50, 100, 200, 500]
         
@@ -344,24 +341,16 @@ class PredictiveRanking:
             print("-" * 60)
             
             for filtro in filters:
-                # Extrair série
-                series = []
-                for c in self.contests:
-                    series.append(self._extract_filter(c['dezenas'], filtro))
-                series = np.array(series, dtype=float)
+                series = np.array([extract_filter(c['dezenas'], filtro) for c in self.contests], dtype=float)
                 
                 n_blocos = len(series) // block_size
                 if n_blocos < 3:
                     continue
                 
-                # Dividir em blocos independentes
                 blocos = []
                 for i in range(n_blocos):
-                    start = i * block_size
-                    end = start + block_size
-                    blocos.append(series[start:end])
+                    blocos.append(series[i*block_size:(i+1)*block_size])
                 
-                # Testar duas estratégias: reversão e tendência
                 for strategy in ['reversao', 'tendencia']:
                     acertos = 0
                     total_testes = 0
@@ -374,15 +363,7 @@ class PredictiveRanking:
                         total_testes += 1
                         
                         if strategy == 'reversao':
-                            # Se está acima da média, deve cair
                             predicted_down = mean_prev > historical_mean
-                        else:  # tendencia
-                            # Se está acima da média, continua acima
-                            predicted_down = mean_prev > historical_mean
-                            # Na tendência, prevemos que continua na mesma direção
-                            predicted_down = not predicted_down
-                        
-                        if strategy == 'reversao':
                             if predicted_down and mean_curr < mean_prev:
                                 acertos += 1
                             elif not predicted_down and mean_curr > mean_prev:
@@ -394,50 +375,23 @@ class PredictiveRanking:
                                 acertos += 1
                     
                     accuracy = acertos / total_testes * 100 if total_testes > 0 else 0
+                    p_value = binomtest(acertos, total_testes, 0.5, alternative='greater').pvalue if total_testes > 0 else 1.0
                     
-                    # Significância (teste binomial contra 50%)
-                    if total_testes > 0:
-                        p_value = binomtest(acertos, total_testes, 0.5, alternative='greater').pvalue
-                    else:
-                        p_value = 1.0
-                    
-                    key = (filtro, strategy, block_size)
-                    all_results[key] = {
-                        'accuracy': accuracy,
-                        'acertos': acertos,
-                        'total': total_testes,
-                        'p_value': p_value
+                    all_results[(filtro, strategy, block_size)] = {
+                        'accuracy': accuracy, 'acertos': acertos, 'total': total_testes, 'p_value': p_value
                     }
                     
                     sig = "🔍" if p_value < 0.05 else ("📊" if p_value < 0.15 else "  ")
                     print(f"{filtro:<15} {strategy:<12} {accuracy:<10.1f}% {acertos}/{total_testes:<10} {p_value:<10.4f} {sig}")
         
-        # Resumo final: melhor estratégia por filtro
-        print(f"\n📊 RESUMO: MELHOR ESTRATÉGIA POR FILTRO")
-        print(f"{'Filtro':<15} {'Melhor Est.':<12} {'Precisão':<10} {'Bloco':<10} {'p-value':<10}")
-        print("-" * 60)
-        for filtro in filters:
-            best = None
-            best_acc = 0
-            for key, res in all_results.items():
-                if key[0] == filtro and res['accuracy'] > best_acc:
-                    best = key
-                    best_acc = res['accuracy']
-            if best:
-                res = all_results[best]
-                sig = "🔍" if res['p_value'] < 0.05 else ""
-                print(f"{filtro:<15} {best[1]:<12} {res['accuracy']:<10.1f}% {best[2]:<10} {res['p_value']:<10.4f} {sig}")
-        
         return all_results
     
     def rank_dezenas_individual(self, block_sizes=None):
-        """Testa poder preditivo das 25 dezenas individuais."""
+        """Testa poder preditivo das 25 dezenas."""
         if block_sizes is None:
             block_sizes = [100, 200, 500]
         
         print(f"\n📊 PODER PREDITIVO DAS 25 DEZENAS")
-        
-        results = {}
         for block_size in block_sizes:
             accuracies = []
             for dezena in range(1, 26):
@@ -446,104 +400,186 @@ class PredictiveRanking:
                 if n_blocos < 3:
                     continue
                 
-                blocos = []
-                for i in range(n_blocos):
-                    blocos.append(series[i*block_size:(i+1)*block_size])
-                
+                blocos = [series[i*block_size:(i+1)*block_size] for i in range(n_blocos)]
                 acertos = 0
                 total = 0
                 for i in range(1, len(blocos)):
                     freq_prev = np.mean(blocos[i-1])
                     freq_curr = np.mean(blocos[i])
                     freq_hist = np.mean(series[:i*block_size])
-                    
                     total += 1
-                    # Estratégia de reversão (mais comum)
                     if freq_prev > freq_hist and freq_curr < freq_prev:
                         acertos += 1
                     elif freq_prev < freq_hist and freq_curr > freq_prev:
                         acertos += 1
-                
                 if total > 0:
                     accuracies.append(acertos / total * 100)
             
             if accuracies:
-                avg_acc = np.mean(accuracies)
-                best_dezena = np.argmax(accuracies) + 1
-                worst_dezena = np.argmin(accuracies) + 1
-                print(f"\n   Bloco {block_size}: média={avg_acc:.1f}%, melhor={best_dezena} ({max(accuracies):.1f}%), pior={worst_dezena} ({min(accuracies):.1f}%)")
+                print(f"\n   Bloco {block_size}: média={np.mean(accuracies):.1f}%, "
+                      f"melhor={np.argmax(accuracies)+1} ({max(accuracies):.1f}%), "
+                      f"pior={np.argmin(accuracies)+1} ({min(accuracies):.1f}%)")
         
-        return results
+        return None
 
 # ============================================================
-# STRUCTURAL PREDICTOR (NOVO v46)
+# CONTROLE MONTE CARLO (NOVO v47)
+# ============================================================
+def monte_carlo_control(contests, n_simulations=100, block_sizes=None):
+    """
+    Gera n_simulations séries aleatórias de mesmo tamanho que contests,
+    executa o ranking de poder preditivo e compara com o resultado real.
+    """
+    if block_sizes is None:
+        block_sizes = [50, 100, 200]
+    
+    n_concursos = len(contests)
+    print(f"\n🎲 CONTROLE MONTE CARLO")
+    print(f"   Simulações: {n_simulations}")
+    print(f"   Cada simulação: {n_concursos} concursos puramente aleatórios")
+    print(f"   Blocos testados: {block_sizes}\n")
+    
+    # Executar no dataset real primeiro
+    ranker_real = PredictiveRanking(contests)
+    real_results = ranker_real.rank_predictive_power(block_sizes)
+    
+    # Agregar resultados reais por bloco e estratégia
+    real_summary = {}
+    for (filtro, strategy, block_size), res in real_results.items():
+        key = (filtro, strategy, block_size)
+        real_summary[key] = res['accuracy']
+    
+    # Executar nas simulações
+    sim_accuracies = defaultdict(list)
+    
+    for sim in tqdm(range(n_simulations), desc="Simulações Monte Carlo"):
+        # Gerar concursos aleatórios
+        sim_contests = []
+        for _ in range(n_concursos):
+            sim_contests.append({'dezenas': sorted(np.random.choice(range(1, 26), 15, replace=False))})
+        
+        ranker_sim = PredictiveRanking(sim_contests)
+        sim_results = ranker_sim.rank_predictive_power(block_sizes)
+        
+        for (filtro, strategy, block_size), res in sim_results.items():
+            key = (filtro, strategy, block_size)
+            sim_accuracies[key].append(res['accuracy'])
+    
+    # Comparar
+    print(f"\n📊 COMPARAÇÃO REAL vs. MONTE CARLO:")
+    print(f"{'Filtro':<15} {'Estratégia':<12} {'Bloco':<8} {'Real':<10} {'MC Médio':<10} {'MC Std':<10} {'Diferença':<10} {'p-value':<10}")
+    print("-" * 90)
+    
+    for key, real_acc in sorted(real_summary.items(), key=lambda x: x[1], reverse=True):
+        filtro, strategy, block_size = key
+        sim_accs = sim_accuracies.get(key, [])
+        if not sim_accs:
+            continue
+        
+        mean_sim = np.mean(sim_accs)
+        std_sim = np.std(sim_accs)
+        diff = real_acc - mean_sim
+        
+        # p-value empírico: quantas simulações superaram o real?
+        p_emp = np.mean(np.array(sim_accs) >= real_acc)
+        
+        sig = "🔍" if p_emp < 0.05 else ""
+        print(f"{filtro:<15} {strategy:<12} {block_size:<8} {real_acc:<10.1f}% {mean_sim:<10.1f}% {std_sim:<10.1f} {diff:<10.1f}% {p_emp:<10.4f} {sig}")
+    
+    print(f"\n🔍 Interpretação:")
+    print(f"   Se 'Diferença' for pequena e p-value > 0.05, o resultado real é compatível com aleatoriedade.")
+    print(f"   Se 'Diferença' for grande e p-value < 0.05, há evidência de sinal preditivo genuíno.")
+    
+    return real_summary, sim_accuracies
+
+# ============================================================
+# TESTE CONCURSO A CONCURSO (NOVO v47)
+# ============================================================
+def test_concurso_a_concurso(contests, min_history=200):
+    """
+    Para cada concurso a partir de min_history, usa o histórico anterior
+    para prever o próximo concurso (apenas 1) e verifica se acertou.
+    """
+    print(f"\n🎯 TESTE CONCURSO A CONCURSO")
+    print(f"   Histórico mínimo: {min_history}")
+    print(f"   Testes: {len(contests) - min_history - 1} previsões\n")
+    
+    filters = ['pares', 'moldura', 'primos', 'consecutivos', 'amplitude']
+    
+    for filtro in filters:
+        series = np.array([extract_filter(c['dezenas'], filtro) for c in contests], dtype=float)
+        
+        acertos_reversao = 0
+        acertos_tendencia = 0
+        total = 0
+        
+        for t in range(min_history, len(contests) - 1):
+            history = series[:t+1]
+            current_val = series[t]
+            next_val = series[t+1]
+            
+            mean_short = np.mean(history[-20:]) if len(history) >= 20 else np.mean(history)
+            mean_long = np.mean(history)
+            
+            total += 1
+            
+            # Previsão por reversão
+            if mean_short > mean_long:
+                pred_rev_down = True
+            else:
+                pred_rev_down = False
+            
+            if pred_rev_down and next_val < current_val:
+                acertos_reversao += 1
+            elif not pred_rev_down and next_val > current_val:
+                acertos_reversao += 1
+            
+            # Previsão por tendência
+            if mean_short > mean_long and next_val > current_val:
+                acertos_tendencia += 1
+            elif mean_short < mean_long and next_val < current_val:
+                acertos_tendencia += 1
+        
+        acc_rev = acertos_reversao / total * 100 if total > 0 else 0
+        acc_tend = acertos_tendencia / total * 100 if total > 0 else 0
+        
+        p_rev = binomtest(acertos_reversao, total, 0.5, alternative='greater').pvalue if total > 0 else 1.0
+        p_tend = binomtest(acertos_tendencia, total, 0.5, alternative='greater').pvalue if total > 0 else 1.0
+        
+        print(f"{filtro:<15}: Reversão={acc_rev:.1f}% ({acertos_reversao}/{total}, p={p_rev:.4f}) | "
+              f"Tendência={acc_tend:.1f}% ({acertos_tendencia}/{total}, p={p_tend:.4f})")
+
+# ============================================================
+# STRUCTURAL PREDICTOR (MANTIDO)
 # ============================================================
 class StructuralPredictor:
     def __init__(self, contests):
         self.contests = contests
-        self.filters = {
-            'pares': {'min': 3, 'max': 12, 'typical': (6, 9)},
-            'moldura': {'min': 6, 'max': 15, 'typical': (8, 11)},
-            'primos': {'min': 2, 'max': 9, 'typical': (4, 7)},
-            'soma': {'min': 120, 'max': 270, 'typical': (170, 220)},
-            'amplitude': {'min': 10, 'max': 24, 'typical': (20, 24)},
-            'consecutivos': {'min': 0, 'max': 12, 'typical': (4, 8)},
-        }
     
     def predict_ranges(self, method='recent'):
-        """
-        Prediz faixas para os filtros estruturais.
-        method: 'recent' (últimos 50 concursos), 'ipe' (tendência via IPE)
-        """
         print(f"\n🔮 STRUCTURAL PREDICTOR (método: {method})")
-        
+        filters_info = {
+            'pares': {'min': 3, 'max': 12}, 'moldura': {'min': 6, 'max': 15},
+            'primos': {'min': 2, 'max': 9}, 'soma': {'min': 120, 'max': 270},
+            'amplitude': {'min': 10, 'max': 24}, 'consecutivos': {'min': 0, 'max': 12}
+        }
         ranges = {}
         
-        for filtro, info in self.filters.items():
-            # Extrair série
-            series = []
-            for c in self.contests:
-                d = c['dezenas']
-                if filtro == 'pares':
-                    val = sum(1 for x in d if x % 2 == 0)
-                elif filtro == 'moldura':
-                    val = sum(1 for x in d if x in MOLDURA)
-                elif filtro == 'primos':
-                    val = sum(1 for x in d if x in PRIMES)
-                elif filtro == 'soma':
-                    val = sum(d)
-                elif filtro == 'consecutivos':
-                    val = sum(1 for i in range(len(d)-1) if d[i+1]-d[i] == 1)
-                elif filtro == 'amplitude':
-                    val = max(d) - min(d)
-                else:
-                    val = 0
-                series.append(val)
-            series = np.array(series, dtype=float)
+        for filtro, info in filters_info.items():
+            series = np.array([extract_filter(c['dezenas'], filtro) for c in self.contests], dtype=float)
             
             if method == 'recent':
-                # Usa média e desvio dos últimos 50 concursos
                 recent = series[-50:]
                 mean_val = np.mean(recent)
                 std_val = np.std(recent)
-                
                 low = max(info['min'], int(mean_val - std_val))
                 high = min(info['max'], int(mean_val + std_val) + 1)
                 ranges[filtro] = (low, high)
-                
-                print(f"   {filtro:<15}: [{low}, {high}] (média recente={mean_val:.1f})")
-            
+                print(f"   {filtro:<15}: [{low}, {high}] (média={mean_val:.1f})")
             elif method == 'ipe':
-                # Usa IPE: frequência curta vs longa
                 freq_short = np.mean(series[-20:])
                 freq_long = np.mean(series[-500:]) if len(series) >= 500 else np.mean(series)
-                
-                if freq_long > 0:
-                    ipe = (freq_short - freq_long) / freq_long * 100
-                else:
-                    ipe = 0.0
-                
-                # Se IPE positivo (aquecido), espera reversão (diminuir)
+                ipe = (freq_short - freq_long) / freq_long * 100 if freq_long > 0 else 0.0
                 if ipe > 5:
                     predicted = max(info['min'], int(freq_long))
                     ranges[filtro] = (predicted - 1, predicted + 1)
@@ -551,28 +587,67 @@ class StructuralPredictor:
                     predicted = min(info['max'], int(freq_long) + 1)
                     ranges[filtro] = (predicted - 1, predicted + 1)
                 else:
-                    # Neutro: usa intervalo típico
-                    ranges[filtro] = info['typical']
-                
+                    ranges[filtro] = (int(freq_long) - 1, int(freq_long) + 1)
                 print(f"   {filtro:<15}: {ranges[filtro]} (IPE={ipe:+.1f}%)")
         
         return ranges
 
 # ============================================================
-# SUGESTÃO AUTOMÁTICA (mantida e melhorada)
+# WALK‑FORWARD DO STRUCTURAL PREDICTOR (NOVO v47)
 # ============================================================
-def suggest_from_structural_predictor(contests):
-    """Sugere fixas e filtros baseado no StructuralPredictor."""
-    predictor = StructuralPredictor(contests)
-    ranges = predictor.predict_ranges(method='recent')
+def walk_forward_structural(contests, train_size=500, test_size=50, step=50):
+    """
+    Walk‑forward usando o Structural Predictor para gerar faixas
+    e otimizar a carteira.
+    """
+    print(f"\n🔬 WALK‑FORWARD DO STRUCTURAL PREDICTOR")
+    print(f"   Treino: {train_size}, Teste: {test_size}, Passo: {step}")
     
-    # Usar trinca fixa que já mostrou bom desempenho
-    fixed = [15, 16, 20]
-    print(f"\n💡 SUGESTÃO AUTOMÁTICA:")
-    print(f"   Fixas: {fixed}")
-    print(f"   Faixas estruturais: {ranges}")
+    results = []
+    start = train_size
+    while start + test_size <= len(contests):
+        train_data = contests[start-train_size:start]
+        test_data = contests[start:start+test_size]
+        
+        # Usar o Structural Predictor no treino
+        predictor = StructuralPredictor(train_data)
+        ranges = predictor.predict_ranges(method='recent')
+        
+        # Gerar carteira
+        opt = PortfolioOptimizer(train_data,
+                                 range_pares=ranges.get('pares'),
+                                 range_moldura=ranges.get('moldura'),
+                                 range_primos=ranges.get('primos'),
+                                 range_soma=ranges.get('soma'),
+                                 range_amplitude=ranges.get('amplitude'),
+                                 range_consecutivos=ranges.get('consecutivos'))
+        
+        try:
+            portfolio = opt.optimize(5, 10000, method='pair_covering')
+            bt = opt.backtest(portfolio, test_data)
+            
+            results.append({
+                'start': start,
+                'lift': bt['lift'],
+                'roi': bt['roi'],
+                '14pts': bt['hit_distribution'].get(14, 0),
+                '13pts': bt['hit_distribution'].get(13, 0),
+            })
+            print(f"   Janela {start}: lift={bt['lift']:.3f} | ROI={bt['roi']:+.1f}% | "
+                  f"13pts={bt['hit_distribution'].get(13,0)} 14pts={bt['hit_distribution'].get(14,0)}")
+        except Exception as e:
+            print(f"   Janela {start}: ERRO - {e}")
+        
+        start += step
     
-    return fixed, ranges
+    if results:
+        print(f"\n📊 RESUMO:")
+        print(f"   Média lift: {np.mean([r['lift'] for r in results]):.3f}")
+        print(f"   Média ROI: {np.mean([r['roi'] for r in results]):.1f}%")
+        print(f"   Total 13pts: {sum(r['13pts'] for r in results)}")
+        print(f"   Total 14pts: {sum(r['14pts'] for r in results)}")
+    
+    return results
 
 # ============================================================
 # BUSCA OOS E COMPARAÇÕES (mantidas)
@@ -583,8 +658,7 @@ def search_best_fixed_oos(contests, n_fixed=3, top_n=20, train_size=3500, n_game
     test_data = contests[train_size:]
     
     candidates = []
-    all_combos = list(combinations(range(1, 26), n_fixed))
-    for fixed_tuple in tqdm(all_combos, desc="Filtrando"):
+    for fixed_tuple in tqdm(combinations(range(1, 26), n_fixed), desc="Filtrando"):
         fixed_set = set(fixed_tuple)
         acertos = sum(1 for c in train_data if fixed_set.issubset(set(c['dezenas'])))
         freq = acertos / len(train_data)
@@ -592,12 +666,10 @@ def search_best_fixed_oos(contests, n_fixed=3, top_n=20, train_size=3500, n_game
             candidates.append((fixed_tuple, freq, acertos))
     
     candidates.sort(key=lambda x: x[1], reverse=True)
-    top_candidates = candidates[:200]
     
     results = []
-    for fixed_tuple, freq, acertos in tqdm(top_candidates, desc="Backtest OOS"):
-        fixed = list(fixed_tuple)
-        opt = PortfolioOptimizer(train_data, fixed=fixed)
+    for fixed_tuple, freq, acertos in tqdm(candidates[:200], desc="Backtest OOS"):
+        opt = PortfolioOptimizer(train_data, fixed=list(fixed_tuple))
         try:
             portfolio = opt.optimize(n_games, n_candidates, method=method)
             bt = opt.backtest(portfolio, test_data)
@@ -618,51 +690,18 @@ def search_best_fixed_oos(contests, n_fixed=3, top_n=20, train_size=3500, n_game
 def compare_trincas(contests, trinca1, trinca2, n_games=5, n_candidates=30000, method='pair_covering'):
     print(f"\n⚔️ COMPARAÇÃO DE TRINCAS")
     for i, trinca in enumerate([trinca1, trinca2], 1):
-        print(f"\n--- Trinca {i}: {trinca} ---")
         opt = PortfolioOptimizer(contests, fixed=list(trinca))
         portfolio = opt.optimize(n_games, n_candidates, method=method)
         bt = opt.backtest(portfolio, contests[-200:])
-        print(f"   Lift={bt['lift']:.2f}x | ROI={bt['roi']:+.1f}%")
-
-def walk_forward_conditional(contests, n_windows=8, train_size=400, test_size=50, n_games=5,
-                             fixed=None, ranges=None, method='pair_covering'):
-    print(f"\n🔬 WALK-FORWARD CONDICIONAL ({n_windows} janelas)")
-    results = []
-    for w in range(n_windows):
-        test_end = len(contests) - w * test_size
-        test_start = test_end - test_size
-        train_end = test_start
-        train_start = max(0, train_end - train_size)
-        if train_start >= train_end or test_start >= test_end: continue
-        train_data = contests[train_start:train_end]
-        test_data = contests[test_start:test_end]
-        if len(train_data) < 100 or len(test_data) < 5: continue
-        
-        opt = PortfolioOptimizer(train_data, fixed=fixed,
-                                 range_pares=ranges.get('pares') if ranges else None,
-                                 range_moldura=ranges.get('moldura') if ranges else None,
-                                 range_primos=ranges.get('primos') if ranges else None,
-                                 range_soma=ranges.get('soma') if ranges else None,
-                                 range_amplitude=ranges.get('amplitude') if ranges else None,
-                                 range_consecutivos=ranges.get('consecutivos') if ranges else None)
-        portfolio = opt.optimize(n_games, n_candidates=10000, method=method)
-        bt = opt.backtest(portfolio, test_data)
-        results.append({
-            'window': w, 'lift': bt['lift'], 'roi': bt['roi'],
-            '14pts': bt['hit_distribution'].get(14,0),
-        })
-        print(f"   Janela {w}: lift={bt['lift']:.3f} | ROI={bt['roi']:+.1f}% | 14pts={bt['hit_distribution'].get(14,0)}")
-    if results:
-        print(f"\n📊 RESUMO: Média lift: {np.mean([r['lift'] for r in results]):.3f}")
-    return results
+        print(f"   Trinca {i} ({trinca}): Lift={bt['lift']:.2f}x | ROI={bt['roi']:+.1f}%")
 
 # ============================================================
 # INTERFACE PRINCIPAL
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v46")
-    print("   STRUCTURAL PREDICTOR + REVERSÃO/TENDÊNCIA + SIGNIFICÂNCIA")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v47")
+    print("   MONTE CARLO + CONCURSO A CONCURSO + WALK‑FORWARD ESTRUTURAL")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
@@ -671,13 +710,10 @@ def main():
     print(f"\n📂 {len(contests)} concursos")
     print(f"📌 Último: {contests[-1]['concurso']} - {contests[-1]['dezenas']}")
 
-    ranker = PredictiveRanking(contests)
-    predictor = StructuralPredictor(contests)
-
     while True:
         print("\nOpções:")
         print("1. Gerar carteira personalizada")
-        print("2. Walk‑forward condicional")
+        print("2. Walk‑forward condicional simples")
         print("3. Backtest nos últimos 200 concursos")
         print("4. Buscar melhores fixas (out‑of‑sample)")
         print("5. Comparar duas trincas")
@@ -685,14 +721,15 @@ def main():
         print("7. Poder preditivo das 25 dezenas")
         print("8. Structural Predictor (previsão de faixas)")
         print("9. Gerar carteira com previsões estruturais")
+        print("10. Controle Monte Carlo (baseline aleatório)")
+        print("11. Teste preditivo concurso a concurso")
+        print("12. Walk‑forward do Structural Predictor")
         print("0. Sair")
         op = input("Escolha: ").strip()
         
         if op == '1':
-            print("\n📝 CONFIGURAÇÃO DA CARTEIRA")
-            fixed_str = input("   Dezenas fixas (ex: 15 16 20 ou ENTER): ").strip()
+            fixed_str = input("\n   Dezenas fixas (ex: 15 16 20 ou ENTER): ").strip()
             fixed = [int(x) for x in fixed_str.split()] if fixed_str else []
-            
             print("   Faixas estruturais (ENTER para pular)")
             try:
                 pares_str = input("   Pares min,max (ex: 7,9): ").strip()
@@ -706,18 +743,11 @@ def main():
                 primos_str = input("   Primos min,max: ").strip()
                 range_primos = tuple(int(x) for x in primos_str.split(',')) if primos_str else None
             except: range_primos = None
-            try:
-                soma_str = input("   Soma min,max: ").strip()
-                range_soma = tuple(int(x) for x in soma_str.split(',')) if soma_str else None
-            except: range_soma = None
-            
-            print("\n   Método: 1. Pair Covering  2. Triple Covering")
-            metodo = input("   Escolha [1]: ").strip() or "1"
+            metodo = input("\n   Método [1. Pair, 2. Triple]: ").strip() or "1"
             method = 'pair_covering' if metodo == '1' else 'triple_covering'
             
-            opt = PortfolioOptimizer(contests, fixed=fixed,
-                                     range_pares=range_pares, range_moldura=range_moldura,
-                                     range_primos=range_primos, range_soma=range_soma)
+            opt = PortfolioOptimizer(contests, fixed=fixed, range_pares=range_pares,
+                                     range_moldura=range_moldura, range_primos=range_primos)
             portfolio = opt.optimize(5, 30000, method=method)
             for i, g in enumerate(portfolio, 1):
                 p = sum(1 for x in g if x%2==0); pr = sum(1 for x in g if x in PRIMES); m = sum(1 for x in g if x in MOLDURA)
@@ -731,7 +761,22 @@ def main():
             fixed = [int(x) for x in fixed_str.split()] if fixed_str else []
             metodo = input("   Método [1. Pair, 2. Triple]: ").strip() or "1"
             method = 'pair_covering' if metodo == '1' else 'triple_covering'
-            walk_forward_conditional(contests, fixed=fixed, method=method)
+            
+            # Walk‑forward simples
+            results = []
+            for w in range(8):
+                test_end = len(contests) - w * 50
+                test_start = test_end - 50
+                train_end = test_start
+                train_start = max(0, train_end - 400)
+                if train_start >= train_end or test_start >= test_end: continue
+                opt = PortfolioOptimizer(contests[train_start:train_end], fixed=fixed)
+                portfolio = opt.optimize(5, 10000, method=method)
+                bt = opt.backtest(portfolio, contests[test_start:test_end])
+                results.append({'lift': bt['lift'], 'roi': bt['roi']})
+                print(f"   Janela {w}: lift={bt['lift']:.3f} | ROI={bt['roi']:+.1f}%")
+            if results:
+                print(f"\n📊 Média lift: {np.mean([r['lift'] for r in results]):.3f}")
         
         elif op == '3':
             fixed_str = input("\n   Fixas (ENTER para pular): ").strip()
@@ -767,34 +812,36 @@ def main():
             compare_trincas(contests, trinca1, trinca2)
         
         elif op == '6':
-            print("\n📝 TAMANHOS DE BLOCO (ex: 50,100,200,500)")
-            blocos_str = input("   [50,100,200,500]: ").strip() or "50,100,200,500"
+            blocos_str = input("\n   Tamanhos de bloco (ex: 50,100,200,500) [50,100,200,500]: ").strip()
             try:
-                block_sizes = [int(x) for x in blocos_str.split(',')]
+                block_sizes = [int(x) for x in blocos_str.split(',')] if blocos_str else [50, 100, 200, 500]
             except:
                 block_sizes = [50, 100, 200, 500]
+            ranker = PredictiveRanking(contests)
             ranker.rank_predictive_power(block_sizes)
         
         elif op == '7':
-            print("\n📝 TAMANHOS DE BLOCO (ex: 100,200,500)")
-            blocos_str = input("   [100,200,500]: ").strip() or "100,200,500"
+            blocos_str = input("\n   Tamanhos de bloco (ex: 100,200,500) [100,200,500]: ").strip()
             try:
-                block_sizes = [int(x) for x in blocos_str.split(',')]
+                block_sizes = [int(x) for x in blocos_str.split(',')] if blocos_str else [100, 200, 500]
             except:
                 block_sizes = [100, 200, 500]
+            ranker = PredictiveRanking(contests)
             ranker.rank_dezenas_individual(block_sizes)
         
         elif op == '8':
-            print("\n📝 MÉTODO DE PREVISÃO")
-            print("   1. Recente (últimos 50 concursos)")
-            print("   2. IPE (tendência via Índice de Pressão)")
+            print("\n   Método: 1. Recente (50 concursos)  2. IPE")
             metodo = input("   Escolha [1]: ").strip() or "1"
             method = 'recent' if metodo == '1' else 'ipe'
+            predictor = StructuralPredictor(contests)
             predictor.predict_ranges(method=method)
         
         elif op == '9':
-            fixed, ranges = suggest_from_structural_predictor(contests)
-            gerar = input("\n   Gerar carteira com estas previsões? (s/n): ").strip().lower()
+            predictor = StructuralPredictor(contests)
+            ranges = predictor.predict_ranges(method='recent')
+            fixed = [15, 16, 20]
+            print(f"\n   Fixas sugeridas: {fixed}")
+            gerar = input("   Gerar carteira? (s/n): ").strip().lower()
             if gerar == 's':
                 metodo = input("   Método [1. Pair, 2. Triple]: ").strip() or "1"
                 method = 'pair_covering' if metodo == '1' else 'triple_covering'
@@ -812,6 +859,32 @@ def main():
                 if len(contests) > 200:
                     bt = opt.backtest(portfolio, contests[-200:])
                     print(f"\n🔬 BACKTEST: Lift={bt['lift']:.2f}x | ROI={bt['roi']:+.1f}%")
+        
+        elif op == '10':
+            try:
+                n_sim = int(input("\n   Número de simulações [100]: ").strip() or "100")
+            except: n_sim = 100
+            blocos_str = input("   Blocos (ex: 50,100,200) [50,100,200]: ").strip()
+            try:
+                block_sizes = [int(x) for x in blocos_str.split(',')] if blocos_str else [50, 100, 200]
+            except:
+                block_sizes = [50, 100, 200]
+            monte_carlo_control(contests, n_sim, block_sizes)
+        
+        elif op == '11':
+            try:
+                min_hist = int(input("\n   Histórico mínimo [200]: ").strip() or "200")
+            except: min_hist = 200
+            test_concurso_a_concurso(contests, min_hist)
+        
+        elif op == '12':
+            try:
+                train_size = int(input("\n   Tamanho do treino [500]: ").strip() or "500")
+                test_size = int(input("   Tamanho do teste [50]: ").strip() or "50")
+                step = int(input("   Passo [50]: ").strip() or "50")
+            except:
+                train_size, test_size, step = 500, 50, 50
+            walk_forward_structural(contests, train_size, test_size, step)
         
         elif op == '0':
             break
