@@ -2,19 +2,22 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v53
-TESTE FORA DA AMOSTRA DAS MELHORES TRINCAS + RANKING DE DEZENAS
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v54
+TESTE DE PADRÕES ESTRUTURAIS FORA DA AMOSTRA
 
 OBJETIVO:
-✅ Dividir histórico em duas janelas independentes
-✅ Ranquear trincas na janela 1 (treino)
-✅ Testar as top 50 trincas na janela 2 (teste)
-✅ Verificar se mantêm desempenho acima da média
-✅ Ranking de dezenas por aparições nas melhores trincas
+✅ Abandonar busca por trincas fixas
+✅ Avaliar poder preditivo de padrões estáveis:
+   - Pares, moldura, primos, soma, consecutivos, amplitude
+   - Frequência individual das dezenas
+   - Atraso (delay) das dezenas
+✅ Walk‑forward com treino/teste independentes
+✅ Comparação contra baseline aleatório
+✅ Ranking de padrões com verdadeiro poder preditivo
 """
 
 import numpy as np
-from scipy.stats import hypergeom
+from scipy.stats import hypergeom, wilcoxon, binomtest
 from collections import Counter, defaultdict
 from itertools import combinations
 import os, random, time, warnings
@@ -26,26 +29,9 @@ warnings.filterwarnings('ignore')
 # ============================================================
 # CONSTANTES
 # ============================================================
+PRIMES_SET = {2, 3, 5, 7, 11, 13, 17, 19, 23}
+MOLDURA_SET = {1,2,3,4,5, 6,10, 11,15, 16,20, 21,22,23,24,25}
 HYPE_PROBS = {k: hypergeom.pmf(k, 25, 15, 15) for k in range(0, 16)}
-PREMIO_VALORES = {11: 6.0, 12: 12.0, 13: 30.0, 14: 1500.0, 15: 1800000.0}
-
-# ============================================================
-# BITMASK
-# ============================================================
-class BitmaskCache:
-    def __init__(self):
-        self._cache = {}
-    def get_mask(self, game):
-        key = tuple(game) if isinstance(game, list) else game
-        if key not in self._cache:
-            mask = 0
-            for d in key:
-                mask |= (1 << d)
-            self._cache[key] = mask
-        return self._cache[key]
-
-BITMASK_CACHE = BitmaskCache()
-mask_intersection = lambda m1, m2: (m1 & m2).bit_count()
 
 # ============================================================
 # CARREGAMENTO DE DADOS
@@ -71,191 +57,248 @@ def load_all_contests(csv_file='resultados_lotofacil.csv'):
     return contests
 
 # ============================================================
-# GERADOR DE POOL GLOBAL
+# EXTRATOR DE PADRÕES ESTRUTURAIS
 # ============================================================
-def generate_global_pool(n_games=100000):
-    """Gera um pool global de jogos aleatórios (sem restrições)."""
-    print(f"Gerando pool global de {n_games} jogos...")
-    pool = []
-    seen = set()
-    while len(pool) < n_games:
-        game = sorted(np.random.choice(range(1, 26), 15, replace=False))
-        key = tuple(game)
-        if key not in seen:
-            seen.add(key)
-            pool.append(game)
-    return pool
-
-# ============================================================
-# AVALIADOR DE TRINCA (VERSÃO OTIMIZADA)
-# ============================================================
-def evaluate_trinca_v53(contests, trinca, global_pool, global_masks):
-    """
-    Avalia uma trinca usando o pool global (com baseline justo).
-    Retorna score e contagens.
-    """
-    trinca_set = set(trinca)
-    pool_indices = [i for i, g in enumerate(global_pool) if trinca_set.issubset(g)]
-    n_trinca = len(pool_indices)
-    
-    if n_trinca == 0:
-        return {'14_count': 0, '13_count': 0, 'score': 0, 'n_jogos': 0}
-
-    pool_masks_trinca = global_masks[pool_indices]
-    baseline_indices = np.random.choice(len(global_pool), n_trinca, replace=False)
-    baseline_masks = global_masks[baseline_indices]
-
-    hit_counts = {k: 0 for k in range(11, 16)}
-    baseline_counts = {k: 0 for k in range(11, 16)}
-
-    for draw in contests:
-        dm = BITMASK_CACHE.get_mask(draw['dezenas'])
-        best_com = max((mask_intersection(pm, dm) for pm in pool_masks_trinca), default=0)
-        if best_com >= 11:
-            hit_counts[best_com] += 1
-
-        best_base = max((mask_intersection(pm, dm) for pm in baseline_masks), default=0)
-        if best_base >= 11:
-            baseline_counts[best_base] += 1
-
-    score = (
-        hit_counts.get(13, 0) * 1 +
-        hit_counts.get(14, 0) * 20 +
-        hit_counts.get(15, 0) * 1000
-    )
-    score_baseline = (
-        baseline_counts.get(13, 0) * 1 +
-        baseline_counts.get(14, 0) * 20 +
-        baseline_counts.get(15, 0) * 1000
-    )
-
+def extract_structural_features(dezenas):
+    """Extrai características estruturais de um jogo."""
+    d = sorted(dezenas)
     return {
-        '14_count': hit_counts.get(14, 0),
-        '13_count': hit_counts.get(13, 0),
-        'score': score,
-        'score_baseline': score_baseline,
-        'n_jogos': n_trinca
+        'pares': sum(1 for x in d if x % 2 == 0),
+        'moldura': sum(1 for x in d if x in MOLDURA_SET),
+        'primos': sum(1 for x in d if x in PRIMES_SET),
+        'soma': sum(d),
+        'consecutivos': sum(1 for i in range(len(d)-1) if d[i+1]-d[i] == 1),
+        'amplitude': max(d) - min(d),
+        'dezenas_presentes': set(d)
+    }
+
+def build_structural_series(contests):
+    """Constrói séries temporais para cada padrão estrutural."""
+    series = {
+        'pares': [],
+        'moldura': [],
+        'primos': [],
+        'soma': [],
+        'consecutivos': [],
+        'amplitude': []
+    }
+    
+    # Frequência por dezena (acumulada)
+    freq_acumulada = {d: [] for d in range(1, 26)}
+    atraso = {d: [] for d in range(1, 26)}
+    last_seen = {d: -1 for d in range(1, 26)}
+    
+    for idx, c in enumerate(contests):
+        feat = extract_structural_features(c['dezenas'])
+        for key in series:
+            series[key].append(feat[key])
+        
+        present = feat['dezenas_presentes']
+        for d in range(1, 26):
+            # Frequência acumulada até aqui
+            freq = sum(1 for past in contests[:idx+1] if d in past['dezenas'])
+            freq_acumulada[d].append(freq / (idx+1))
+            
+            # Atraso
+            if d in present:
+                last_seen[d] = idx
+            atraso[d].append(idx - last_seen[d])
+    
+    return series, freq_acumulada, atraso
+
+# ============================================================
+# AVALIADOR DE PADRÃO COM WALK‑FORWARD
+# ============================================================
+def evaluate_pattern_walk_forward(contests, pattern_name, pattern_series, 
+                                  train_size=500, test_size=50, step=50):
+    """
+    Walk‑forward: tenta prever a direção do padrão no próximo bloco
+    usando apenas informações do bloco de treino.
+    """
+    n = len(pattern_series)
+    predictions = []
+    actuals = []
+    
+    start = train_size
+    while start + test_size <= n:
+        train_data = pattern_series[start-train_size:start]
+        test_data = pattern_series[start:start+test_size]
+        
+        # Característica do treino
+        mean_train = np.mean(train_data)
+        mean_long = np.mean(pattern_series[:start])
+        
+        # Previsão: reversão à média
+        if mean_train > mean_long:
+            pred_direction = -1  # prevê queda
+        else:
+            pred_direction = 1   # prevê alta
+        
+        # Realidade no teste
+        mean_test = np.mean(test_data)
+        actual_direction = 1 if mean_test > mean_train else -1
+        
+        predictions.append(pred_direction)
+        actuals.append(actual_direction)
+        
+        start += step
+    
+    if len(predictions) == 0:
+        return {'accuracy': 50.0, 'n_predictions': 0, 'p_value': 1.0}
+    
+    accuracy = sum(1 for p, a in zip(predictions, actuals) if p == a) / len(predictions) * 100
+    n_correct = sum(1 for p, a in zip(predictions, actuals) if p == a)
+    
+    # Significância contra 50% (acaso)
+    p_value = binomtest(n_correct, len(predictions), 0.5, alternative='greater').pvalue
+    
+    return {
+        'accuracy': accuracy,
+        'n_predictions': len(predictions),
+        'n_correct': n_correct,
+        'p_value': p_value,
+        'predictions': predictions,
+        'actuals': actuals
     }
 
 # ============================================================
-# RANKING DE DEZENAS POR APARIÇÕES NAS MELHORES TRINCAS
+# BASELINE ALEATÓRIO PARA COMPARAÇÃO
 # ============================================================
-def rank_dezenas_from_top_trincas(top_trincas):
-    """
-    Dado uma lista de trincas (ex.: top 50), conta quantas vezes cada dezena aparece.
-    """
-    dezena_count = Counter()
-    for trinca in top_trincas:
-        for d in trinca:
-            dezena_count[d] += 1
-    return dezena_count.most_common()
+def generate_random_series(n, pattern_type='binary'):
+    """Gera uma série aleatória do mesmo tamanho."""
+    if pattern_type == 'binary':
+        return np.random.choice([0, 1], size=n)
+    else:
+        # Para séries contínuas, gera ruído branco
+        return np.random.randn(n)
+
+def evaluate_random_baseline(contests, pattern_name, n_simulations=100,
+                             train_size=500, test_size=50, step=50):
+    """Avalia o baseline aleatório para um padrão."""
+    n = len(contests)
+    accuracies = []
+    
+    for _ in range(n_simulations):
+        # Gera série aleatória do mesmo tamanho
+        random_series = np.random.randn(n)
+        result = evaluate_pattern_walk_forward(contests, pattern_name, random_series,
+                                               train_size, test_size, step)
+        accuracies.append(result['accuracy'])
+    
+    return np.mean(accuracies), np.std(accuracies)
 
 # ============================================================
-# TESTE PRINCIPAL: JANELA 1 (TREINO) → JANELA 2 (TESTE)
+# TESTE PRINCIPAL DE PADRÕES ESTRUTURAIS
 # ============================================================
-def test_out_of_sample(contests, train_start=2700, train_end=3200, test_start=3201, test_end=3701, pool_size=100000):
+def test_structural_patterns(contests, train_size=500, test_size=50, step=50, n_baseline=200):
     """
-    Fase 1: Ranqueia trincas nos concursos train_start..train_end
-    Fase 2: Testa as top 50 nos concursos test_start..test_end
+    Testa todos os padrões estruturais e ranqueia por poder preditivo real.
     """
     print("\n" + "="*70)
-    print("🔬 TESTE FORA DA AMOSTRA DAS MELHORES TRINCAS")
+    print("🔬 TESTE DE PADRÕES ESTRUTURAIS FORA DA AMOSTRA")
     print("="*70)
-    print(f"   Treino: concursos {train_start} a {train_end} ({train_end-train_start+1} concursos)")
-    print(f"   Teste:  concursos {test_start} a {test_end} ({test_end-test_start+1} concursos)\n")
-
-    # Dados de treino e teste
-    train_contests = [c for c in contests if train_start <= c['concurso'] <= train_end]
-    test_contests = [c for c in contests if test_start <= c['concurso'] <= test_end]
-
-    if len(train_contests) < 100 or len(test_contests) < 100:
-        print("❌ Janelas muito pequenas. Ajuste os intervalos.")
-        return
-
-    # Pool global (comum a treino e teste)
-    global_pool = generate_global_pool(pool_size)
-    global_masks = np.array([BITMASK_CACHE.get_mask(g) for g in global_pool], dtype=np.uint32)
-
-    # FASE 1: Ranquear as 200 trincas mais frequentes no treino
-    print("FASE 1: Ranqueando trincas no período de TREINO...")
-    trinca_freq = Counter()
-    for c in tqdm(train_contests, desc="Frequência histórica"):
-        d = c['dezenas']
-        for trinca in combinations(sorted(d), 3):
-            trinca_freq[trinca] += 1
-
-    top200 = trinca_freq.most_common(200)
-    print(f"   Top 200 trincas mais frequentes selecionadas.")
-
-    results_train = []
-    for trinca, freq in tqdm(top200, desc="Avaliando no treino"):
-        res = evaluate_trinca_v53(train_contests, trinca, global_pool, global_masks)
-        results_train.append((trinca, freq, res))
-
-    results_train.sort(key=lambda x: x[2]['score'], reverse=True)
-    top50_train = results_train[:50]
-
-    print(f"\n🏆 TOP 10 TRINCAS NO TREINO:")
-    for i, (trinca, freq, res) in enumerate(top50_train[:10], 1):
-        print(f"   {i}. {trinca} | Score={res['score']} | 14pts={res['14_count']} | Freq={freq}")
-
-    # FASE 2: Testar as top 50 no teste
-    print("\nFASE 2: Testando as top 50 trincas no período de TESTE...")
-    results_test = []
-    for trinca, freq, _ in tqdm(top50_train, desc="Testando fora da amostra"):
-        res = evaluate_trinca_v53(test_contests, trinca, global_pool, global_masks)
-        results_test.append((trinca, freq, res))
-
-    # Calcular baseline para o teste (usando 50 trincas aleatórias)
-    todas_trincas = list(combinations(range(1, 26), 3))
-    top50_set = set(t[0] for t in top50_train)
-    restantes = [t for t in todas_trincas if t not in top50_set]
-    random.shuffle(restantes)
-    random50 = restantes[:50]
-
-    random_scores = []
-    for trinca in tqdm(random50, desc="Baseline aleatório"):
-        res = evaluate_trinca_v53(test_contests, trinca, global_pool, global_masks)
-        random_scores.append(res['score'])
-
-    random_scores = np.array(random_scores)
-    mean_random = np.mean(random_scores)
-    std_random = np.std(random_scores)
-
-    # Exibir resultados do teste
-    print(f"\n📊 RESULTADOS NO TESTE (concursos {test_start}–{test_end}):")
-    print(f"{'Trinca':<20} {'Score':<8} {'14pts':<8} {'Z-score':<10} {'% Base':<10}")
-    print("-" * 65)
-
-    results_test.sort(key=lambda x: x[2]['score'], reverse=True)
-    for i, (trinca, freq, res) in enumerate(results_test[:20], 1):
-        z = (res['score'] - mean_random) / std_random if std_random > 0 else 0.0
-        pct = np.mean(random_scores <= res['score']) * 100
-        print(f"{i:<3} {str(trinca):<15} {res['score']:<8} {res['14_count']:<8} {z:<10.2f} {pct:<10.1f}%")
-
-    # Quantas das top 50 estão acima da média?
-    above_mean = sum(1 for _, _, res in results_test if res['score'] > mean_random)
+    print(f"   Walk‑forward: treino {train_size}, teste {test_size}, passo {step}")
+    print(f"   Baseline: {n_baseline} simulações aleatórias por padrão\n")
+    
+    # Extrair séries estruturais
+    series, freq_dezenas, atraso_dezenas = build_structural_series(contests)
+    
+    # Padrões a testar
+    patterns_to_test = {
+        'Pares': ('estrutural', series['pares']),
+        'Moldura': ('estrutural', series['moldura']),
+        'Primos': ('estrutural', series['primos']),
+        'Soma': ('estrutural', series['soma']),
+        'Consecutivos': ('estrutural', series['consecutivos']),
+        'Amplitude': ('estrutural', series['amplitude']),
+    }
+    
+    # Adicionar frequência das dezenas mais estáveis
+    for d in [20, 12, 4, 11, 10, 25, 18, 21]:  # baseado nos achados anteriores
+        patterns_to_test[f'Freq Dezena {d}'] = ('frequencia', freq_dezenas[d])
+    
+    # Adicionar atraso das mesmas dezenas
+    for d in [20, 12, 4, 11, 10, 25]:
+        patterns_to_test[f'Atraso Dezena {d}'] = ('atraso', atraso_dezenas[d])
+    
+    results = {}
+    baseline_results = {}
+    
+    # Avaliar cada padrão
+    for name, (tipo, serie) in tqdm(patterns_to_test.items(), desc="Avaliando padrões"):
+        result = evaluate_pattern_walk_forward(contests, name, serie,
+                                               train_size, test_size, step)
+        results[name] = result
+        
+        # Baseline aleatório específico para este padrão
+        mean_base, std_base = evaluate_random_baseline(contests, name, n_baseline,
+                                                       train_size, test_size, step)
+        baseline_results[name] = (mean_base, std_base)
+    
+    # Calcular z‑score e ranquear
+    final_ranking = []
+    for name, res in results.items():
+        mean_base, std_base = baseline_results[name]
+        z = (res['accuracy'] - mean_base) / std_base if std_base > 0 else 0.0
+        pct = 0.0
+        if std_base > 0:
+            # Estima percentil assumindo distribuição normal
+            from scipy.stats import norm
+            pct = norm.cdf(z) * 100
+        
+        final_ranking.append({
+            'pattern': name,
+            'accuracy': res['accuracy'],
+            'baseline_mean': mean_base,
+            'z_score': z,
+            'percentile': pct,
+            'n_predictions': res['n_predictions'],
+            'p_value': res['p_value']
+        })
+    
+    # Ordenar por z‑score
+    final_ranking.sort(key=lambda x: x['z_score'], reverse=True)
+    
+    # Exibir resultados
+    print(f"\n📊 RANKING DE PODER PREDITIVO REAL:")
+    print(f"{'Padrão':<20} {'Acurácia':<10} {'Baseline':<10} {'Z‑score':<10} {'%ile':<8} {'p‑value':<10} {'Avaliação'}")
+    print("-" * 85)
+    
+    for item in final_ranking:
+        if item['z_score'] > 2.0:
+            avaliacao = "🔍 FORTE"
+        elif item['z_score'] > 1.0:
+            avaliacao = "📊 Leve"
+        elif item['z_score'] > 0:
+            avaliacao = "📊 Marginal"
+        else:
+            avaliacao = "❌ Nulo"
+        
+        print(f"{item['pattern']:<20} {item['accuracy']:<10.1f}% {item['baseline_mean']:<10.1f}% "
+              f"{item['z_score']:<10.2f} {item['percentile']:<8.1f}% {item['p_value']:<10.4f} {avaliacao}")
+    
+    # Resumo
+    strong = [item for item in final_ranking if item['z_score'] > 2.0]
+    any_strong = len(strong) > 0
+    
     print(f"\n📊 RESUMO:")
-    print(f"   Média baseline aleatório: {mean_random:.1f}")
-    print(f"   Trincas do treino acima da média no teste: {above_mean}/50 ({above_mean/50*100:.0f}%)")
-    print(f"   Z-score médio das top 50: {np.mean([(r[2]['score']-mean_random)/std_random for r in results_test]):.2f}")
-
-    # Ranking de dezenas
-    print(f"\n📊 DEZENAS MAIS FREQUENTES NAS TOP 50 DO TREINO:")
-    dezena_rank = rank_dezenas_from_top_trincas([t[0] for t in top50_train])
-    for i, (dezena, count) in enumerate(dezena_rank[:15], 1):
-        bar = "█" * count
-        print(f"   {i:2}. Dezena {dezena:2}: {count} aparições {bar}")
-
-    return results_test, dezena_rank
+    print(f"   Padrões com z > 2.0: {len(strong)}")
+    if any_strong:
+        print(f"   Melhores: {[s['pattern'] for s in strong]}")
+    else:
+        print(f"   Nenhum padrão mostrou poder preditivo forte fora da amostra.")
+        print(f"   Isso sugere que a Lotofácil se comporta de forma essencialmente aleatória")
+        print(f"   para as características estruturais testadas.")
+    
+    return final_ranking
 
 # ============================================================
 # INTERFACE PRINCIPAL
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v53")
-    print("   TESTE FORA DA AMOSTRA DAS MELHORES TRINCAS")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v54")
+    print("   PODER PREDITIVO DE PADRÕES ESTRUTURAIS")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
@@ -263,27 +306,38 @@ def main():
         return
     print(f"\n📂 {len(contests)} concursos")
 
-    # Intervalos padrão
-    train_start = 2700
-    train_end = 3200
-    test_start = 3201
-    test_end = len(contests)
+    # Parâmetros do walk‑forward
+    print("\nParâmetros do walk‑forward:")
+    try:
+        train_size = int(input("   Tamanho do treino [500]: ").strip() or "500")
+        test_size = int(input("   Tamanho do teste [50]: ").strip() or "50")
+        step = int(input("   Passo [50]: ").strip() or "50")
+    except:
+        train_size, test_size, step = 500, 50, 50
 
-    print(f"\nConfiguração padrão:")
-    print(f"   Treino: concursos {train_start}–{train_end} ({train_end-train_start+1} concursos)")
-    print(f"   Teste:  concursos {test_start}–{test_end} ({test_end-test_start+1} concursos)")
+    # Executar teste
+    results = test_structural_patterns(contests, train_size, test_size, step)
 
-    alterar = input("\nAlterar intervalos? (s/n): ").strip().lower()
-    if alterar == 's':
-        try:
-            train_start = int(input("   Início treino: "))
-            train_end = int(input("   Fim treino: "))
-            test_start = int(input("   Início teste: "))
-            test_end = int(input("   Fim teste: "))
-        except:
-            print("Valores inválidos. Usando padrão.")
-
-    test_out_of_sample(contests, train_start, train_end, test_start, test_end)
+    # Perguntar se quer ver detalhes de algum padrão
+    ver_detalhes = input("\nVer detalhes de algum padrão? (nome ou ENTER para sair): ").strip()
+    if ver_detalhes:
+        # Reconstruir séries para mostrar
+        series, _, _ = build_structural_series(contests)
+        # Mostrar os últimos valores
+        if ver_detalhes == 'Pares':
+            print(f"   Últimos 10 valores de Pares: {series['pares'][-10:]}")
+        elif ver_detalhes == 'Moldura':
+            print(f"   Últimos 10 valores de Moldura: {series['moldura'][-10:]}")
+        elif ver_detalhes == 'Primos':
+            print(f"   Últimos 10 valores de Primos: {series['primos'][-10:]}")
+        elif ver_detalhes == 'Soma':
+            print(f"   Últimos 10 valores de Soma: {series['soma'][-10:]}")
+        elif ver_detalhes == 'Consecutivos':
+            print(f"   Últimos 10 valores de Consecutivos: {series['consecutivos'][-10:]}")
+        elif ver_detalhes == 'Amplitude':
+            print(f"   Últimos 10 valores de Amplitude: {series['amplitude'][-10:]}")
+        else:
+            print(f"   Padrão '{ver_detalhes}' não reconhecido.")
 
     print("\n✅ Análise concluída.")
 
