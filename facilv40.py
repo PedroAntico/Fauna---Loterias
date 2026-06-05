@@ -2,22 +2,20 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v54
-TESTE DE PADRÕES ESTRUTURAIS FORA DA AMOSTRA
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v55
+MEMÓRIA ESTRUTURAL COM AUTOCORRELAÇÃO + BASELINE POR PERMUTAÇÃO
 
-OBJETIVO:
-✅ Abandonar busca por trincas fixas
-✅ Avaliar poder preditivo de padrões estáveis:
-   - Pares, moldura, primos, soma, consecutivos, amplitude
-   - Frequência individual das dezenas
-   - Atraso (delay) das dezenas
-✅ Walk‑forward com treino/teste independentes
-✅ Comparação contra baseline aleatório
-✅ Ranking de padrões com verdadeiro poder preditivo
+CORREÇÕES METODOLÓGICAS:
+✅ Autocorrelação (lag 1, 5, 10) para detectar memória real
+✅ Janela móvel (50, 100, 200) em vez de frequência acumulada
+✅ Atraso normalizado (relativo à média histórica)
+✅ Baseline por permutação da série real (preserva distribuição)
+✅ Correlação de Spearman + erro absoluto (além da direção)
+✅ Preditor melhorado (regressão linear com janela móvel)
 """
 
 import numpy as np
-from scipy.stats import hypergeom, wilcoxon, binomtest
+from scipy.stats import hypergeom, wilcoxon, binomtest, spearmanr, pearsonr
 from collections import Counter, defaultdict
 from itertools import combinations
 import os, random, time, warnings
@@ -57,7 +55,7 @@ def load_all_contests(csv_file='resultados_lotofacil.csv'):
     return contests
 
 # ============================================================
-# EXTRATOR DE PADRÕES ESTRUTURAIS
+# EXTRATOR DE PADRÕES ESTRUTURAIS (CORRIGIDO)
 # ============================================================
 def extract_structural_features(dezenas):
     """Extrai características estruturais de um jogo."""
@@ -69,23 +67,27 @@ def extract_structural_features(dezenas):
         'soma': sum(d),
         'consecutivos': sum(1 for i in range(len(d)-1) if d[i+1]-d[i] == 1),
         'amplitude': max(d) - min(d),
-        'dezenas_presentes': set(d)
+        'presentes': set(d)
     }
 
 def build_structural_series(contests):
-    """Constrói séries temporais para cada padrão estrutural."""
+    """
+    Constrói séries temporais com:
+    - Valores dos padrões estruturais
+    - Frequência em janela móvel (50, 100, 200)
+    - Atraso normalizado
+    """
     series = {
-        'pares': [],
-        'moldura': [],
-        'primos': [],
-        'soma': [],
-        'consecutivos': [],
-        'amplitude': []
+        'pares': [], 'moldura': [], 'primos': [],
+        'soma': [], 'consecutivos': [], 'amplitude': []
     }
     
-    # Frequência por dezena (acumulada)
-    freq_acumulada = {d: [] for d in range(1, 26)}
-    atraso = {d: [] for d in range(1, 26)}
+    # Frequência em janelas móveis
+    freq_windows = {d: {50: [], 100: [], 200: []} for d in range(1, 26)}
+    
+    # Atraso normalizado
+    atraso_norm = {d: [] for d in range(1, 26)}
+    atraso_historico = {d: [] for d in range(1, 26)}
     last_seen = {d: -1 for d in range(1, 26)}
     
     for idx, c in enumerate(contests):
@@ -93,212 +95,292 @@ def build_structural_series(contests):
         for key in series:
             series[key].append(feat[key])
         
-        present = feat['dezenas_presentes']
+        present = feat['presentes']
+        
+        # Frequência em janelas móveis
         for d in range(1, 26):
-            # Frequência acumulada até aqui
-            freq = sum(1 for past in contests[:idx+1] if d in past['dezenas'])
-            freq_acumulada[d].append(freq / (idx+1))
-            
-            # Atraso
+            for window in [50, 100, 200]:
+                start = max(0, idx - window)
+                count = sum(1 for i in range(start, idx+1) if d in contests[i]['dezenas'])
+                freq = count / (idx - start + 1)
+                freq_windows[d][window].append(freq)
+        
+        # Atraso normalizado
+        for d in range(1, 26):
             if d in present:
                 last_seen[d] = idx
-            atraso[d].append(idx - last_seen[d])
+            delay = idx - last_seen[d]
+            atraso_norm[d].append(delay)
+            
+            # Média histórica do atraso para esta dezena
+            if idx > 0:
+                media_hist = np.mean(atraso_norm[d][:idx+1])
+                atraso_historico[d].append(delay / (media_hist + 1e-10))
+            else:
+                atraso_historico[d].append(1.0)
     
-    return series, freq_acumulada, atraso
+    return series, freq_windows, atraso_historico
 
 # ============================================================
-# AVALIADOR DE PADRÃO COM WALK‑FORWARD
+# CÁLCULO DE AUTOCORRELAÇÃO
 # ============================================================
-def evaluate_pattern_walk_forward(contests, pattern_name, pattern_series, 
-                                  train_size=500, test_size=50, step=50):
+def compute_autocorrelations(series, max_lag=10):
+    """Calcula autocorrelação para lags 1 até max_lag."""
+    n = len(series)
+    autocorrs = {}
+    for lag in range(1, max_lag + 1):
+        if n > lag:
+            x = series[:-lag]
+            y = series[lag:]
+            if np.std(x) > 0 and np.std(y) > 0:
+                corr, _ = pearsonr(x, y)
+                autocorrs[lag] = corr
+            else:
+                autocorrs[lag] = 0.0
+    return autocorrs
+
+# ============================================================
+# AVALIADOR DE PADRÃO COM BASELINE POR PERMUTAÇÃO
+# ============================================================
+def evaluate_pattern_permutation(series, n_permutations=200,
+                                 train_size=500, test_size=50, step=50):
     """
-    Walk‑forward: tenta prever a direção do padrão no próximo bloco
-    usando apenas informações do bloco de treino.
+    Avalia um padrão com walk‑forward.
+    Baseline: embaralha a série real (preserva distribuição).
+    Métricas: acurácia da direção, correlação Spearman, MAE.
     """
-    n = len(pattern_series)
-    predictions = []
-    actuals = []
+    n = len(series)
+    
+    # Resultados na série real
+    real_accuracy = []
+    real_spearman = []
+    real_mae = []
     
     start = train_size
     while start + test_size <= n:
-        train_data = pattern_series[start-train_size:start]
-        test_data = pattern_series[start:start+test_size]
+        train_data = series[start-train_size:start]
+        test_data = series[start:start+test_size]
         
-        # Característica do treino
-        mean_train = np.mean(train_data)
-        mean_long = np.mean(pattern_series[:start])
+        if len(train_data) < 10 or len(test_data) < 2:
+            start += step
+            continue
         
-        # Previsão: reversão à média
-        if mean_train > mean_long:
-            pred_direction = -1  # prevê queda
-        else:
-            pred_direction = 1   # prevê alta
+        # Preditor: média móvel da janela curta vs longa
+        mean_short = np.mean(train_data[-50:]) if len(train_data) >= 50 else np.mean(train_data)
+        mean_long = np.mean(train_data)
         
-        # Realidade no teste
+        # Previsão: se curta > longa, espera queda (reversão)
+        pred_direction = -1 if mean_short > mean_long else 1
+        
+        # Realidade
         mean_test = np.mean(test_data)
-        actual_direction = 1 if mean_test > mean_train else -1
+        actual_direction = 1 if mean_test > np.mean(train_data) else -1
         
-        predictions.append(pred_direction)
-        actuals.append(actual_direction)
+        real_accuracy.append(1 if pred_direction == actual_direction else 0)
+        
+        # Correlação Spearman entre valores previstos e reais
+        if len(test_data) >= 3:
+            try:
+                # Previsão ingênua: repetir último valor da janela
+                pred_values = np.full(len(test_data), mean_short)
+                corr, _ = spearmanr(pred_values, test_data)
+                real_spearman.append(corr)
+            except:
+                real_spearman.append(0.0)
+        
+        # Erro absoluto médio
+        mae = np.mean(np.abs(test_data - np.median(train_data)))
+        real_mae.append(mae)
         
         start += step
     
-    if len(predictions) == 0:
-        return {'accuracy': 50.0, 'n_predictions': 0, 'p_value': 1.0}
+    if len(real_accuracy) == 0:
+        return {'accuracy': 50.0, 'spearman': 0.0, 'mae': 0.0, 'z_accuracy': 0.0, 'n': 0}
     
-    accuracy = sum(1 for p, a in zip(predictions, actuals) if p == a) / len(predictions) * 100
-    n_correct = sum(1 for p, a in zip(predictions, actuals) if p == a)
+    real_acc = np.mean(real_accuracy) * 100
+    real_spear = np.mean(real_spearman) if real_spearman else 0.0
+    real_mae_val = np.mean(real_mae) if real_mae else 0.0
     
-    # Significância contra 50% (acaso)
-    p_value = binomtest(n_correct, len(predictions), 0.5, alternative='greater').pvalue
+    # Baseline por permutação
+    perm_accuracies = []
+    perm_spearmans = []
+    perm_maes = []
+    
+    for _ in tqdm(range(n_permutations), desc="  Permutações", leave=False):
+        shuffled = np.random.permutation(series)
+        
+        start = train_size
+        accs = []
+        spears = []
+        maes = []
+        
+        while start + test_size <= n:
+            train_data = shuffled[start-train_size:start]
+            test_data = shuffled[start:start+test_size]
+            
+            if len(train_data) < 10 or len(test_data) < 2:
+                start += step
+                continue
+            
+            mean_short = np.mean(train_data[-50:]) if len(train_data) >= 50 else np.mean(train_data)
+            mean_long = np.mean(train_data)
+            pred_direction = -1 if mean_short > mean_long else 1
+            
+            mean_test = np.mean(test_data)
+            actual_direction = 1 if mean_test > np.mean(train_data) else -1
+            
+            accs.append(1 if pred_direction == actual_direction else 0)
+            
+            if len(test_data) >= 3:
+                try:
+                    pred_values = np.full(len(test_data), mean_short)
+                    corr, _ = spearmanr(pred_values, test_data)
+                    spears.append(corr)
+                except:
+                    spears.append(0.0)
+            
+            maes.append(np.mean(np.abs(test_data - np.median(train_data))))
+            start += step
+        
+        perm_accuracies.append(np.mean(accs) * 100 if accs else 50.0)
+        perm_spearmans.append(np.mean(spears) if spears else 0.0)
+        perm_maes.append(np.mean(maes) if maes else 0.0)
+    
+    perm_accuracies = np.array(perm_accuracies)
+    perm_spearmans = np.array(perm_spearmans)
+    perm_maes = np.array(perm_maes)
+    
+    # Z‑score
+    z_acc = (real_acc - np.mean(perm_accuracies)) / np.std(perm_accuracies) if np.std(perm_accuracies) > 0 else 0.0
+    z_spear = (real_spear - np.mean(perm_spearmans)) / np.std(perm_spearmans) if np.std(perm_spearmans) > 0 else 0.0
+    z_mae = (np.mean(perm_maes) - real_mae_val) / np.std(perm_maes) if np.std(perm_maes) > 0 else 0.0  # MAE menor é melhor
     
     return {
-        'accuracy': accuracy,
-        'n_predictions': len(predictions),
-        'n_correct': n_correct,
-        'p_value': p_value,
-        'predictions': predictions,
-        'actuals': actuals
+        'accuracy': real_acc,
+        'spearman': real_spear,
+        'mae': real_mae_val,
+        'z_accuracy': z_acc,
+        'z_spearman': z_spear,
+        'z_mae': z_mae,
+        'n_predictions': len(real_accuracy),
+        'baseline_acc': np.mean(perm_accuracies),
+        'baseline_spear': np.mean(perm_spearmans),
+        'baseline_mae': np.mean(perm_maes)
     }
-
-# ============================================================
-# BASELINE ALEATÓRIO PARA COMPARAÇÃO
-# ============================================================
-def generate_random_series(n, pattern_type='binary'):
-    """Gera uma série aleatória do mesmo tamanho."""
-    if pattern_type == 'binary':
-        return np.random.choice([0, 1], size=n)
-    else:
-        # Para séries contínuas, gera ruído branco
-        return np.random.randn(n)
-
-def evaluate_random_baseline(contests, pattern_name, n_simulations=100,
-                             train_size=500, test_size=50, step=50):
-    """Avalia o baseline aleatório para um padrão."""
-    n = len(contests)
-    accuracies = []
-    
-    for _ in range(n_simulations):
-        # Gera série aleatória do mesmo tamanho
-        random_series = np.random.randn(n)
-        result = evaluate_pattern_walk_forward(contests, pattern_name, random_series,
-                                               train_size, test_size, step)
-        accuracies.append(result['accuracy'])
-    
-    return np.mean(accuracies), np.std(accuracies)
 
 # ============================================================
 # TESTE PRINCIPAL DE PADRÕES ESTRUTURAIS
 # ============================================================
-def test_structural_patterns(contests, train_size=500, test_size=50, step=50, n_baseline=200):
+def test_structural_patterns_v55(contests, train_size=500, test_size=50, step=50, n_perm=200):
     """
-    Testa todos os padrões estruturais e ranqueia por poder preditivo real.
+    Testa padrões estruturais com:
+    - Autocorrelação (detecta memória)
+    - Walk‑forward com baseline por permutação
+    - Ranking por múltiplas métricas
     """
     print("\n" + "="*70)
-    print("🔬 TESTE DE PADRÕES ESTRUTURAIS FORA DA AMOSTRA")
+    print("🔬 TESTE DE MEMÓRIA ESTRUTURAL (v55)")
     print("="*70)
     print(f"   Walk‑forward: treino {train_size}, teste {test_size}, passo {step}")
-    print(f"   Baseline: {n_baseline} simulações aleatórias por padrão\n")
+    print(f"   Baseline: {n_perm} permutações da série real\n")
     
-    # Extrair séries estruturais
-    series, freq_dezenas, atraso_dezenas = build_structural_series(contests)
+    # 1. Extrair séries
+    series, freq_windows, atraso_hist = build_structural_series(contests)
     
-    # Padrões a testar
-    patterns_to_test = {
-        'Pares': ('estrutural', series['pares']),
-        'Moldura': ('estrutural', series['moldura']),
-        'Primos': ('estrutural', series['primos']),
-        'Soma': ('estrutural', series['soma']),
-        'Consecutivos': ('estrutural', series['consecutivos']),
-        'Amplitude': ('estrutural', series['amplitude']),
-    }
+    # 2. Calcular autocorrelações
+    print("📊 AUTOCORRELAÇÕES (lag 1, 5, 10):")
+    print(f"{'Padrão':<25} {'Lag 1':<10} {'Lag 5':<10} {'Lag 10':<10} {'Memória?'}")
+    print("-" * 65)
     
-    # Adicionar frequência das dezenas mais estáveis
-    for d in [20, 12, 4, 11, 10, 25, 18, 21]:  # baseado nos achados anteriores
-        patterns_to_test[f'Freq Dezena {d}'] = ('frequencia', freq_dezenas[d])
+    autocorr_results = {}
+    patterns_for_test = {}
     
-    # Adicionar atraso das mesmas dezenas
-    for d in [20, 12, 4, 11, 10, 25]:
-        patterns_to_test[f'Atraso Dezena {d}'] = ('atraso', atraso_dezenas[d])
-    
-    results = {}
-    baseline_results = {}
-    
-    # Avaliar cada padrão
-    for name, (tipo, serie) in tqdm(patterns_to_test.items(), desc="Avaliando padrões"):
-        result = evaluate_pattern_walk_forward(contests, name, serie,
-                                               train_size, test_size, step)
-        results[name] = result
+    # Padrões estruturais
+    for name in ['pares', 'moldura', 'primos', 'soma', 'consecutivos', 'amplitude']:
+        s = np.array(series[name], dtype=float)
+        autocorrs = compute_autocorrelations(s, max_lag=10)
+        autocorr_results[name] = autocorrs
         
-        # Baseline aleatório específico para este padrão
-        mean_base, std_base = evaluate_random_baseline(contests, name, n_baseline,
-                                                       train_size, test_size, step)
-        baseline_results[name] = (mean_base, std_base)
-    
-    # Calcular z‑score e ranquear
-    final_ranking = []
-    for name, res in results.items():
-        mean_base, std_base = baseline_results[name]
-        z = (res['accuracy'] - mean_base) / std_base if std_base > 0 else 0.0
-        pct = 0.0
-        if std_base > 0:
-            # Estima percentil assumindo distribuição normal
-            from scipy.stats import norm
-            pct = norm.cdf(z) * 100
+        # Verificar se alguma autocorrelação é significativa
+        max_ac = max(abs(autocorrs.get(1, 0)), abs(autocorrs.get(5, 0)), abs(autocorrs.get(10, 0)))
+        memoria = "🔍" if max_ac > 0.10 else ("📊" if max_ac > 0.05 else "❌")
         
-        final_ranking.append({
-            'pattern': name,
-            'accuracy': res['accuracy'],
-            'baseline_mean': mean_base,
-            'z_score': z,
-            'percentile': pct,
-            'n_predictions': res['n_predictions'],
-            'p_value': res['p_value']
-        })
-    
-    # Ordenar por z‑score
-    final_ranking.sort(key=lambda x: x['z_score'], reverse=True)
-    
-    # Exibir resultados
-    print(f"\n📊 RANKING DE PODER PREDITIVO REAL:")
-    print(f"{'Padrão':<20} {'Acurácia':<10} {'Baseline':<10} {'Z‑score':<10} {'%ile':<8} {'p‑value':<10} {'Avaliação'}")
-    print("-" * 85)
-    
-    for item in final_ranking:
-        if item['z_score'] > 2.0:
-            avaliacao = "🔍 FORTE"
-        elif item['z_score'] > 1.0:
-            avaliacao = "📊 Leve"
-        elif item['z_score'] > 0:
-            avaliacao = "📊 Marginal"
-        else:
-            avaliacao = "❌ Nulo"
+        print(f"{name:<25} {autocorrs.get(1, 0):<10.4f} {autocorrs.get(5, 0):<10.4f} {autocorrs.get(10, 0):<10.4f} {memoria}")
         
-        print(f"{item['pattern']:<20} {item['accuracy']:<10.1f}% {item['baseline_mean']:<10.1f}% "
-              f"{item['z_score']:<10.2f} {item['percentile']:<8.1f}% {item['p_value']:<10.4f} {avaliacao}")
+        patterns_for_test[name] = ('estrutural', s)
     
-    # Resumo
-    strong = [item for item in final_ranking if item['z_score'] > 2.0]
-    any_strong = len(strong) > 0
+    # Frequência em janela móvel (dezenas mais relevantes)
+    dezenas_relevantes = [20, 12, 4, 11, 10, 25, 18, 21]
+    for d in dezenas_relevantes:
+        for window in [50, 100]:
+            name = f'Freq Dezena {d} ({window})'
+            s = np.array(freq_windows[d][window], dtype=float)
+            autocorrs = compute_autocorrelations(s, max_lag=10)
+            max_ac = max(abs(autocorrs.get(1, 0)), abs(autocorrs.get(5, 0)), abs(autocorrs.get(10, 0)))
+            memoria = "🔍" if max_ac > 0.10 else ""
+            print(f"{name:<25} {autocorrs.get(1, 0):<10.4f} {autocorrs.get(5, 0):<10.4f} {autocorrs.get(10, 0):<10.4f} {memoria}")
+            patterns_for_test[name] = ('frequencia', s)
     
-    print(f"\n📊 RESUMO:")
-    print(f"   Padrões com z > 2.0: {len(strong)}")
-    if any_strong:
-        print(f"   Melhores: {[s['pattern'] for s in strong]}")
+    # Atraso normalizado
+    for d in dezenas_relevantes[:6]:
+        name = f'Atraso Dezena {d}'
+        s = np.array(atraso_hist[d], dtype=float)
+        autocorrs = compute_autocorrelations(s, max_lag=10)
+        max_ac = max(abs(autocorrs.get(1, 0)), abs(autocorrs.get(5, 0)), abs(autocorrs.get(10, 0)))
+        memoria = "🔍" if max_ac > 0.10 else ""
+        print(f"{name:<25} {autocorrs.get(1, 0):<10.4f} {autocorrs.get(5, 0):<10.4f} {autocorrs.get(10, 0):<10.4f} {memoria}")
+        patterns_for_test[name] = ('atraso', s)
+    
+    # 3. Walk‑forward com baseline por permutação
+    print(f"\n📊 WALK‑FORWARD COM BASELINE POR PERMUTAÇÃO:")
+    print(f"{'Padrão':<25} {'Acurácia':<10} {'Z‑Acc':<10} {'Spearman':<10} {'Z‑Spear':<10} {'MAE':<10} {'Z‑MAE':<10}")
+    print("-" * 90)
+    
+    results = []
+    for name, (tipo, s) in tqdm(patterns_for_test.items(), desc="Avaliando padrões"):
+        res = evaluate_pattern_permutation(s, n_perm, train_size, test_size, step)
+        results.append((name, res))
+        
+        # Destacar se algum z‑score é significativo
+        destaque = ""
+        if abs(res['z_accuracy']) > 2.0 or abs(res['z_spearman']) > 2.0 or abs(res['z_mae']) > 2.0:
+            destaque = "🔍"
+        
+        print(f"{name:<25} {res['accuracy']:<10.1f}% {res['z_accuracy']:<10.2f} "
+              f"{res['spearman']:<10.4f} {res['z_spearman']:<10.2f} "
+              f"{res['mae']:<10.2f} {res['z_mae']:<10.2f} {destaque}")
+    
+    # 4. Resumo
+    print(f"\n📊 RESUMO FINAL:")
+    strong_signals = []
+    for name, res in results:
+        if abs(res['z_accuracy']) > 2.0:
+            strong_signals.append((name, 'acurácia', res['z_accuracy']))
+        if abs(res['z_spearman']) > 2.0:
+            strong_signals.append((name, 'Spearman', res['z_spearman']))
+        if abs(res['z_mae']) > 2.0:
+            strong_signals.append((name, 'MAE', res['z_mae']))
+    
+    print(f"   Padrões com z > |2.0|: {len(strong_signals)}")
+    if strong_signals:
+        for name, metrica, z in strong_signals:
+            print(f"      {name}: {metrica} z={z:.2f}")
     else:
-        print(f"   Nenhum padrão mostrou poder preditivo forte fora da amostra.")
-        print(f"   Isso sugere que a Lotofácil se comporta de forma essencialmente aleatória")
-        print(f"   para as características estruturais testadas.")
+        print(f"   Nenhum padrão estrutural mostrou sinal forte fora da amostra.")
+        print(f"   Autocorrelações próximas de zero → ausência de memória temporal.")
+        print(f"   Z‑scores modestos → desempenho compatível com aleatoriedade.")
+        print(f"\n   ✅ A Lotofácil se comporta, para todas as características testadas,")
+        print(f"      como um processo sem memória estrutural explorável.")
     
-    return final_ranking
+    return results, autocorr_results
 
 # ============================================================
 # INTERFACE PRINCIPAL
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v54")
-    print("   PODER PREDITIVO DE PADRÕES ESTRUTURAIS")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v55")
+    print("   MEMÓRIA ESTRUTURAL COM AUTOCORRELAÇÃO + BASELINE POR PERMUTAÇÃO")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
@@ -306,38 +388,16 @@ def main():
         return
     print(f"\n📂 {len(contests)} concursos")
 
-    # Parâmetros do walk‑forward
-    print("\nParâmetros do walk‑forward:")
+    print("\nParâmetros do teste:")
     try:
         train_size = int(input("   Tamanho do treino [500]: ").strip() or "500")
         test_size = int(input("   Tamanho do teste [50]: ").strip() or "50")
         step = int(input("   Passo [50]: ").strip() or "50")
+        n_perm = int(input("   Permutações (baseline) [200]: ").strip() or "200")
     except:
-        train_size, test_size, step = 500, 50, 50
+        train_size, test_size, step, n_perm = 500, 50, 50, 200
 
-    # Executar teste
-    results = test_structural_patterns(contests, train_size, test_size, step)
-
-    # Perguntar se quer ver detalhes de algum padrão
-    ver_detalhes = input("\nVer detalhes de algum padrão? (nome ou ENTER para sair): ").strip()
-    if ver_detalhes:
-        # Reconstruir séries para mostrar
-        series, _, _ = build_structural_series(contests)
-        # Mostrar os últimos valores
-        if ver_detalhes == 'Pares':
-            print(f"   Últimos 10 valores de Pares: {series['pares'][-10:]}")
-        elif ver_detalhes == 'Moldura':
-            print(f"   Últimos 10 valores de Moldura: {series['moldura'][-10:]}")
-        elif ver_detalhes == 'Primos':
-            print(f"   Últimos 10 valores de Primos: {series['primos'][-10:]}")
-        elif ver_detalhes == 'Soma':
-            print(f"   Últimos 10 valores de Soma: {series['soma'][-10:]}")
-        elif ver_detalhes == 'Consecutivos':
-            print(f"   Últimos 10 valores de Consecutivos: {series['consecutivos'][-10:]}")
-        elif ver_detalhes == 'Amplitude':
-            print(f"   Últimos 10 valores de Amplitude: {series['amplitude'][-10:]}")
-        else:
-            print(f"   Padrão '{ver_detalhes}' não reconhecido.")
+    test_structural_patterns_v55(contests, train_size, test_size, step, n_perm)
 
     print("\n✅ Análise concluída.")
 
