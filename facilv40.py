@@ -2,21 +2,22 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v57
-TESTES DE REGRESSÃO À MÉDIA NOS PARES
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v58
+RESPOSTA AO IMPULSO: DINÂMICA DE REGRESSÃO À MÉDIA
 
-TRÊS TESTES INDEPENDENTES:
-✅ Teste A (Binário): se média recente > 7.2, prevê ≤7 pares;
-   se < 7.2, prevê ≥8. Mede acurácia e p‑valor.
-✅ Teste B (Correlação): correlação entre desvio atual e desvio futuro.
-   Se negativa e significativa → regressão à média.
-✅ Teste C (Extremos): quando a janela recente está > 8.0 ou < 6.5 pares,
-   mede a média do próximo concurso.
-✅ Walk‑forward honesto (sem vazamento temporal)
+OBJETIVO:
+✅ Para cada padrão estrutural (pares, moldura, primos, etc.),
+   detectar eventos onde a média móvel se afasta da média histórica
+   por mais de 1 ou 2 desvios padrão.
+✅ Medir a trajetória de retorno nos concursos seguintes
+   (t+1, t+2, t+3, t+5, t+10, t+20, t+50).
+✅ Construir curvas de relaxação empíricas.
+✅ Walk‑forward honesto: sem vazamento temporal.
 """
 
 import numpy as np
-from scipy.stats import binomtest, pearsonr
+from scipy.stats import hypergeom
+from collections import defaultdict
 import os, warnings
 from tqdm import tqdm
 
@@ -25,7 +26,8 @@ warnings.filterwarnings('ignore')
 # ============================================================
 # CONSTANTES
 # ============================================================
-MEDIA_TEORICA_PARES = 15 * 12 / 25   # 7.2
+MOLDURA_SET = {1,2,3,4,5, 6,10, 11,15, 16,20, 21,22,23,24,25}
+PRIMES_SET = {2, 3, 5, 7, 11, 13, 17, 19, 23}
 
 # ============================================================
 # CARREGAMENTO DE DADOS
@@ -51,124 +53,168 @@ def load_all_contests(csv_file='resultados_lotofacil.csv'):
     return contests
 
 # ============================================================
-# EXTRAÇÃO DA SÉRIE DE PARES
+# EXTRAÇÃO DE PADRÕES ESTRUTURAIS
 # ============================================================
-def extrair_serie_pares(contests):
-    """Retorna um array numpy com o número de pares em cada concurso."""
-    return np.array([sum(1 for x in c['dezenas'] if x % 2 == 0) for c in contests], dtype=float)
+def extrair_series(contests):
+    """Extrai todas as séries estruturais."""
+    series = {
+        'pares': [],
+        'moldura': [],
+        'primos': [],
+        'soma': [],
+        'consecutivos': [],
+        'amplitude': []
+    }
+    for c in contests:
+        d = c['dezenas']
+        series['pares'].append(sum(1 for x in d if x % 2 == 0))
+        series['moldura'].append(sum(1 for x in d if x in MOLDURA_SET))
+        series['primos'].append(sum(1 for x in d if x in PRIMES_SET))
+        series['soma'].append(sum(d))
+        series['consecutivos'].append(sum(1 for i in range(len(d)-1) if d[i+1]-d[i] == 1))
+        series['amplitude'].append(max(d) - min(d))
+    
+    return {k: np.array(v, dtype=float) for k, v in series.items()}
 
 # ============================================================
-# TESTE A: PREVISÃO BINÁRIA
+# RESPOSTA AO IMPULSO
 # ============================================================
-def teste_binario(serie, janela=20):
+def impulso_response(series_dict, janelas_media=[5, 10, 20, 50], 
+                     thresholds=[1.0, 2.0],
+                     horizontes=[1, 2, 3, 5, 10, 20, 50]):
     """
-    Para cada ponto t (janela .. n-1):
-    - calcula a média dos últimos 'janela' valores (até t-1)
-    - se média > 7.2, prevê que o próximo valor será ≤ 7
-    - se média < 7.2, prevê que o próximo valor será ≥ 8
-    - compara com o valor real em t
+    Para cada padrão e cada janela de média móvel:
+    1. Calcula a média e desvio padrão históricos (até o concurso atual).
+    2. Detecta eventos onde a média móvel se afasta da média histórica
+       por mais de threshold desvios padrão.
+    3. Para cada evento, registra a média móvel nos horizontes seguintes.
     """
-    n = len(serie)
-    acertos = 0
-    total = 0
+    resultados = {}
     
-    for t in range(janela, n):
-        media_recente = np.mean(serie[t-janela:t])
-        valor_real = serie[t]
+    for nome, serie in series_dict.items():
+        n = len(serie)
+        resultados[nome] = {}
         
-        if media_recente > MEDIA_TEORICA_PARES:
-            previsao = 'baixo'  # espera ≤7
-            acertou = (valor_real <= 7)
-        elif media_recente < MEDIA_TEORICA_PARES:
-            previsao = 'alto'   # espera ≥8
-            acertou = (valor_real >= 8)
-        else:
-            continue  # exatamente na média, ignora
-        
-        total += 1
-        if acertou:
-            acertos += 1
+        for janela in janelas_media:
+            # Calcular média móvel
+            media_movel = np.full(n, np.nan)
+            for i in range(janela, n):
+                media_movel[i] = np.mean(serie[i-janela:i])
+            
+            # Inicializar coletores para cada combinação de threshold e direção
+            eventos = defaultdict(list)  # chave: (threshold, direcao)
+            
+            for i in range(janela, n - max(horizontes)):
+                if np.isnan(media_movel[i]):
+                    continue
+                
+                # Média e desvio históricos ATÉ i (sem vazamento)
+                hist_media = np.mean(serie[:i])
+                hist_std = np.std(serie[:i])
+                if hist_std == 0:
+                    continue
+                
+                desvio = (media_movel[i] - hist_media) / hist_std
+                
+                # Verificar thresholds
+                for thresh in thresholds:
+                    if desvio > thresh:
+                        # Coletar médias móveis futuras
+                        trajetoria = []
+                        for h in horizontes:
+                            if i + h < n:
+                                # Média móvel no futuro (usando janela até i+h)
+                                if i + h >= janela:
+                                    mm_futura = np.mean(serie[i+h-janela:i+h])
+                                else:
+                                    mm_futura = np.nan
+                                trajetoria.append(mm_futura)
+                            else:
+                                trajetoria.append(np.nan)
+                        eventos[(thresh, 'alto')].append(trajetoria)
+                    
+                    elif desvio < -thresh:
+                        trajetoria = []
+                        for h in horizontes:
+                            if i + h < n:
+                                if i + h >= janela:
+                                    mm_futura = np.mean(serie[i+h-janela:i+h])
+                                else:
+                                    mm_futura = np.nan
+                                trajetoria.append(mm_futura)
+                            else:
+                                trajetoria.append(np.nan)
+                        eventos[(thresh, 'baixo')].append(trajetoria)
+            
+            # Agregar trajetórias
+            resultados[nome][janela] = {}
+            for (thresh, direcao), trajetorias in eventos.items():
+                if len(trajetorias) == 0:
+                    continue
+                traj_array = np.array(trajetorias)
+                media_traj = np.nanmean(traj_array, axis=0)
+                std_traj = np.nanstd(traj_array, axis=0)
+                n_eventos = len(trajetorias)
+                resultados[nome][janela][(thresh, direcao)] = {
+                    'media': media_traj,
+                    'std': std_traj,
+                    'n': n_eventos,
+                    'horizontes': horizontes
+                }
     
-    if total == 0:
-        return 0.5, 0, 0, 1.0
-    
-    acuracia = acertos / total
-    p_value = binomtest(acertos, total, 0.5, alternative='greater').pvalue
-    
-    return acuracia, acertos, total, p_value
+    return resultados
 
 # ============================================================
-# TESTE B: CORRELAÇÃO DE DESVIOS
+# EXIBIÇÃO DOS RESULTADOS
 # ============================================================
-def teste_correlacao(serie, janela=20):
-    """
-    Para cada t (janela .. n-1):
-    - desvio_atual = média_recente - 7.2
-    - desvio_futuro = valor_real - 7.2
-    Mede a correlação entre esses dois vetores.
-    """
-    n = len(serie)
-    desvios_atuais = []
-    desvios_futuros = []
-    
-    for t in range(janela, n):
-        media_recente = np.mean(serie[t-janela:t])
-        valor_real = serie[t]
-        desvios_atuais.append(media_recente - MEDIA_TEORICA_PARES)
-        desvios_futuros.append(valor_real - MEDIA_TEORICA_PARES)
-    
-    if len(desvios_atuais) < 10:
-        return 0.0, 1.0, 0
-    
-    corr, p_value = pearsonr(desvios_atuais, desvios_futuros)
-    return corr, p_value, len(desvios_atuais)
-
-# ============================================================
-# TESTE C: ANÁLISE DE EXTREMOS
-# ============================================================
-def teste_extremos(serie, janela=20, limiar_alto=8.0, limiar_baixo=6.5):
-    """
-    Quando a média recente está acima de limiar_alto,
-    verifica a média do próximo valor.
-    Quando está abaixo de limiar_baixo, idem.
-    """
-    n = len(serie)
-    altos = []
-    baixos = []
-    
-    for t in range(janela, n):
-        media_recente = np.mean(serie[t-janela:t])
-        valor_real = serie[t]
+def exibir_resultados(resultados, series_dict):
+    """Exibe as curvas de relaxação para cada padrão."""
+    for nome in ['pares', 'moldura', 'primos']:  # foco nos mais relevantes
+        serie = series_dict[nome]
+        media_hist = np.mean(serie)
+        std_hist = np.std(serie)
         
-        if media_recente > limiar_alto:
-            altos.append(valor_real)
-        elif media_recente < limiar_baixo:
-            baixos.append(valor_real)
-    
-    resultado = {}
-    if altos:
-        resultado['media_pos_alto'] = np.mean(altos)
-        resultado['n_alto'] = len(altos)
-    else:
-        resultado['media_pos_alto'] = None
-        resultado['n_alto'] = 0
-    
-    if baixos:
-        resultado['media_pos_baixo'] = np.mean(baixos)
-        resultado['n_baixo'] = len(baixos)
-    else:
-        resultado['media_pos_baixo'] = None
-        resultado['n_baixo'] = 0
-    
-    return resultado
+        print(f"\n{'='*70}")
+        print(f"📊 PADRÃO: {nome.upper()} (média={media_hist:.2f}, σ={std_hist:.2f})")
+        print(f"{'='*70}")
+        
+        for janela in sorted(resultados[nome].keys()):
+            print(f"\n   Janela de média móvel: {janela} concursos")
+            for (thresh, direcao), dados in sorted(resultados[nome][janela].items()):
+                if dados['n'] < 5:  # ignora amostras muito pequenas
+                    continue
+                print(f"\n   {'🔺' if direcao=='alto' else '🔻'} Desvio > {thresh}σ ({direcao}) — {dados['n']} eventos")
+                print(f"   {'Horizonte':<10} {'Média móvel':<15} {'Δ para média':<15}")
+                print(f"   {'-'*40}")
+                
+                for i, h in enumerate(dados['horizontes']):
+                    mm = dados['media'][i]
+                    if not np.isnan(mm):
+                        delta = mm - media_hist
+                        print(f"   t+{h:<8} {mm:<15.4f} {delta:+.4f}")
+                
+                # Calcular "meia‑vida" aproximada: horizonte onde o desvio cai pela metade
+                desvio_inicial = dados['media'][0] - media_hist if not np.isnan(dados['media'][0]) else 0
+                if abs(desvio_inicial) > 0.01:
+                    meia_vida = None
+                    for i, h in enumerate(dados['horizontes']):
+                        if not np.isnan(dados['media'][i]):
+                            desvio_atual = dados['media'][i] - media_hist
+                            if abs(desvio_atual) <= abs(desvio_inicial) / 2:
+                                meia_vida = h
+                                break
+                    if meia_vida:
+                        print(f"   ⏱️ Meia‑vida aproximada: {meia_vida} concursos")
+                    else:
+                        print(f"   ⏱️ Desvio não reduziu à metade no horizonte observado")
 
 # ============================================================
 # INTERFACE PRINCIPAL
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v57")
-    print("   REGRESSÃO À MÉDIA NOS PARES – TRÊS TESTES")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v58")
+    print("   RESPOSTA AO IMPULSO: DINÂMICA DE REGRESSÃO À MÉDIA")
     print("="*70)
     
     contests = load_all_contests('resultados_lotofacil.csv')
@@ -178,80 +224,39 @@ def main():
     
     print(f"\n📂 {len(contests)} concursos")
     
-    # Extrair série de pares
-    serie_pares = extrair_serie_pares(contests)
-    print(f"📊 Série de pares: {len(serie_pares)} valores")
-    print(f"   Média histórica: {np.mean(serie_pares):.4f}")
-    print(f"   Média teórica:   {MEDIA_TEORICA_PARES:.4f}")
+    # Extrair séries
+    series_dict = extrair_series(contests)
+    print("📊 Séries extraídas: pares, moldura, primos, soma, consecutivos, amplitude")
     
     # Parâmetros
-    janela = 20
-    print(f"\n⚙️ Janela para média recente: {janela} concursos")
+    janelas = [5, 10, 20, 50]
+    thresholds = [1.0, 2.0]
+    horizontes = [1, 2, 3, 5, 10, 20, 50]
     
-    # Teste A
-    print("\n" + "="*70)
-    print("TESTE A: PREVISÃO BINÁRIA")
+    print(f"\n⚙️ Parâmetros:")
+    print(f"   Janelas de média móvel: {janelas}")
+    print(f"   Thresholds (σ): {thresholds}")
+    print(f"   Horizontes: {horizontes}")
+    
+    # Executar análise
+    print(f"\n🔄 Processando (isso pode levar alguns segundos)...")
+    resultados = impulso_response(series_dict, janelas, thresholds, horizontes)
+    
+    # Exibir resultados
+    exibir_resultados(resultados, series_dict)
+    
+    # Conclusão interpretativa
+    print(f"\n{'='*70}")
+    print("📊 INTERPRETAÇÃO")
     print("="*70)
-    acuracia, acertos, total, p_val = teste_binario(serie_pares, janela)
-    print(f"   Previsões: {total}")
-    print(f"   Acertos: {acertos}")
-    print(f"   Acurácia: {acuracia*100:.2f}%")
-    print(f"   p‑valor (binomial): {p_val:.4f}")
-    if p_val < 0.05:
-        print(f"   🔍 Estatisticamente significativo (p < 0.05)")
-    else:
-        print(f"   📊 Não significativo")
+    print("Se a média móvel retorna ao valor histórico em t+1 ou t+2,")
+    print("isso sugere que cada concurso é independente e o desvio era")
+    print("apenas flutuação amostral (sem memória).")
+    print("Se o retorno é gradual (ex.: 5-10 concursos), pode indicar")
+    print("uma dinâmica de reversão mais lenta, potencialmente explorável.")
+    print("Observe também a meia‑vida estimada para cada caso.")
     
-    # Teste B
-    print("\n" + "="*70)
-    print("TESTE B: CORRELAÇÃO DE DESVIOS")
-    print("="*70)
-    corr, p_corr, n_pares = teste_correlacao(serie_pares, janela)
-    print(f"   Pares (desvio atual, desvio futuro): {n_pares}")
-    print(f"   Correlação de Pearson: {corr:.4f}")
-    print(f"   p‑valor: {p_corr:.4f}")
-    if corr < 0 and p_corr < 0.05:
-        print(f"   🔍 Correlação negativa significativa → regressão à média detectada!")
-    elif corr < 0:
-        print(f"   📊 Correlação negativa, mas não significativa.")
-    elif corr > 0:
-        print(f"   📊 Correlação positiva (não indica regressão à média).")
-    else:
-        print(f"   📊 Correlação nula.")
-    
-    # Teste C
-    print("\n" + "="*70)
-    print("TESTE C: ANÁLISE DE EXTREMOS")
-    print("="*70)
-    extremos = teste_extremos(serie_pares, janela)
-    print(f"   Após janela com média > 8.0 pares:")
-    if extremos['media_pos_alto'] is not None:
-        print(f"      Média do próximo concurso: {extremos['media_pos_alto']:.4f}")
-        print(f"      Ocorrências: {extremos['n_alto']}")
-    else:
-        print(f"      Nenhuma ocorrência.")
-    print(f"   Após janela com média < 6.5 pares:")
-    if extremos['media_pos_baixo'] is not None:
-        print(f"      Média do próximo concurso: {extremos['media_pos_baixo']:.4f}")
-        print(f"      Ocorrências: {extremos['n_baixo']}")
-    else:
-        print(f"      Nenhuma ocorrência.")
-    
-    # Conclusão
-    print("\n" + "="*70)
-    print("📊 CONCLUSÃO")
-    print("="*70)
-    if p_val < 0.05 and corr < 0 and p_corr < 0.05:
-        print("✅ Os três testes indicam regressão à média significativa nos pares.")
-        print("   Este é o primeiro sinal robusto encontrado pelo laboratório.")
-    elif p_val < 0.05 or (corr < 0 and p_corr < 0.05):
-        print("📊 Alguns testes indicam regressão à média, mas não todos.")
-        print("   São necessários mais experimentos para confirmar.")
-    else:
-        print("❌ Nenhum teste detectou regressão à média significativa.")
-        print("   Os pares não mostram memória temporal explorável.")
-    
-    print("\n✅ Experimentos concluídos.")
+    print("\n✅ Análise concluída.")
 
 if __name__ == "__main__":
     main()
