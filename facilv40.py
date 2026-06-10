@@ -2,21 +2,21 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v59
-RESPOSTA AO IMPULSO: VALORES BRUTOS (SEM MÉDIA MÓVEL)
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v61
+INFORMAÇÃO MÚTUA AVANÇADA: CONCURSOS, DEZENAS E ESTRUTURAS
 
-CORREÇÃO METODOLÓGICA:
-✅ Mede o valor bruto dos concursos futuros (t+1, t+2, ...)
-   em vez da média móvel.
-✅ Elimina a inércia artificial da média móvel.
-✅ Detecta se, após um evento extremo, os sorteios individuais
-   regridem à média ou permanecem independentes.
-✅ Mantém walk‑forward honesto (sem vazamento temporal).
+MELHORIAS:
+✅ Permutações aumentadas para 2000 (significância mais precisa)
+✅ Lags estendidos: 1, 2, 3, 5, 10, 20, 50
+✅ MI para dezenas individuais (25 séries binárias)
+✅ MI para o concurso completo (vetor de 25 bits)
+✅ Correção de viés por permutação em todos os casos
 """
 
 import numpy as np
-from scipy.stats import hypergeom
-from collections import defaultdict
+from scipy.stats import entropy
+from collections import Counter
+from itertools import product
 import os, warnings
 from tqdm import tqdm
 
@@ -52,10 +52,10 @@ def load_all_contests(csv_file='resultados_lotofacil.csv'):
     return contests
 
 # ============================================================
-# EXTRAÇÃO DE PADRÕES ESTRUTURAIS
+# EXTRAÇÃO DE DADOS
 # ============================================================
-def extrair_series(contests):
-    """Extrai todas as séries estruturais."""
+def extrair_series_estruturais(contests):
+    """Séries de características agregadas (pares, moldura, etc.)."""
     series = {
         'pares': [],
         'moldura': [],
@@ -72,178 +72,174 @@ def extrair_series(contests):
         series['soma'].append(sum(d))
         series['consecutivos'].append(sum(1 for i in range(len(d)-1) if d[i+1]-d[i] == 1))
         series['amplitude'].append(max(d) - min(d))
-    
     return {k: np.array(v, dtype=float) for k, v in series.items()}
 
-# ============================================================
-# RESPOSTA AO IMPULSO COM VALORES BRUTOS
-# ============================================================
-def impulso_response_raw(series_dict, janelas_media=[5, 10, 20, 50], 
-                         thresholds=[1.0, 2.0],
-                         horizontes=[1, 2, 3, 5, 10, 20, 50]):
-    """
-    Para cada padrão e cada janela de média móvel:
-    1. Calcula média e desvio padrão históricos (até o concurso atual).
-    2. Detecta eventos onde a média móvel se afasta da média histórica
-       por mais de threshold desvios padrão.
-    3. Para cada evento, registra o VALOR BRUTO dos concursos seguintes
-       (não a média móvel).
-    """
-    resultados = {}
-    
-    for nome, serie in series_dict.items():
-        n = len(serie)
-        resultados[nome] = {}
-        
-        for janela in janelas_media:
-            # Calcular média móvel
-            media_movel = np.full(n, np.nan)
-            for i in range(janela, n):
-                media_movel[i] = np.mean(serie[i-janela:i])
-            
-            # Inicializar coletores
-            eventos = defaultdict(list)  # chave: (threshold, direcao)
-            
-            for i in range(janela, n - max(horizontes)):
-                if np.isnan(media_movel[i]):
-                    continue
-                
-                # Média e desvio históricos ATÉ i (sem vazamento)
-                hist_media = np.mean(serie[:i])
-                hist_std = np.std(serie[:i])
-                if hist_std == 0:
-                    continue
-                
-                desvio = (media_movel[i] - hist_media) / hist_std
-                
-                # Verificar thresholds
-                for thresh in thresholds:
-                    if desvio > thresh:
-                        # Coletar VALORES BRUTOS futuros
-                        trajetoria = []
-                        for h in horizontes:
-                            if i + h < n:
-                                trajetoria.append(serie[i + h])
-                            else:
-                                trajetoria.append(np.nan)
-                        eventos[(thresh, 'alto')].append(trajetoria)
-                    
-                    elif desvio < -thresh:
-                        trajetoria = []
-                        for h in horizontes:
-                            if i + h < n:
-                                trajetoria.append(serie[i + h])
-                            else:
-                                trajetoria.append(np.nan)
-                        eventos[(thresh, 'baixo')].append(trajetoria)
-            
-            # Agregar trajetórias
-            resultados[nome][janela] = {}
-            for (thresh, direcao), trajetorias in eventos.items():
-                if len(trajetorias) == 0:
-                    continue
-                traj_array = np.array(trajetorias)
-                media_traj = np.nanmean(traj_array, axis=0)
-                std_traj = np.nanstd(traj_array, axis=0)
-                n_eventos = len(trajetorias)
-                resultados[nome][janela][(thresh, direcao)] = {
-                    'media': media_traj,
-                    'std': std_traj,
-                    'n': n_eventos,
-                    'horizontes': horizontes
-                }
-    
-    return resultados
+def extrair_series_dezenas(contests):
+    """25 séries binárias (presença/ausência de cada dezena)."""
+    n = len(contests)
+    dezenas = np.zeros((n, 25), dtype=np.int8)
+    for i, c in enumerate(contests):
+        for d in c['dezenas']:
+            dezenas[i, d-1] = 1
+    return dezenas
 
 # ============================================================
-# EXIBIÇÃO DOS RESULTADOS
+# INFORMAÇÃO MÚTUA (COM CORREÇÃO POR PERMUTAÇÃO)
 # ============================================================
-def exibir_resultados(resultados, series_dict):
-    """Exibe as curvas de relaxação para cada padrão."""
-    for nome in ['pares', 'moldura', 'primos']:
-        serie = series_dict[nome]
-        media_hist = np.mean(serie)
-        std_hist = np.std(serie)
-        
-        print(f"\n{'='*70}")
-        print(f"📊 PADRÃO: {nome.upper()} (média histórica={media_hist:.2f}, σ={std_hist:.2f})")
-        print(f"{'='*70}")
-        
-        for janela in sorted(resultados[nome].keys()):
-            print(f"\n   Janela de referência: {janela} concursos")
-            for (thresh, direcao), dados in sorted(resultados[nome][janela].items()):
-                if dados['n'] < 5:  # ignora amostras muito pequenas
-                    continue
-                print(f"\n   {'🔺' if direcao=='alto' else '🔻'} Desvio > {thresh}σ ({direcao}) — {dados['n']} eventos")
-                print(f"   {'Horizonte':<10} {'Valor bruto':<15} {'Δ para média':<15}")
-                print(f"   {'-'*40}")
-                
-                # Exibir todos os horizontes
-                for i, h in enumerate(dados['horizontes']):
-                    val = dados['media'][i]
-                    if not np.isnan(val):
-                        delta = val - media_hist
-                        print(f"   t+{h:<8} {val:<15.4f} {delta:+.4f}")
-                
-                # Análise: em t+1, o valor já está próximo da média?
-                if not np.isnan(dados['media'][0]):
-                    delta_t1 = abs(dados['media'][0] - media_hist)
-                    if delta_t1 < 0.5 * std_hist:
-                        print(f"   ✅ Em t+1, o valor já está a menos de 0.5σ da média histórica.")
-                        print(f"      Isso sugere independência: cada concurso é aproximadamente i.i.d.")
-                    elif delta_t1 < 1.0 * std_hist:
-                        print(f"   📊 Em t+1, o valor está entre 0.5σ e 1σ da média.")
-                    else:
-                        print(f"   🔍 Em t+1, o desvio ainda é >1σ. Possível persistência de curto prazo.")
+def mutual_information(x, y, bins=None):
+    """MI entre duas séries. bins=None para dados discretos."""
+    if bins is not None:
+        combined = np.concatenate([x, y])
+        bin_edges = np.percentile(combined, np.linspace(0, 100, bins+1))
+        x_disc = np.digitize(x, bin_edges[1:-1])
+        y_disc = np.digitize(y, bin_edges[1:-1])
+    else:
+        x_disc = x.astype(int)
+        y_disc = y.astype(int)
+    joint = Counter(zip(x_disc, y_disc))
+    total = len(x_disc)
+    mi = 0.0
+    for (xi, yi), cnt in joint.items():
+        p_xy = cnt / total
+        p_x = np.mean(x_disc == xi)
+        p_y = np.mean(y_disc == yi)
+        if p_x > 0 and p_y > 0:
+            mi += p_xy * np.log2(p_xy / (p_x * p_y))
+    return mi
+
+def mi_significance(series, lag, n_perm=2000, bins=None):
+    """MI observada, corrigida, p-valor e média nula."""
+    if len(series) <= lag:
+        return 0, 0, 1.0, 0
+    x = series[:-lag]
+    y = series[lag:]
+    mi_obs = mutual_information(x, y, bins=bins)
+    mi_null = np.zeros(n_perm)
+    y_shuffled = y.copy()
+    for i in range(n_perm):
+        np.random.shuffle(y_shuffled)
+        mi_null[i] = mutual_information(x, y_shuffled, bins=bins)
+    mean_null = np.mean(mi_null)
+    mi_corr = mi_obs - mean_null
+    p_val = np.mean(mi_null >= mi_obs)
+    return mi_obs, mi_corr, p_val, mean_null
+
+# ============================================================
+# ANÁLISE COMPLETA
+# ============================================================
+def analisar_mi_estrutural(series_dict, lags):
+    """MI para características agregadas."""
+    bins_cfg = {
+        'pares': None, 'moldura': None, 'primos': None,
+        'soma': 10, 'consecutivos': None, 'amplitude': 10
+    }
+    print("\n📊 INFORMAÇÃO MÚTUA – CARACTERÍSTICAS ESTRUTURAIS")
+    print(f"   Lags: {lags} | Permutações: 2000\n")
+    resultados = {}
+    for nome, serie in series_dict.items():
+        bins = bins_cfg.get(nome, 10)
+        print(f"--- {nome} ---")
+        print(f"   {'Lag':<8} {'MI obs':<10} {'MI corr':<10} {'p‑valor':<10}")
+        for lag in lags:
+            mi_obs, mi_corr, p_val, _ = mi_significance(serie, lag, bins=bins)
+            print(f"   {lag:<8} {mi_obs:<10.4f} {mi_corr:<10.4f} {p_val:<10.4f}")
+        resultados[nome] = {lag: {'mi_corr': mi_corr, 'p_val': p_val} for lag in lags}
+    return resultados
+
+def analisar_mi_dezenas(dezenas, lags):
+    """MI para cada uma das 25 dezenas (séries binárias)."""
+    print("\n📊 INFORMAÇÃO MÚTUA – DEZENAS INDIVIDUAIS")
+    print(f"   Lags: {lags} | Permutações: 2000\n")
+    resultados = {}
+    for d in range(25):
+        serie = dezenas[:, d]
+        print(f"--- Dezena {d+1:2d} ---")
+        print(f"   {'Lag':<8} {'MI obs':<10} {'MI corr':<10} {'p‑valor':<10}")
+        for lag in lags:
+            mi_obs, mi_corr, p_val, _ = mi_significance(serie, lag, bins=None)
+            print(f"   {lag:<8} {mi_obs:<10.4f} {mi_corr:<10.4f} {p_val:<10.4f}")
+        resultados[d+1] = {lag: {'mi_corr': mi_corr, 'p_val': p_val} for lag in lags}
+    return resultados
+
+def analisar_mi_concurso(contests, lags):
+    """MI entre concursos completos (vetor de 25 bits)."""
+    # Representação como máscara de bits (número inteiro)
+    masks = np.array([BITMASK_CACHE.get_mask(c['dezenas']) for c in contests], dtype=np.uint32)
+    print("\n📊 INFORMAÇÃO MÚTUA – CONCURSO COMPLETO (25 bits)")
+    print(f"   Lags: {lags} | Permutações: 2000\n")
+    # Discretização: usamos os próprios inteiros (já são discretos)
+    print(f"   {'Lag':<8} {'MI obs':<10} {'MI corr':<10} {'p‑valor':<10}")
+    for lag in lags:
+        mi_obs, mi_corr, p_val, _ = mi_significance(masks, lag, bins=None)
+        print(f"   {lag:<8} {mi_obs:<10.4f} {mi_corr:<10.4f} {p_val:<10.4f}")
+
+class BitmaskCache:
+    def __init__(self):
+        self._cache = {}
+    def get_mask(self, game):
+        key = tuple(game) if isinstance(game, list) else game
+        if key not in self._cache:
+            mask = 0
+            for d in key:
+                mask |= (1 << d)
+            self._cache[key] = mask
+        return self._cache[key]
+
+BITMASK_CACHE = BitmaskCache()
 
 # ============================================================
 # INTERFACE PRINCIPAL
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v59")
-    print("   RESPOSTA AO IMPULSO: VALORES BRUTOS (SEM MÉDIA MÓVEL)")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v61")
+    print("   INFORMAÇÃO MÚTUA AVANÇADA")
     print("="*70)
     
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
         print("❌ Arquivo 'resultados_lotofacil.csv' não encontrado.")
         return
-    
     print(f"\n📂 {len(contests)} concursos")
-    
-    # Extrair séries
-    series_dict = extrair_series(contests)
-    print("📊 Séries extraídas: pares, moldura, primos, soma, consecutivos, amplitude")
-    
+
     # Parâmetros
-    janelas = [5, 10, 20, 50]
-    thresholds = [1.0, 2.0]
-    horizontes = [1, 2, 3, 5, 10, 20, 50]
-    
-    print(f"\n⚙️ Parâmetros:")
-    print(f"   Janelas de referência: {janelas}")
-    print(f"   Thresholds (σ): {thresholds}")
-    print(f"   Horizontes: {horizontes}")
-    
-    # Executar análise
-    print(f"\n🔄 Processando...")
-    resultados = impulso_response_raw(series_dict, janelas, thresholds, horizontes)
-    
-    # Exibir resultados
-    exibir_resultados(resultados, series_dict)
-    
-    # Conclusão interpretativa
-    print(f"\n{'='*70}")
-    print("📊 INTERPRETAÇÃO")
+    lags = [1, 2, 3, 5, 10, 20, 50]
+
+    # 1. Características estruturais
+    series_est = extrair_series_estruturais(contests)
+    resultados_est = analisar_mi_estrutural(series_est, lags)
+
+    # 2. Dezenas individuais
+    dezenas = extrair_series_dezenas(contests)
+    resultados_dez = analisar_mi_dezenas(dezenas, lags)
+
+    # 3. Concurso completo
+    analisar_mi_concurso(contests, lags)
+
+    # Resumo
+    print("\n" + "="*70)
+    print("📊 RESUMO GERAL")
     print("="*70)
-    print("Este teste mede o VALOR BRUTO de cada concurso futuro após")
-    print("um evento extremo na média móvel. Não há inércia artificial.")
-    print("Se em t+1 o valor já está próximo da média histórica, isso")
-    print("indica que os sorteios são essencialmente independentes (i.i.d.).")
-    print("Se o desvio persiste por vários concursos, pode haver memória")
-    print("de curto prazo.")
-    
+    sinais = []
+    # Verificar características
+    for nome, res in resultados_est.items():
+        for lag, val in res.items():
+            if val['p_val'] < 0.05 and val['mi_corr'] > 0.001:
+                sinais.append((f"Estrutura {nome}", lag, val['mi_corr'], val['p_val']))
+    # Verificar dezenas
+    for dezena, res in resultados_dez.items():
+        for lag, val in res.items():
+            if val['p_val'] < 0.05 and val['mi_corr'] > 0.001:
+                sinais.append((f"Dezena {dezena}", lag, val['mi_corr'], val['p_val']))
+    if sinais:
+        print("   🔍 Possíveis dependências detectadas:")
+        for s in sinais[:10]:
+            print(f"      {s[0]} lag {s[1]}: MI corr={s[2]:.4f}, p={s[3]:.4f}")
+    else:
+        print("   ✅ Nenhuma dependência temporal significativa encontrada.")
+        print("   As características e dezenas são compatíveis com independência (i.i.d.).")
+        print("   I(X_t ; X_{t+lag}) ≈ 0 para todos os lags testados.")
+
     print("\n✅ Análise concluída.")
 
 if __name__ == "__main__":
