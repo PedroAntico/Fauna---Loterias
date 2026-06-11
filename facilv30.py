@@ -775,7 +775,7 @@ def main():
                 max_semifixed=max_semifixed,
                 range_pares=range_pares,
                 range_moldura=range_moldura,
-                range_primos=range_primos))
+                range_primos=range_primos)
             portfolio = opt.optimize(5, 30000, method=method)
             for i, g in enumerate(portfolio, 1):
                 p = sum(1 for x in g if x%2==0); pr = sum(1 for x in g if x in PRIMES); m = sum(1 for x in g if x in MOLDURA)
