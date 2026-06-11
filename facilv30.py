@@ -254,6 +254,8 @@ class PortfolioOptimizer:
     def optimize(self, n_games=5, n_candidates=30000, method='pair_covering'):
         print(f"\n🧩 CARTEIRA: {n_games} jogos | método: {method}")
         if self.fixed: print(f"   Fixas: {self.fixed}")
+        if self.semifixed: print( f"   Semifixas: {self.semifixed} "
+                                 f"(mín={self.min_semifixed}, máx={self.max_semifixed})" )
         if self.range_pares: print(f"   Pares: {self.range_pares}")
         if self.range_moldura: print(f"   Moldura: {self.range_moldura}")
         if self.range_primos: print(f"   Primos: {self.range_primos}")
@@ -728,8 +730,27 @@ def main():
         op = input("Escolha: ").strip()
         
         if op == '1':
-            fixed_str = input("\n   Dezenas fixas (ex: 15 16 20 ou ENTER): ").strip()
+            fixed_str = input( "\n   Dezenas fixas (ex: 15 16 20 ou ENTER): ").strip()  
             fixed = [int(x) for x in fixed_str.split()] if fixed_str else []
+              
+            semifixed_str = input(
+                "   Dezenas semifixas (ex: 03 07 14 25 ou ENTER): ").strip()
+            
+            semifixed = [int(x) for x in semifixed_str.split()] if semifixed_str else []
+            
+            if semifixed:
+                try:
+                    min_semifixed = int(
+                        input( f"   Mínimo de semifixas [0-{len(semifixed)}]: " ).strip() or "0" )
+            
+                    max_semifixed = int( input( f"   Máximo de semifixas [0-{len(semifixed)}]: " ).strip() or str(len(semifixed)) )
+            
+                except:
+                    min_semifixed = 0
+                    max_semifixed = len(semifixed)
+            else:
+                min_semifixed = 0
+                max_semifixed = None
             print("   Faixas estruturais (ENTER para pular)")
             try:
                 pares_str = input("   Pares min,max (ex: 7,9): ").strip()
@@ -746,8 +767,15 @@ def main():
             metodo = input("\n   Método [1. Pair, 2. Triple]: ").strip() or "1"
             method = 'pair_covering' if metodo == '1' else 'triple_covering'
             
-            opt = PortfolioOptimizer(contests, fixed=fixed, range_pares=range_pares,
-                                     range_moldura=range_moldura, range_primos=range_primos)
+            opt = PortfolioOptimizer(
+                contests,
+                fixed=fixed,
+                semifixed=semifixed,
+                min_semifixed=min_semifixed,
+                max_semifixed=max_semifixed,
+                range_pares=range_pares,
+                range_moldura=range_moldura,
+                range_primos=range_primos))
             portfolio = opt.optimize(5, 30000, method=method)
             for i, g in enumerate(portfolio, 1):
                 p = sum(1 for x in g if x%2==0); pr = sum(1 for x in g if x in PRIMES); m = sum(1 for x in g if x in MOLDURA)
