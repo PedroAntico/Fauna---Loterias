@@ -2,23 +2,25 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v64
-TESTE DE EFICIÊNCIA DE FIXAS MANUAIS vs. ALEATÓRIAS
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v65
+TESTE DE HEURÍSTICA DINÂMICA PARA FIXAS E SEMIFIXAS
 
 OBJETIVO:
-✅ Comparar a escolha manual de fixas contra centenas de fixas aleatórias
-✅ Walk‑forward: para cada concurso, gerar carteira e medir acertos
-✅ Métricas: média de acertos, 13+, 14+, ROI
-✅ Z‑score e percentil para avaliar significância
-✅ Responde: a escolha intuitiva de fixas agrega valor real?
+✅ Simular uma regra automatizada para escolha de fixas e semifixas
+   usando apenas informações disponíveis até o concurso anterior.
+✅ Para cada concurso (walk‑forward):
+   - Seleciona top K dezenas por score = frequência recente + bônus de atraso
+   - As primeiras F viram fixas; as S seguintes viram semifixas
+   - Gera carteira com Pair Covering respeitando fixas e semifixas
+✅ Compara acertos com centenas de seleções aleatórias de fixas/semifixas
+✅ Métricas: média de acertos, z‑score, total 13/14 pontos, ROI
 """
 
 import numpy as np
-from scipy.stats import hypergeom, wilcoxon
+from scipy.stats import hypergeom
 from collections import Counter, defaultdict
 from itertools import combinations
 import os, random, time, warnings
-from math import comb
 from tqdm import tqdm
 
 warnings.filterwarnings('ignore')
@@ -72,33 +74,97 @@ def load_all_contests(csv_file='resultados_lotofacil.csv'):
     return contests
 
 # ============================================================
-# GERADOR DE JOGOS
+# GERADOR DE JOGOS (COM FIXAS E SEMIFIXAS)
 # ============================================================
 class LooseGenerator:
     def generate_random(self):
         return sorted(np.random.choice(range(1, 26), 15, replace=False))
-    def generate_with_fixed(self, fixed):
+
+    def generate_with_fixed_and_semi(self, fixed, semifixed, min_semi, max_semi):
+        """
+        Gera um jogo contendo todas as fixas e entre min_semi e max_semi semifixas.
+        """
         fixed_set = set(fixed)
-        restantes = list(set(range(1, 26)) - fixed_set)
-        complemento = np.random.choice(restantes, 15 - len(fixed_set), replace=False)
-        return sorted(fixed_set | set(complemento))
+        semi_set = set(semifixed) - fixed_set
+        proibidas = fixed_set | semi_set
+        restantes = list(set(range(1, 26)) - proibidas)
+        n_fixas = len(fixed_set)
+        max_s = min(max_semi, len(semi_set))
+        min_s = max(min_semi, 0)
+        if min_s > max_s:
+            return None
+        for _ in range(200):
+            n_semi = random.randint(min_s, max_s)
+            n_rest = 15 - n_fixas - n_semi
+            if n_rest < 0 or n_rest > len(restantes):
+                continue
+            chosen_semi = set(random.sample(list(semi_set), n_semi)) if n_semi > 0 and len(semi_set) > 0 else set()
+            chosen_rest = set(random.sample(restantes, n_rest)) if n_rest > 0 else set()
+            game = sorted(fixed_set | chosen_semi | chosen_rest)
+            if len(game) == 15:
+                return game
+        return None
 
 # ============================================================
-# OTIMIZADOR DE CARTEIRA (PAIR COVERING)
+# HEURÍSTICA PARA SELEÇÃO DE FIXAS E SEMIFIXAS
+# ============================================================
+def selecionar_fixas_automaticas(contests, n_fixas=4, n_semifixas=7, 
+                                 janela_freq=50, peso_atraso=0.3):
+    """
+    Dado o histórico até o momento, ranqueia as 25 dezenas por:
+        score[d] = freq_recente[d] + peso_atraso * (1 / (atraso[d] + 1))
+    onde freq_recente é a proporção de aparições nos últimos janela_freq concursos,
+    e atraso é o número de concursos desde a última aparição.
+    As top n_fixas viram fixas; as n_semifixas seguintes viram semifixas.
+    """
+    if len(contests) == 0:
+        return [], []
+    
+    total = len(contests)
+    recent = contests[-janela_freq:] if janela_freq < total else contests
+    
+    freq_recente = Counter()
+    for c in recent:
+        freq_recente.update(c['dezenas'])
+    for d in range(1, 26):
+        freq_recente[d] = freq_recente.get(d, 0) / len(recent)
+    
+    atraso = {}
+    last_seen = {d: -1 for d in range(1, 26)}
+    for i, c in enumerate(contests):
+        for d in c['dezenas']:
+            last_seen[d] = i
+    for d in range(1, 26):
+        atraso[d] = (total - 1) - last_seen[d]  # concursos desde a última aparição
+    
+    # Score combinado
+    scores = {}
+    for d in range(1, 26):
+        score = freq_recente[d] + peso_atraso / (atraso[d] + 1)
+        scores[d] = score
+    
+    # Ordenar dezenas por score decrescente
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    
+    fixas = [d for d, _ in ranked[:n_fixas]]
+    semifixas = [d for d, _ in ranked[n_fixas:n_fixas+n_semifixas]]
+    return fixas, semifixas
+
+# ============================================================
+# OTIMIZADOR DE CARTEIRA (PAIR COVERING COM RESTRIÇÕES)
 # ============================================================
 class PortfolioOptimizer:
     def __init__(self, contests):
         self.contests = contests
         self.generator = LooseGenerator()
 
-    def generate_pool(self, n_candidates, fixed=None):
+    def generate_pool(self, n_candidates, fixed, semifixed, min_semi, max_semi):
         pool = []
         seen = set()
         for _ in range(n_candidates):
-            if fixed:
-                g = self.generator.generate_with_fixed(fixed)
-            else:
-                g = self.generator.generate_random()
+            g = self.generator.generate_with_fixed_and_semi(fixed, semifixed, min_semi, max_semi)
+            if g is None:
+                continue
             key = tuple(g)
             if key not in seen:
                 seen.add(key)
@@ -107,7 +173,7 @@ class PortfolioOptimizer:
 
     def select_pair_covering(self, candidates, n_select):
         if len(candidates) < n_select:
-            raise ValueError(f"Pool insuficiente: {len(candidates)} < {n_select}")
+            return candidates[:n_select] if candidates else []
         covered = set()
         selected = []
         for _ in range(n_select):
@@ -145,113 +211,96 @@ class PortfolioOptimizer:
         theo_prob = 1 - (1 - p_single) ** len(portfolio)
         lift = prob / theo_prob if theo_prob > 0 else 1.0
         roi = (total_premio - total_custo) / total_custo * 100 if total_custo > 0 else 0
-        return {'lift': lift, 'roi': roi, 'hit_counts': hit_counts}
+        return {'acertos': sum(hit_counts.values()), 'lift': lift, 'roi': roi, 
+                'hit_counts': hit_counts}
 
 # ============================================================
-# TESTE DE EFICIÊNCIA DE FIXAS
+# TESTE DE HEURÍSTICA DINÂMICA
 # ============================================================
-def testar_eficiencia_fixas(contests, fixas_manual, n_random_fixas=200, 
-                            n_games=5, pool_size=2000, start=3500, step=1):
+def testar_heuristica_dinamica(contests, n_fixas=4, n_semifixas=7, 
+                               min_semi=1, max_semi=3, n_random=200,
+                               janela_freq=50, peso_atraso=0.3,
+                               start=500, n_games=5, pool_size=2000):
     """
-    Walk‑forward: para cada concurso a partir de 'start', gera uma carteira
-    com as fixas manuais e compara com n_random_fixas conjuntos aleatórios
-    de fixas (do mesmo tamanho).
+    Walk‑forward: para cada concurso a partir de 'start', 
+    seleciona fixas e semifixas com a heurística, gera carteira e
+    compara com n_random seleções aleatórias de fixas/semifixas.
     """
     print(f"\n{'='*70}")
-    print(f"🔬 TESTE DE EFICIÊNCIA DE FIXAS MANUAIS")
+    print(f"🔬 TESTE DE HEURÍSTICA DINÂMICA PARA FIXAS")
     print(f"{'='*70}")
-    print(f"   Fixas manuais: {fixas_manual}")
-    print(f"   Fixas aleatórias comparadas: {n_random_fixas}")
-    print(f"   Concursos testados: {len(contests) - start}\n")
+    print(f"   Fixas: {n_fixas} | Semifixas: {n_semifixas} (usadas {min_semi} a {max_semi} por jogo)")
+    print(f"   Heurística: frequência ({janela_freq} conc.) + atraso (peso {peso_atraso})")
+    print(f"   Comparação: {n_random} seleções aleatórias por concurso\n")
 
-    n_fixas = len(fixas_manual)
-    todas_trincas = list(combinations(range(1, 26), n_fixas))
-    
-    resultados_manual = []
-    resultados_aleatorios = defaultdict(list)  # chave = concurso, valor = lista de acertos
+    resultados_heuristicos = []
+    resultados_aleatorios = defaultdict(list)
 
     for t in tqdm(range(start, len(contests)), desc="Walk‑forward"):
-        train_data = contests[t-500:t] if t >= 500 else contests[:t]
-        test_data = [contests[t]]
+        treino = contests[:t]  # dados disponíveis até t-1
+        teste = [contests[t]]
         
-        # --- Carteira com fixas manuais ---
-        opt_manual = PortfolioOptimizer(train_data)
+        # Selecionar fixas/semifixas com a heurística
+        fixas, semifixas = selecionar_fixas_automaticas(
+            treino, n_fixas, n_semifixas, janela_freq, peso_atraso
+        )
+        
+        # Carteira heurística
+        opt = PortfolioOptimizer(treino)
         try:
-            pool_manual = opt_manual.generate_pool(pool_size, fixed=fixas_manual)
-            portfolio_manual = opt_manual.select_pair_covering(pool_manual, n_games)
-            bt_manual = opt_manual.backtest(portfolio_manual, test_data)
-            acertos_manual = sum(bt_manual['hit_counts'].values())
-            resultados_manual.append({
-                'concurso': contests[t]['concurso'],
-                'acertos': acertos_manual,
-                '13pts': bt_manual['hit_counts'].get(13, 0),
-                '14pts': bt_manual['hit_counts'].get(14, 0),
-                'roi': bt_manual['roi']
-            })
+            pool_heu = opt.generate_pool(pool_size, fixas, semifixas, min_semi, max_semi)
+            portfolio_heu = opt.select_pair_covering(pool_heu, n_games)
+            bt_heu = opt.backtest(portfolio_heu, teste)
+            resultados_heuristicos.append(bt_heu)
         except Exception as e:
-            resultados_manual.append({'concurso': contests[t]['concurso'], 'acertos': 0, '13pts': 0, '14pts': 0, 'roi': 0})
+            resultados_heuristicos.append({'acertos': 0, 'hit_counts': {}, 'lift': 0, 'roi': 0})
             continue
 
-        # --- Carteiras com fixas aleatórias ---
-        random.shuffle(todas_trincas)
-        for trinca in todas_trincas[:n_random_fixas]:
-            if set(trinca) == set(fixas_manual):
-                continue
+        # Carteiras aleatórias (mesmo número de fixas e semifixas)
+        for _ in range(n_random):
+            fixas_rand = random.sample(range(1, 26), n_fixas)
+            # semifixas aleatórias (sem interseção com fixas)
+            candidatas_semi = [d for d in range(1, 26) if d not in fixas_rand]
+            semifixas_rand = random.sample(candidatas_semi, min(n_semifixas, len(candidatas_semi)))
             try:
-                opt_rand = PortfolioOptimizer(train_data)
-                pool_rand = opt_rand.generate_pool(pool_size, fixed=list(trinca))
-                portfolio_rand = opt_rand.select_pair_covering(pool_rand, n_games)
-                bt_rand = opt_rand.backtest(portfolio_rand, test_data)
-                acertos_rand = sum(bt_rand['hit_counts'].values())
-                resultados_aleatorios[t].append(acertos_rand)
+                pool_rand = opt.generate_pool(pool_size, fixas_rand, semifixas_rand, min_semi, max_semi)
+                portfolio_rand = opt.select_pair_covering(pool_rand, n_games)
+                bt_rand = opt.backtest(portfolio_rand, teste)
+                resultados_aleatorios[t].append(bt_rand['acertos'])
             except:
                 resultados_aleatorios[t].append(0)
 
-    # --- Análise estatística ---
-    acertos_manual_arr = np.array([r['acertos'] for r in resultados_manual])
-    
-    # Para cada concurso, média e desvio das aleatórias
-    medias_aleatorias = []
-    stds_aleatorias = []
+    # Análise
+    acertos_heu = np.array([r['acertos'] for r in resultados_heuristicos])
+    medias_rand = []
     for t in range(start, len(contests)):
         if t in resultados_aleatorios and len(resultados_aleatorios[t]) > 0:
-            medias_aleatorias.append(np.mean(resultados_aleatorios[t]))
-            stds_aleatorias.append(np.std(resultados_aleatorios[t]))
+            medias_rand.append(np.mean(resultados_aleatorios[t]))
         else:
-            medias_aleatorias.append(0)
-            stds_aleatorias.append(0)
-    
-    medias_aleatorias = np.array(medias_aleatorias)
-    stds_aleatorias = np.array(stds_aleatorias)
-    
-    # Z‑score por concurso (quando std > 0)
-    z_scores = np.where(stds_aleatorias > 0, 
-                        (acertos_manual_arr - medias_aleatorias) / stds_aleatorias, 
-                        0.0)
-    
-    print(f"\n📊 RESULTADOS:")
-    print(f"   Média de acertos (manual): {np.mean(acertos_manual_arr):.3f}")
-    print(f"   Média de acertos (aleatório): {np.mean(medias_aleatorias):.3f}")
+            medias_rand.append(0)
+    medias_rand = np.array(medias_rand)
+
+    dif = acertos_heu - medias_rand
+    z_scores = dif / np.std(medias_rand) if np.std(medias_rand) > 0 else np.zeros_like(dif)
+
+    print(f"\n📊 RESULTADOS (heurística vs. aleatório):")
+    print(f"   Média acertos (heurística): {np.mean(acertos_heu):.3f}")
+    print(f"   Média acertos (aleatório):   {np.mean(medias_rand):.3f}")
     print(f"   Z‑score médio: {np.mean(z_scores):.3f}")
-    print(f"   Z‑score > 0 em {np.mean(z_scores > 0)*100:.1f}% dos concursos")
-    print(f"   Total 13pts (manual): {sum(r['13pts'] for r in resultados_manual)}")
-    print(f"   Total 14pts (manual): {sum(r['14pts'] for r in resultados_manual)}")
-    print(f"   ROI médio (manual): {np.mean([r['roi'] for r in resultados_manual]):.1f}%")
-    
-    # Percentil da média manual em relação às médias aleatórias
-    if np.std(medias_aleatorias) > 0:
-        z_global = (np.mean(acertos_manual_arr) - np.mean(medias_aleatorias)) / (np.std(medias_aleatorias) / np.sqrt(len(medias_aleatorias)))
-        print(f"   Z‑score global: {z_global:.3f}")
-    
-    return resultados_manual, resultados_aleatorios
+    print(f"   % concursos com z > 0: {np.mean(z_scores > 0)*100:.1f}%")
+    print(f"   Total 13pts (heurística): {sum(r['hit_counts'].get(13,0) for r in resultados_heuristicos)}")
+    print(f"   Total 14pts (heurística): {sum(r['hit_counts'].get(14,0) for r in resultados_heuristicos)}")
+    print(f"   ROI médio (heurística): {np.mean([r['roi'] for r in resultados_heuristicos]):.1f}%")
+
+    return resultados_heuristicos
 
 # ============================================================
 # INTERFACE PRINCIPAL
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v64")
-    print("   EFICIÊNCIA DE FIXAS MANUAIS vs. ALEATÓRIAS")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v65")
+    print("   HEURÍSTICA DINÂMICA PARA FIXAS E SEMIFIXAS")
     print("="*70)
     
     contests = load_all_contests('resultados_lotofacil.csv')
@@ -260,25 +309,26 @@ def main():
         return
     print(f"\n📂 {len(contests)} concursos")
 
-    # Definir fixas manuais a testar
-    print("\n📝 DEFINIÇÃO DAS FIXAS MANUAIS")
-    fixas_str = input("   Digite as fixas (ex: 15,16,20): ").strip()
+    # Parâmetros configuráveis
+    print("\n⚙️ Parâmetros da heurística (ENTER para padrão):")
     try:
-        fixas_manual = [int(x) for x in fixas_str.split(',')]
-        if len(fixas_manual) < 2:
-            print("   É necessário pelo menos 2 fixas.")
-            return
-    except:
-        print("   Formato inválido.")
-        return
+        n_fixas = int(input("   Número de fixas [4]: ").strip() or "4")
+        n_semifixas = int(input("   Número de semifixas [7]: ").strip() or "7")
+        min_semi = int(input("   Mínimo de semifixas por jogo [1]: ").strip() or "1")
+        max_semi = int(input("   Máximo de semifixas por jogo [3]: ").strip() or "3")
+        janela = int(input("   Janela para frequência recente [50]: ").strip() or "50")
+        peso = float(input("   Peso do atraso [0.3]: ").strip() or "0.3")
+        n_random = int(input("   Comparações aleatórias por concurso [200]: ").strip() or "200")
+        start = int(input("   Início do walk‑forward [500]: ").strip() or "500")
+    except ValueError:
+        print("   Valor inválido. Usando padrões.")
+        n_fixas, n_semifixas, min_semi, max_semi = 4, 7, 1, 3
+        janela, peso, n_random, start = 50, 0.3, 200, 500
 
-    # Parâmetros do teste
-    try:
-        n_random = int(input("   Quantas fixas aleatórias comparar por concurso? [200]: ").strip() or "200")
-    except:
-        n_random = 200
-
-    testar_eficiencia_fixas(contests, fixas_manual, n_random)
+    testar_heuristica_dinamica(
+        contests, n_fixas, n_semifixas, min_semi, max_semi,
+        n_random, janela, peso, start
+    )
 
     print("\n✅ Análise concluída.")
 
