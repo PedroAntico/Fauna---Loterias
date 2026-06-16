@@ -2,22 +2,20 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v61
-INFORMAÇÃO MÚTUA AVANÇADA: CONCURSOS, DEZENAS E ESTRUTURAS
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v62
+TESTE DE SINAL INVERTIDO (ANTI‑PREDITIVO) + ESTUDO DA DEZENA 25
 
-MELHORIAS:
-✅ Permutações aumentadas para 2000 (significância mais precisa)
-✅ Lags estendidos: 1, 2, 3, 5, 10, 20, 50
-✅ MI para dezenas individuais (25 séries binárias)
-✅ MI para o concurso completo (vetor de 25 bits)
-✅ Correção de viés por permutação em todos os casos
+HIPÓTESES:
+✅ O modelo erra de forma sistemática? (edge invertido)
+✅ Comparação das taxas de acerto normal e invertida contra baseline aleatório
+✅ Estudo específico da dezena 25: P(25 em t+2 | 25 em t) vs P(25 em t+2 | 25 ∉ t)
+✅ Walk‑forward honesto com correção por permutação
 """
 
 import numpy as np
-from scipy.stats import entropy
+from scipy.stats import binomtest
 from collections import Counter
-from itertools import product
-import os, warnings
+import os, random, warnings
 from tqdm import tqdm
 
 warnings.filterwarnings('ignore')
@@ -52,17 +50,12 @@ def load_all_contests(csv_file='resultados_lotofacil.csv'):
     return contests
 
 # ============================================================
-# EXTRAÇÃO DE DADOS
+# EXTRAÇÃO DE SÉRIES
 # ============================================================
 def extrair_series_estruturais(contests):
-    """Séries de características agregadas (pares, moldura, etc.)."""
     series = {
-        'pares': [],
-        'moldura': [],
-        'primos': [],
-        'soma': [],
-        'consecutivos': [],
-        'amplitude': []
+        'pares': [], 'moldura': [], 'primos': [],
+        'soma': [], 'consecutivos': [], 'amplitude': []
     }
     for c in contests:
         d = c['dezenas']
@@ -75,7 +68,6 @@ def extrair_series_estruturais(contests):
     return {k: np.array(v, dtype=float) for k, v in series.items()}
 
 def extrair_series_dezenas(contests):
-    """25 séries binárias (presença/ausência de cada dezena)."""
     n = len(contests)
     dezenas = np.zeros((n, 25), dtype=np.int8)
     for i, c in enumerate(contests):
@@ -84,116 +76,152 @@ def extrair_series_dezenas(contests):
     return dezenas
 
 # ============================================================
-# INFORMAÇÃO MÚTUA (COM CORREÇÃO POR PERMUTAÇÃO)
+# PREDITOR SIMPLES (REVERSÃO À MÉDIA)
 # ============================================================
-def mutual_information(x, y, bins=None):
-    """MI entre duas séries. bins=None para dados discretos."""
-    if bins is not None:
-        combined = np.concatenate([x, y])
-        bin_edges = np.percentile(combined, np.linspace(0, 100, bins+1))
-        x_disc = np.digitize(x, bin_edges[1:-1])
-        y_disc = np.digitize(y, bin_edges[1:-1])
+def prever_direcao(serie, idx, janela=20):
+    """Prevê se o próximo valor será maior (+1) ou menor (-1) que o atual."""
+    if idx < janela:
+        return 0  # sem previsão
+    media_recente = np.mean(serie[idx-janela:idx])
+    media_historica = np.mean(serie[:idx])
+    if media_recente > media_historica:
+        return -1  # prevê queda
     else:
-        x_disc = x.astype(int)
-        y_disc = y.astype(int)
-    joint = Counter(zip(x_disc, y_disc))
-    total = len(x_disc)
-    mi = 0.0
-    for (xi, yi), cnt in joint.items():
-        p_xy = cnt / total
-        p_x = np.mean(x_disc == xi)
-        p_y = np.mean(y_disc == yi)
-        if p_x > 0 and p_y > 0:
-            mi += p_xy * np.log2(p_xy / (p_x * p_y))
-    return mi
+        return 1   # prevê alta
 
-def mi_significance(series, lag, n_perm=2000, bins=None):
-    """MI observada, corrigida, p-valor e média nula."""
-    if len(series) <= lag:
-        return 0, 0, 1.0, 0
-    x = series[:-lag]
-    y = series[lag:]
-    mi_obs = mutual_information(x, y, bins=bins)
-    mi_null = np.zeros(n_perm)
-    y_shuffled = y.copy()
-    for i in range(n_perm):
-        np.random.shuffle(y_shuffled)
-        mi_null[i] = mutual_information(x, y_shuffled, bins=bins)
-    mean_null = np.mean(mi_null)
-    mi_corr = mi_obs - mean_null
-    p_val = np.mean(mi_null >= mi_obs)
-    return mi_obs, mi_corr, p_val, mean_null
+def direcao_real(serie, idx):
+    """Retorna +1 se o valor subiu em relação ao anterior, -1 se caiu, 0 se igual."""
+    if idx < 1:
+        return 0
+    if serie[idx] > serie[idx-1]:
+        return 1
+    elif serie[idx] < serie[idx-1]:
+        return -1
+    else:
+        return 0
 
 # ============================================================
-# ANÁLISE COMPLETA
+# ANÁLISE DE ACERTO NORMAL E INVERTIDO
 # ============================================================
-def analisar_mi_estrutural(series_dict, lags):
-    """MI para características agregadas."""
-    bins_cfg = {
-        'pares': None, 'moldura': None, 'primos': None,
-        'soma': 10, 'consecutivos': None, 'amplitude': 10
+def analisar_edge(serie, janela=20, n_perm=500):
+    """
+    Para cada ponto a partir de janela+1, faz uma previsão de direção.
+    Calcula a taxa de acerto normal e a taxa de acerto invertida.
+    Compara ambas com um baseline aleatório (permutação da série).
+    """
+    n = len(serie)
+    previsoes = []
+    reais = []
+    
+    for i in range(janela + 1, n):
+        pred = prever_direcao(serie, i-1, janela)  # prevê direção de i-1 → i
+        real = direcao_real(serie, i)
+        if pred != 0 and real != 0:
+            previsoes.append(pred)
+            reais.append(real)
+    
+    previsoes = np.array(previsoes)
+    reais = np.array(reais)
+    
+    if len(previsoes) == 0:
+        return {'acc_normal': 0.5, 'acc_invertido': 0.5, 'p_normal': 1.0, 'p_invertido': 1.0, 'n': 0}
+    
+    # Acerto normal
+    acertos_normal = np.sum(previsoes == reais)
+    acc_normal = acertos_normal / len(previsoes)
+    
+    # Acerto invertido (se tivéssemos usado a previsão oposta)
+    acertos_invertido = np.sum(previsoes != reais)
+    acc_invertido = acertos_invertido / len(previsoes)
+    
+    # Baseline por permutação
+    accs_perm = []
+    for _ in range(n_perm):
+        shuffled = np.random.permutation(serie)
+        prev_perm = []
+        real_perm = []
+        for i in range(janela + 1, n):
+            pred = prever_direcao(shuffled, i-1, janela)
+            real = direcao_real(shuffled, i)
+            if pred != 0 and real != 0:
+                prev_perm.append(pred)
+                real_perm.append(real)
+        if len(prev_perm) > 0:
+            prev_perm = np.array(prev_perm)
+            real_perm = np.array(real_perm)
+            acc_perm = np.mean(prev_perm == real_perm)
+            accs_perm.append(acc_perm)
+    
+    accs_perm = np.array(accs_perm)
+    mean_perm = np.mean(accs_perm)
+    std_perm = np.std(accs_perm)
+    
+    # p-valor para acerto normal (unicaudal: acc_normal >= acc_perm)
+    p_normal = np.mean(accs_perm >= acc_normal)
+    # p-valor para acerto invertido (acc_invertido >= 1 - acc_perm)
+    p_invertido = np.mean(accs_perm >= acc_invertido)
+    
+    return {
+        'acc_normal': acc_normal,
+        'acc_invertido': acc_invertido,
+        'p_normal': p_normal,
+        'p_invertido': p_invertido,
+        'baseline_mean': mean_perm,
+        'baseline_std': std_perm,
+        'n': len(previsoes)
     }
-    print("\n📊 INFORMAÇÃO MÚTUA – CARACTERÍSTICAS ESTRUTURAIS")
-    print(f"   Lags: {lags} | Permutações: 2000\n")
-    resultados = {}
-    for nome, serie in series_dict.items():
-        bins = bins_cfg.get(nome, 10)
-        print(f"--- {nome} ---")
-        print(f"   {'Lag':<8} {'MI obs':<10} {'MI corr':<10} {'p‑valor':<10}")
-        for lag in lags:
-            mi_obs, mi_corr, p_val, _ = mi_significance(serie, lag, bins=bins)
-            print(f"   {lag:<8} {mi_obs:<10.4f} {mi_corr:<10.4f} {p_val:<10.4f}")
-        resultados[nome] = {lag: {'mi_corr': mi_corr, 'p_val': p_val} for lag in lags}
-    return resultados
 
-def analisar_mi_dezenas(dezenas, lags):
-    """MI para cada uma das 25 dezenas (séries binárias)."""
-    print("\n📊 INFORMAÇÃO MÚTUA – DEZENAS INDIVIDUAIS")
-    print(f"   Lags: {lags} | Permutações: 2000\n")
-    resultados = {}
-    for d in range(25):
-        serie = dezenas[:, d]
-        print(f"--- Dezena {d+1:2d} ---")
-        print(f"   {'Lag':<8} {'MI obs':<10} {'MI corr':<10} {'p‑valor':<10}")
-        for lag in lags:
-            mi_obs, mi_corr, p_val, _ = mi_significance(serie, lag, bins=None)
-            print(f"   {lag:<8} {mi_obs:<10.4f} {mi_corr:<10.4f} {p_val:<10.4f}")
-        resultados[d+1] = {lag: {'mi_corr': mi_corr, 'p_val': p_val} for lag in lags}
-    return resultados
-
-def analisar_mi_concurso(contests, lags):
-    """MI entre concursos completos (vetor de 25 bits)."""
-    # Representação como máscara de bits (número inteiro)
-    masks = np.array([BITMASK_CACHE.get_mask(c['dezenas']) for c in contests], dtype=np.uint32)
-    print("\n📊 INFORMAÇÃO MÚTUA – CONCURSO COMPLETO (25 bits)")
-    print(f"   Lags: {lags} | Permutações: 2000\n")
-    # Discretização: usamos os próprios inteiros (já são discretos)
-    print(f"   {'Lag':<8} {'MI obs':<10} {'MI corr':<10} {'p‑valor':<10}")
-    for lag in lags:
-        mi_obs, mi_corr, p_val, _ = mi_significance(masks, lag, bins=None)
-        print(f"   {lag:<8} {mi_obs:<10.4f} {mi_corr:<10.4f} {p_val:<10.4f}")
-
-class BitmaskCache:
-    def __init__(self):
-        self._cache = {}
-    def get_mask(self, game):
-        key = tuple(game) if isinstance(game, list) else game
-        if key not in self._cache:
-            mask = 0
-            for d in key:
-                mask |= (1 << d)
-            self._cache[key] = mask
-        return self._cache[key]
-
-BITMASK_CACHE = BitmaskCache()
+# ============================================================
+# ESTUDO ESPECÍFICO DA DEZENA 25
+# ============================================================
+def estudo_dezena_25(dezenas, lag=2, n_perm=2000):
+    """P(25 em t+lag | 25 em t) vs P(25 em t+lag | 25 não em t)."""
+    serie = dezenas[:, 24]  # índice 24 = dezena 25
+    n = len(serie)
+    
+    # Casos onde 25 apareceu em t
+    idx_presente = np.where(serie[:n-lag] == 1)[0]
+    # Casos onde 25 NÃO apareceu em t
+    idx_ausente = np.where(serie[:n-lag] == 0)[0]
+    
+    if len(idx_presente) == 0 or len(idx_ausente) == 0:
+        return None
+    
+    prob_dado_presente = np.mean(serie[idx_presente + lag])
+    prob_dado_ausente = np.mean(serie[idx_ausente + lag])
+    prob_geral = np.mean(serie)
+    
+    # Teste de permutação: diferença entre as duas condicionais
+    dif_obs = prob_dado_presente - prob_dado_ausente
+    
+    difs_perm = []
+    for _ in range(n_perm):
+        shuffled = serie.copy()
+        np.random.shuffle(shuffled)
+        p_pres = np.mean(shuffled[idx_presente + lag]) if len(idx_presente) > 0 else 0
+        p_aus = np.mean(shuffled[idx_ausente + lag]) if len(idx_ausente) > 0 else 0
+        difs_perm.append(p_pres - p_aus)
+    difs_perm = np.array(difs_perm)
+    
+    p_val = np.mean(np.abs(difs_perm) >= np.abs(dif_obs))
+    
+    return {
+        'P(t+lag | presente)': prob_dado_presente,
+        'P(t+lag | ausente)': prob_dado_ausente,
+        'P(geral)': prob_geral,
+        'diferença': dif_obs,
+        'p_valor': p_val,
+        'n_presente': len(idx_presente),
+        'n_ausente': len(idx_ausente)
+    }
 
 # ============================================================
 # INTERFACE PRINCIPAL
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v61")
-    print("   INFORMAÇÃO MÚTUA AVANÇADA")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v62")
+    print("   TESTE DE SINAL INVERTIDO + ESTUDO DA DEZENA 25")
     print("="*70)
     
     contests = load_all_contests('resultados_lotofacil.csv')
@@ -202,44 +230,46 @@ def main():
         return
     print(f"\n📂 {len(contests)} concursos")
 
-    # Parâmetros
-    lags = [1, 2, 3, 5, 10, 20, 50]
-
-    # 1. Características estruturais
+    # 1. Análise de características estruturais
+    print("\n📊 ANÁLISE DE EDGE NORMAL / INVERTIDO (CARACTERÍSTICAS ESTRUTURAIS)")
     series_est = extrair_series_estruturais(contests)
-    resultados_est = analisar_mi_estrutural(series_est, lags)
-
-    # 2. Dezenas individuais
+    
+    for nome, serie in series_est.items():
+        res = analisar_edge(serie)
+        print(f"\n--- {nome} ---")
+        print(f"   Previsões: {res['n']}")
+        print(f"   Acerto normal:    {res['acc_normal']*100:.1f}% (p={res['p_normal']:.4f})")
+        print(f"   Acerto invertido: {res['acc_invertido']*100:.1f}% (p={res['p_invertido']:.4f})")
+        print(f"   Baseline (perm):  média={res['baseline_mean']*100:.1f}%")
+        if res['p_normal'] < 0.05:
+            print(f"   🔍 Edge NORMAL significativo!")
+        if res['p_invertido'] < 0.05:
+            print(f"   🔍 Edge INVERTIDO significativo!")
+    
+    # 2. Análise das 25 dezenas
+    print("\n📊 ANÁLISE DE EDGE NORMAL / INVERTIDO (DEZENAS INDIVIDUAIS)")
     dezenas = extrair_series_dezenas(contests)
-    resultados_dez = analisar_mi_dezenas(dezenas, lags)
-
-    # 3. Concurso completo
-    analisar_mi_concurso(contests, lags)
-
-    # Resumo
-    print("\n" + "="*70)
-    print("📊 RESUMO GERAL")
-    print("="*70)
-    sinais = []
-    # Verificar características
-    for nome, res in resultados_est.items():
-        for lag, val in res.items():
-            if val['p_val'] < 0.05 and val['mi_corr'] > 0.001:
-                sinais.append((f"Estrutura {nome}", lag, val['mi_corr'], val['p_val']))
-    # Verificar dezenas
-    for dezena, res in resultados_dez.items():
-        for lag, val in res.items():
-            if val['p_val'] < 0.05 and val['mi_corr'] > 0.001:
-                sinais.append((f"Dezena {dezena}", lag, val['mi_corr'], val['p_val']))
-    if sinais:
-        print("   🔍 Possíveis dependências detectadas:")
-        for s in sinais[:10]:
-            print(f"      {s[0]} lag {s[1]}: MI corr={s[2]:.4f}, p={s[3]:.4f}")
-    else:
-        print("   ✅ Nenhuma dependência temporal significativa encontrada.")
-        print("   As características e dezenas são compatíveis com independência (i.i.d.).")
-        print("   I(X_t ; X_{t+lag}) ≈ 0 para todos os lags testados.")
-
+    for d in range(25):
+        serie = dezenas[:, d]
+        res = analisar_edge(serie)
+        # Só exibe se houver algum sinal
+        if res['p_normal'] < 0.05 or res['p_invertido'] < 0.05:
+            print(f"   Dezena {d+1:2d}: normal={res['acc_normal']*100:.1f}% invertido={res['acc_invertido']*100:.1f}%")
+    
+    # 3. Estudo específico da dezena 25
+    print("\n📊 ESTUDO DA DEZENA 25 (lag=2)")
+    estudo = estudo_dezena_25(dezenas, lag=2)
+    if estudo:
+        print(f"   P(25 em t+2 | 25 em t)    = {estudo['P(t+lag | presente)']:.4f}")
+        print(f"   P(25 em t+2 | 25 não em t) = {estudo['P(t+lag | ausente)']:.4f}")
+        print(f"   P(25 geral)                = {estudo['P(geral)']:.4f}")
+        print(f"   Diferença = {estudo['diferença']:.4f}")
+        print(f"   p‑valor (permutação) = {estudo['p_valor']:.4f}")
+        if estudo['p_valor'] < 0.05:
+            print(f"   🔍 Diferença significativa! A dezena 25 pode ter dependência temporal.")
+        else:
+            print(f"   📊 Diferença não significativa. Comportamento compatível com independência.")
+    
     print("\n✅ Análise concluída.")
 
 if __name__ == "__main__":
