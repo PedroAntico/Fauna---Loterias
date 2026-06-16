@@ -8,7 +8,7 @@ ESTUDO DE DEPENDÊNCIA TEMPORAL CONDICIONAL DAS 25 DEZENAS
 OBJETIVO:
 ✅ Para cada dezena e cada lag (1,2,3,5), calcular:
    P(d em t+lag | d em t) e P(d em t+lag | d ausente em t)
-✅ Testar significância da diferença via permutação (2000 simulações)
+✅ Testar significância da diferença via permutação (200 simulações)
 ✅ Aplicar correção FDR (Benjamini‑Hochberg) para múltiplos testes
 ✅ Ranquear os sinais mais promissores
 ✅ Investigar se a dezena 25 (lag=2) sobrevive à correção
@@ -60,7 +60,7 @@ def extrair_series_dezenas(contests):
 # ============================================================
 # TESTE DE DEPENDÊNCIA CONDICIONAL PARA UMA DEZENA
 # ============================================================
-def teste_dependencia_condicional(serie, lag, n_perm=2000):
+def teste_dependencia_condicional(serie, lag, n_perm=200):
     """
     Calcula:
     - P(d em t+lag | d em t)
@@ -110,7 +110,7 @@ def teste_dependencia_condicional(serie, lag, n_perm=2000):
 # ============================================================
 # ANÁLISE COMPLETA PARA TODAS AS DEZENAS E LAGS
 # ============================================================
-def analisar_todas_dezenas(dezenas, lags=[1, 2, 3, 5], n_perm=2000):
+def analisar_todas_dezenas(dezenas, lags=[1, 2, 3, 5], n_perm=200):
     """
     Para cada dezena (1..25) e cada lag, executa o teste de dependência condicional.
     Aplica correção FDR ao final.
@@ -208,7 +208,7 @@ def main():
     
     # Parâmetros
     lags = [1, 2, 3, 5]
-    n_perm = 2000
+    n_perm = 200
     
     # Executar análise
     resultados = analisar_todas_dezenas(dezenas, lags, n_perm)
