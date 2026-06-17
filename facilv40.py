@@ -2,18 +2,16 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v70
-COMPARAÇÃO: CARTEIRA ESTRUTURAL PURA vs. ESTRUTURA + REVERSÃO
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v70.1
+IMPORTAÇÃO ROBUSTA + DIVERSIDADE FORÇADA NA CARTEIRA
 
-HIPÓTESE:
-✅ Carteira A (apenas estrutura) supera Carteira B (estrutura + reversão)
-
-MÉTODO:
-✅ Ambas usam os mesmos centros previstos e clusterização
-✅ Carteira A: score = distância estrutural ponderada (sem bônus de dezenas)
-✅ Carteira B: score = distância estrutural ponderada + bônus de reversão (v69.1)
-✅ Walk‑forward real para ambas
-✅ Comparação de lift, ROI, 13/14/15 pontos
+CORREÇÕES:
+✅ DezenaModelReversao incorporado diretamente (sem import externo)
+✅ Fallback automático: se o modelo falhar, usa estrutura pura
+✅ Diversidade pós pair‑covering:
+   - Interseção máxima entre jogos ≤ 9
+   - Cobertura mínima de 22 dezenas distintas
+✅ Walk‑forward comparativo preservado
 """
 
 import numpy as np
@@ -132,9 +130,9 @@ def extract_filter(dezenas, filter_name, prev_dezenas=None):
     return 0
 
 # ============================================================
-# STRUCTURAL PREDICTOR (MANTIDO DO v69.1, SEM SOMA)
+# STRUCTURAL PREDICTOR (MANTIDO, SEM SOMA)
 # ============================================================
-class StructuralPredictorV70:
+class StructuralPredictorV701:
     def __init__(self, contests, cache_file='v70_weights_cache.json'):
         self.contests = contests
         self.active_filters = ['pares', 'moldura', 'primos', 'amplitude', 'repeticoes']
@@ -214,6 +212,51 @@ class StructuralPredictorV70:
         return centers
 
 # ============================================================
+# MODELO DE DEZENAS POR REVERSÃO (INCORPORADO)
+# ============================================================
+class DezenaModelReversao:
+    def __init__(self, contests):
+        self.contests = contests
+
+    def compute_scores(self, janela_curta=20, janela_longa=100, peso_atraso=0.3):
+        if len(self.contests) == 0:
+            return {d: 0.0 for d in range(1, 26)}
+        total = len(self.contests)
+        recent = self.contests[-janela_curta:] if janela_curta < total else self.contests
+        long_data = self.contests[-janela_longa:] if janela_longa < total else self.contests
+        freq_curta = Counter()
+        for c in recent:
+            freq_curta.update(c['dezenas'])
+        freq_longa = Counter()
+        for c in long_data:
+            freq_longa.update(c['dezenas'])
+        last_seen = {d: -1 for d in range(1, 26)}
+        for i, c in enumerate(self.contests):
+            for d in c['dezenas']:
+                last_seen[d] = i
+        atraso = {d: (total - 1 - last_seen[d]) for d in range(1, 26)}
+        max_atraso = max(atraso.values()) + 1
+        scores = {}
+        n_curta = len(recent)
+        n_longa = max(1, len(long_data))
+        for d in range(1, 26):
+            fc = freq_curta.get(d, 0) / n_curta
+            fl = freq_longa.get(d, 0) / n_longa
+            edge = fc - fl
+            reversao_score = -edge * 2.0
+            atraso_score = peso_atraso * (atraso[d] / max_atraso)
+            scores[d] = reversao_score + atraso_score
+        mean_score = np.mean(list(scores.values()))
+        std_score = np.std(list(scores.values()))
+        if std_score > 0:
+            for d in scores:
+                scores[d] = (scores[d] - mean_score) / std_score
+        else:
+            for d in scores:
+                scores[d] = 0.0
+        return scores
+
+# ============================================================
 # KMEANS MANUAL
 # ============================================================
 class SimpleKMeans:
@@ -245,9 +288,9 @@ class SimpleKMeans:
         return labels
 
 # ============================================================
-# OTIMIZADOR DE CARTEIRA v70 (DUAS VERSÕES: A e B)
+# OTIMIZADOR DE CARTEIRA v70.1 (COM DIVERSIDADE FORÇADA)
 # ============================================================
-class PortfolioOptimizerV70:
+class PortfolioOptimizerV701:
     def __init__(self, contests, fixed=None, semifixed=None, min_semifixed=0, max_semifixed=None,
                  use_reversao=False):
         self.contests = contests
@@ -256,10 +299,9 @@ class PortfolioOptimizerV70:
         self.semifixed = semifixed if semifixed else []
         self.min_semifixed = min_semifixed
         self.max_semifixed = max_semifixed
-        self.predictor = StructuralPredictorV70(contests)
+        self.predictor = StructuralPredictorV701(contests)
         self.use_reversao = use_reversao
         if use_reversao:
-            from v69_1_dezena_model import DezenaModelReversao  # reaproveita o modelo corrigido
             self.dezena_model = DezenaModelReversao(contests)
         else:
             self.dezena_model = None
@@ -312,7 +354,64 @@ class PortfolioOptimizerV70:
                 break
         return pool
 
+    def _ensure_diversity(self, candidates, n_select, max_intersection=9, min_dezenas=22):
+        """
+        Seleciona n_select jogos garantindo:
+        - interseção máxima entre qualquer par ≤ max_intersection
+        - pelo menos min_dezenas distintas cobertas
+        Se não for possível com os candidatos, retorna os melhores possíveis.
+        """
+        if len(candidates) < n_select:
+            return candidates
+        # Ordenar por score (já estão ordenados)
+        selected = []
+        masks = []
+        for c in candidates:
+            if len(selected) >= n_select:
+                break
+            mask_c = BITMASK_CACHE.get_mask(c)
+            # Verificar interseção com todos os já selecionados
+            if masks and any(mask_intersection(mask_c, m) > max_intersection for m in masks):
+                continue
+            selected.append(c)
+            masks.append(mask_c)
+        # Se não completou, relaxa a interseção progressivamente
+        if len(selected) < n_select:
+            for relax in range(max_intersection+1, 15):
+                for c in candidates:
+                    if c in selected:
+                        continue
+                    if len(selected) >= n_select:
+                        break
+                    mask_c = BITMASK_CACHE.get_mask(c)
+                    if masks and any(mask_intersection(mask_c, m) > relax for m in masks):
+                        continue
+                    selected.append(c)
+                    masks.append(mask_c)
+                if len(selected) >= n_select:
+                    break
+        # Verificar cobertura de dezenas
+        dezenas_cobertas = set()
+        for g in selected:
+            dezenas_cobertas.update(g)
+        if len(dezenas_cobertas) < min_dezenas:
+            # Tenta trocar o último jogo por um que melhore a cobertura
+            for c in candidates:
+                if c in selected:
+                    continue
+                new_cob = dezenas_cobertas | set(c)
+                if len(new_cob) > len(dezenas_cobertas):
+                    # Substitui o pior (último) se não violar interseção
+                    mask_c = BITMASK_CACHE.get_mask(c)
+                    if not any(mask_intersection(mask_c, BITMASK_CACHE.get_mask(s)) > max_intersection for s in selected[:-1]):
+                        selected[-1] = c
+                        dezenas_cobertas = new_cob
+                        if len(dezenas_cobertas) >= min_dezenas:
+                            break
+        return selected[:n_select]
+
     def select_pair_covering(self, candidates, n_select):
+        """Pair covering tradicional (mantido como fallback)."""
         if len(candidates) < n_select:
             return candidates
         covered, selected = set(), []
@@ -366,8 +465,18 @@ class PortfolioOptimizerV70:
             cluster_best[lbl].sort(key=lambda x: x[0])
             diverse_pool.extend([g for _, g in cluster_best[lbl][:top_per_cluster]])
         print(f"   Pool diversificado: {len(diverse_pool)} jogos (de {n_clusters} clusters)")
-        portfolio = self.select_pair_covering(diverse_pool, n_games)
+        # Seleção com diversidade forçada
+        portfolio = self._ensure_diversity(diverse_pool, n_games)
+        # Fallback: se não conseguiu, usa pair covering e depois aplica diversidade
+        if len(portfolio) < n_games:
+            portfolio = self.select_pair_covering(diverse_pool, n_games)
+            portfolio = self._ensure_diversity(portfolio, n_games)
         print(f"✅ Carteira final: {len(portfolio)} jogos em {time.time()-t0:.1f}s")
+        # Exibir cobertura de dezenas
+        todas = set()
+        for g in portfolio:
+            todas.update(g)
+        print(f"   Dezenas distintas na carteira: {len(todas)}")
         return portfolio
 
     def backtest(self, portfolio, test_draws):
@@ -397,9 +506,6 @@ class PortfolioOptimizerV70:
 # COMPARAÇÃO A vs B EM WALK‑FORWARD
 # ============================================================
 def comparar_walk_forward(contests, n_games=5, train_size=500, step=50):
-    """
-    Executa walk‑forward para ambas as estratégias (A e B) e compara.
-    """
     print(f"\n🔬 COMPARAÇÃO WALK‑FORWARD: CARTEIRA A vs CARTEIRA B")
     print(f"   Treino: {train_size} | Teste: {step} | Jogos: {n_games}\n")
     results = {'A': [], 'B': []}
@@ -409,7 +515,7 @@ def comparar_walk_forward(contests, n_games=5, train_size=500, step=50):
         test_data = contests[start:start+step]
         for versao, use_rev in [('A', False), ('B', True)]:
             try:
-                opt = PortfolioOptimizerV70(train_data, use_reversao=use_rev)
+                opt = PortfolioOptimizerV701(train_data, use_reversao=use_rev)
                 portfolio = opt.optimize(n_games, 30000, n_clusters=20, top_per_cluster=3)
                 bt = opt.backtest(portfolio, test_data)
                 results[versao].append({
@@ -421,14 +527,12 @@ def comparar_walk_forward(contests, n_games=5, train_size=500, step=50):
                 })
             except Exception as e:
                 results[versao].append({'lift': 0, 'roi': 0, '13pts': 0, '14pts': 0, '15pts': 0})
-        # Exibir resumo da janela
         lift_a = results['A'][-1]['lift'] if results['A'] else 0
         lift_b = results['B'][-1]['lift'] if results['B'] else 0
         pts13_a = results['A'][-1]['13pts'] if results['A'] else 0
         pts13_b = results['B'][-1]['13pts'] if results['B'] else 0
         print(f"   Janela {start}: A(lift={lift_a:.3f},13pts={pts13_a}) | B(lift={lift_b:.3f},13pts={pts13_b})")
         start += step
-    # Consolidação final
     if results['A'] and results['B']:
         print(f"\n📊 RESULTADO FINAL:")
         for versao in ['A', 'B']:
@@ -441,7 +545,6 @@ def comparar_walk_forward(contests, n_games=5, train_size=500, step=50):
             print(f"   {nome}:")
             print(f"      Média lift: {avg_lift:.3f} | Média ROI: {avg_roi:.1f}%")
             print(f"      Total 13pts: {total_13} | 14pts: {total_14} | 15pts: {total_15}")
-        # Comparação direta
         diff_lift = np.mean([r['lift'] for r in results['A']]) - np.mean([r['lift'] for r in results['B']])
         diff_13 = sum(r['13pts'] for r in results['A']) - sum(r['13pts'] for r in results['B'])
         print(f"\n   Diferença A − B: lift={diff_lift:+.3f}, 13pts={diff_13:+d}")
@@ -456,8 +559,8 @@ def comparar_walk_forward(contests, n_games=5, train_size=500, step=50):
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v70")
-    print("   COMPARAÇÃO: ESTRUTURA PURA vs. ESTRUTURA + REVERSÃO")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v70.1")
+    print("   IMPORTAÇÃO ROBUSTA + DIVERSIDADE FORÇADA")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
@@ -492,9 +595,9 @@ def main():
                     max_semi = int(input(f"   Máximo de semifixas [0-{len(semifixed)}]: ").strip() or str(len(semifixed)))
                 except:
                     min_semi, max_semi = 0, len(semifixed)
-            opt = PortfolioOptimizerV70(contests, fixed=fixed, semifixed=semifixed,
-                                        min_semifixed=min_semi, max_semifixed=max_semi,
-                                        use_reversao=use_rev)
+            opt = PortfolioOptimizerV701(contests, fixed=fixed, semifixed=semifixed,
+                                         min_semifixed=min_semi, max_semifixed=max_semi,
+                                         use_reversao=use_rev)
             portfolio = opt.optimize(5, 50000, n_clusters=20, top_per_cluster=3)
             for i, g in enumerate(portfolio, 1):
                 p = sum(1 for x in g if x%2==0); pr = sum(1 for x in g if x in PRIMES); m = sum(1 for x in g if x in MOLDURA)
@@ -509,7 +612,7 @@ def main():
         elif op == '4':
             print("\n📊 BACKTEST COMPARATIVO (últimos 200 concursos)")
             for versao, use_rev in [('A (estrutura pura)', False), ('B (estrutura + reversão)', True)]:
-                opt = PortfolioOptimizerV70(contests, use_reversao=use_rev)
+                opt = PortfolioOptimizerV701(contests, use_reversao=use_rev)
                 portfolio = opt.optimize(5, 50000, n_clusters=20, top_per_cluster=3)
                 bt = opt.backtest(portfolio, contests[-200:])
                 print(f"\n   {versao}:")
