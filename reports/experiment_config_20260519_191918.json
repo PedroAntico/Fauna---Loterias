@@ -1,0 +1,172 @@
+{
+  "timestamp": "20260519_191918",
+  "total_contests": 3685,
+  "blind_size": 300,
+  "n_games": 30,
+  "n_bootstrap": 5000,
+  "xgboost": true,
+  "features": [
+    "rep_t-1",
+    "delta_rep_t",
+    "rep_t-2",
+    "delta_rep_t-1",
+    "rep_t-3",
+    "acc_rep",
+    "pares_t-1",
+    "pares_t-2",
+    "delta_pares",
+    "moldura_t-1",
+    "moldura_t-2",
+    "delta_moldura",
+    "soma_t-1",
+    "soma_t-2",
+    "delta_soma",
+    "energia_t-1",
+    "energia_t-2",
+    "delta_energia",
+    "streak_sem_9",
+    "mean_reversion_9",
+    "rep_x_pares",
+    "rep_x_moldura",
+    "rep_x_primos",
+    "pares_x_soma",
+    "primos_x_moldura",
+    "rep_x_energia",
+    "pares_x_moldura",
+    "gap_medio",
+    "gap_var",
+    "gap_max",
+    "gap_min",
+    "energia_jogo",
+    "avg_streak_dezenas",
+    "max_streak_dezenas",
+    "avg_ema",
+    "max_ema",
+    "avg_fadiga",
+    "max_fadiga",
+    "elasticidade",
+    "abs_elasticidade",
+    "entropia_rep",
+    "entropia_conjunta",
+    "entropia_transicao",
+    "quadrantes",
+    "consecutivos",
+    "densidade_local",
+    "assimetria",
+    "clusterizacao",
+    "mutual_information",
+    "conditional_entropy",
+    "pares_recente",
+    "delta_pares_recente",
+    "moldura_recente",
+    "delta_moldura_recente",
+    "soma_recente",
+    "delta_soma_recente",
+    "random_noise"
+  ],
+  "feature_groups": {
+    "repeticao": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "pares": [
+      6,
+      7,
+      8,
+      50,
+      51
+    ],
+    "moldura": [
+      9,
+      10,
+      11,
+      52,
+      53
+    ],
+    "soma": [
+      12,
+      13,
+      14,
+      54,
+      55
+    ],
+    "energia": [
+      15,
+      16,
+      17,
+      31
+    ],
+    "interacoes": [
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26
+    ],
+    "compressao": [
+      27,
+      28,
+      29,
+      30
+    ],
+    "persistencia": [
+      32,
+      33,
+      34,
+      35
+    ],
+    "fadiga": [
+      36,
+      37
+    ],
+    "elasticidade": [
+      38,
+      39
+    ],
+    "entropia": [
+      40,
+      41,
+      42
+    ],
+    "diversidade": [
+      43,
+      44
+    ],
+    "streak": [
+      18,
+      19
+    ],
+    "topologia": [
+      45,
+      46,
+      47
+    ],
+    "info_theory": [
+      48,
+      49
+    ],
+    "repeticao_completa": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      18,
+      19,
+      20,
+      21,
+      22,
+      25
+    ],
+    "controle": [
+      56
+    ]
+  }
+}

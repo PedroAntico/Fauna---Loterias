@@ -1,0 +1,10 @@
+VALIDAÇÃO DE ALEATORIEDADE - MEGA-SENA
+==================================================
+
+Data: 15/05/2026 16:24
+Concursos: 3008
+
+RESULTADOS PRINCIPAIS:
+------------------------------
+Testes NIST-like: TODOS OK
+Análise Espectral: ANOMALIAS DETECTADAS

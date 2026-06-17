@@ -1,0 +1,16 @@
+{
+  "data_analise": "2026-05-15T14:06:51.286825",
+  "total_concursos": 3008,
+  "estados_markov": 987,
+  "entropia_condicional": 1.43529734014076,
+  "anomalias_detectadas": 240,
+  "comparacao_aleatorio": {
+    "soma": {
+      "real_mean": 183.20046542553192,
+      "random_mean": 182.74544,
+      "real_std": 39.950734785354854,
+      "random_std": 40.6483883961763,
+      "difference_pct": 0.2489941338792993,
+      "ks_pvalue": 0.6797950892057613,
+      "mw_pvalue": 0.586159997564207,
+      "is_significant": 

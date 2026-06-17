@@ -1,0 +1,77 @@
+{
+  "baseline": {
+    "roi": -90.02222222222223,
+    "impact": 0.0,
+    "dropped": "nenhum"
+  },
+  "repeticao": {
+    "roi": -90.91111111111111,
+    "impact": -0.8888888888888857,
+    "dropped": "repeticao"
+  },
+  "pares": {
+    "roi": -91.28888888888889,
+    "impact": -1.2666666666666657,
+    "dropped": "pares"
+  },
+  "moldura": {
+    "roi": -90.84444444444445,
+    "impact": -0.8222222222222229,
+    "dropped": "moldura"
+  },
+  "soma": {
+    "roi": -89.08888888888889,
+    "impact": 0.9333333333333371,
+    "dropped": "soma"
+  },
+  "energia": {
+    "roi": -88.86666666666667,
+    "impact": 1.1555555555555515,
+    "dropped": "energia"
+  },
+  "interacoes": {
+    "roi": -75.73333333333333,
+    "impact": 14.288888888888891,
+    "dropped": "interacoes"
+  },
+  "compressao": {
+    "roi": -93.15555555555555,
+    "impact": -3.1333333333333258,
+    "dropped": "compressao"
+  },
+  "persistencia": {
+    "roi": -91.62222222222223,
+    "impact": -1.6000000000000085,
+    "dropped": "persistencia"
+  },
+  "fadiga": {
+    "roi": -90.8,
+    "impact": -0.7777777777777715,
+    "dropped": "fadiga"
+  },
+  "elasticidade": {
+    "roi": -87.4,
+    "impact": 2.62222222222222,
+    "dropped": "elasticidade"
+  },
+  "entropia": {
+    "roi": -91.37777777777778,
+    "impact": -1.3555555555555543,
+    "dropped": "entropia"
+  },
+  "diversidade": {
+    "roi": -87.28888888888889,
+    "impact": 2.7333333333333343,
+    "dropped": "diversidade"
+  },
+  "streak": {
+    "roi": -90.42222222222223,
+    "impact": -0.4000000000000057,
+    "dropped": "streak"
+  },
+  "repeticao_completa": {
+    "roi": -86.06666666666666,
+    "impact": 3.955555555555563,
+    "dropped": "repeticao_completa"
+  }
+}

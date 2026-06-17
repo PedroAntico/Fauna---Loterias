@@ -1,0 +1,38 @@
+{
+  "timestamp": "2026-05-15T17:13:31.642137",
+  "n_games": 50,
+  "metrics": {
+    "dezenas": 15.0,
+    "combinatorial": 25.0,
+    "prize_coverage": 20.0,
+    "diversity": 11.694453363710126,
+    "anti_human": 0,
+    "entropy": 4.993496866810828,
+    "dezenas_cobertas": 25,
+    "coverage_pct": 1.0,
+    "pares_cobertos": 300,
+    "pair_coverage": 1.0,
+    "trincas_cobertas": 2300,
+    "triple_coverage": 1.0,
+    "avg_11_points": 1.0,
+    "avg_12_points": 1.0,
+    "avg_13_points": 1.0,
+    "avg_14_points": 0
+  },
+  "top_dezenas": [
+    12,
+    22,
+    7,
+    6,
+    17
+  ],
+  "bottom_dezenas": [
+    25,
+    23,
+    4,
+    15,
+    18
+  ],
+  "games": [
+    [
+      

@@ -1,0 +1,60 @@
+======================================================================
+RELATÓRIO FINAL DE BACKTEST - LOTOFÁCIL
+Validação Científica Completa
+======================================================================
+
+Data: 17/05/2026 13:05
+
+MONTE CARLO BACKTEST
+----------------------------------------
+Simulações: 50
+
+11 pontos:
+  Estratégia: 268.6 ± 12.5
+  Aleatório:  266.3 ± 15.3
+  p-value: 0.9692
+
+12 pontos:
+  Estratégia: 53.3 ± 8.3
+  Aleatório:  51.9 ± 5.6
+  p-value: 0.2684
+
+13 pontos:
+  Estratégia: 4.7 ± 2.0
+  Aleatório:  4.3 ± 1.9
+  p-value: 0.2487
+
+14 pontos:
+  Estratégia: 0.2 ± 0.4
+  Aleatório:  0.1 ± 0.3
+  p-value: 0.4669
+
+15 pontos:
+  Estratégia: 0.0 ± 0.0
+  Aleatório:  0.0 ± 0.0
+  p-value: nan
+
+
+WALK-FORWARD VALIDATION
+----------------------------------------
+Janelas: 70
+
+Estratégia melhor em 28/70 janelas
+Consistência: 40.0%
+
+
+======================================================================
+CONCLUSÃO FINAL
+======================================================================
+
+⚠️  POSSÍVEL VANTAGEM DETECTADA
+
+Recomenda-se investigação adicional:
+- Aumentar número de simulações
+- Testar em períodos diferentes
+- Verificar possível overfitting
+
+⚠️  DISCLAIMER:
+Este backtest usa apenas dados passados.
+Resultados passados não garantem resultados futuros.
+Loteria é um jogo de azar. Jogue com responsabilidade.
