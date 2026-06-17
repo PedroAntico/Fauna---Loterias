@@ -2,22 +2,22 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v68
-PESOS REAIS + MODELO DE DEZENAS + CLUSTERIZAÇÃO ESTRUTURAL
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v69
+MODELO DE DEZENAS POR REVERSÃO + WALK‑FORWARD REAL DA CARTEIRA
 
 MELHORIAS:
-✅ Pesos dos filtros = ganho real no walk‑forward (taxa predictor − baseline)
-✅ Modelo de dezenas individuais: score por frequência recente + atraso + repetição
-✅ Clusterização estrutural (KMeans) para forçar diversidade
-✅ Score final = distância estrutural ponderada − bônus das dezenas
-✅ Mantém pair covering e backtest
+✅ Modelo de dezenas: penaliza quentes (freq20 > freq100), bonifica frias
+✅ Walk‑forward real: gera carteira para cada concurso e mede 11‑15 pontos
+✅ Cache de ganhos reais dos filtros (evita recalcular)
+✅ Mantém clusterização estrutural + pair covering
+✅ Métricas focadas em 13, 14, 15 pontos
 """
 
 import numpy as np
 from scipy.stats import hypergeom
 from collections import Counter
 from itertools import combinations
-import os, random, time, warnings
+import os, random, time, warnings, json
 from math import comb
 from tqdm import tqdm
 
@@ -74,7 +74,7 @@ def load_all_contests(csv_file='resultados_lotofacil.csv'):
     return contests
 
 # ============================================================
-# GERADOR DE JOGOS (SEM FILTROS ESTRUTURAIS)
+# GERADOR DE JOGOS
 # ============================================================
 class LooseGenerator:
     def __init__(self):
@@ -115,7 +115,7 @@ class LooseGenerator:
         return sorted(np.random.choice(range(1, 26), 15, replace=False))
 
 # ============================================================
-# FUNÇÕES AUXILIARES PARA EXTRAÇÃO DE FILTROS
+# FUNÇÕES AUXILIARES
 # ============================================================
 def extract_filter(dezenas, filter_name, prev_dezenas=None):
     d = sorted(dezenas)
@@ -130,14 +130,15 @@ def extract_filter(dezenas, filter_name, prev_dezenas=None):
     return 0
 
 # ============================================================
-# STRUCTURAL PREDICTOR + CÁLCULO DE GANHOS REAIS
+# STRUCTURAL PREDICTOR COM CACHE
 # ============================================================
-class StructuralPredictorV68:
-    def __init__(self, contests):
+class StructuralPredictorV69:
+    def __init__(self, contests, cache_file='v69_weights_cache.json'):
         self.contests = contests
         self.active_filters = ['pares', 'moldura', 'primos', 'soma', 'amplitude', 'repeticoes']
         self.windows = [20, 50, 100, 200]
-        self._compute_real_gains()
+        self.cache_file = cache_file
+        self._load_or_compute_weights()
 
     def _get_filter_series(self, filter_name):
         series = []
@@ -146,9 +147,29 @@ class StructuralPredictorV68:
             series.append(extract_filter(c['dezenas'], filter_name, prev))
         return np.array(series, dtype=float)
 
-    def _compute_real_gains(self, min_history=500):
-        """Calcula o ganho real de cada filtro sobre o baseline ingênuo."""
+    def _load_or_compute_weights(self):
+        """Carrega pesos do cache ou calcula e salva."""
+        if os.path.exists(self.cache_file):
+            try:
+                with open(self.cache_file, 'r') as f:
+                    data = json.load(f)
+                self.weights = data['weights']
+                self.gains = data['gains']
+                print(f"📂 Pesos carregados do cache ({self.cache_file})")
+                return
+            except:
+                pass
         print("📊 Calculando ganhos reais dos filtros (walk‑forward)...")
+        self._compute_real_gains()
+        # Salvar cache
+        try:
+            with open(self.cache_file, 'w') as f:
+                json.dump({'weights': self.weights, 'gains': self.gains}, f)
+            print(f"   Cache salvo em {self.cache_file}")
+        except:
+            pass
+
+    def _compute_real_gains(self, min_history=500):
         gains = {}
         for filtro in self.active_filters:
             series = self._get_filter_series(filtro)
@@ -158,7 +179,6 @@ class StructuralPredictorV68:
                 history = series[:t+1]
                 next_val = series[t+1]
                 curr_val = series[t]
-                # Predictor: mediana do ensemble de janelas
                 preds = []
                 for w in self.windows:
                     if len(history) >= w:
@@ -169,15 +189,11 @@ class StructuralPredictorV68:
                         center = round(center / 5) * 5
                     if int(round(center)) == int(next_val):
                         acertos_pred += 1
-                # Baseline: repetir valor atual
                 if int(curr_val) == int(next_val):
                     acertos_base += 1
                 total += 1
-            if total > 0:
-                gains[filtro] = (acertos_pred / total - acertos_base / total) * 100
-            else:
-                gains[filtro] = 0.0
-        # Normalizar para soma = 1 (apenas ganhos positivos)
+            gains[filtro] = (acertos_pred / total - acertos_base / total) * 100 if total > 0 else 0.0
+        self.gains = gains
         total_gain = sum(max(0, g) for g in gains.values())
         if total_gain > 0:
             self.weights = {f: max(0, gains[f]) / total_gain for f in gains}
@@ -203,22 +219,31 @@ class StructuralPredictorV68:
         return centers
 
 # ============================================================
-# MODELO DE DEZENAS INDIVIDUAIS
+# MODELO DE DEZENAS POR REVERSÃO (v69)
 # ============================================================
-class DezenaModel:
+class DezenaModelReversao:
     def __init__(self, contests):
         self.contests = contests
 
-    def compute_scores(self, janela_freq=50, peso_atraso=0.5, peso_rep=1.0):
-        """Retorna dicionário com score para cada dezena (1 a 25)."""
+    def compute_scores(self, janela_curta=20, janela_longa=100, peso_atraso=0.3):
+        """
+        Score baseado em reversão:
+        - Se freq20 > freq100 → penaliza (dezena quente, deve cair)
+        - Se freq20 < freq100 → bonifica (dezena fria, deve subir)
+        - Bônus adicional para dezenas atrasadas
+        """
         if len(self.contests) == 0:
             return {d: 0.0 for d in range(1, 26)}
         total = len(self.contests)
-        recent = self.contests[-janela_freq:] if janela_freq < total else self.contests
-        # Frequência recente
-        freq = Counter()
+        recent = self.contests[-janela_curta:] if janela_curta < total else self.contests
+        long_data = self.contests[-janela_longa:] if janela_longa < total else self.contests
+        # Frequências
+        freq_curta = Counter()
         for c in recent:
-            freq.update(c['dezenas'])
+            freq_curta.update(c['dezenas'])
+        freq_longa = Counter()
+        for c in long_data:
+            freq_longa.update(c['dezenas'])
         # Atraso
         last_seen = {d: -1 for d in range(1, 26)}
         for i, c in enumerate(self.contests):
@@ -226,23 +251,26 @@ class DezenaModel:
                 last_seen[d] = i
         atraso = {d: (total - 1 - last_seen[d]) for d in range(1, 26)}
         max_atraso = max(atraso.values()) + 1
-        # Repetição do último concurso
-        ultimo = set(self.contests[-1]['dezenas']) if total > 0 else set()
         scores = {}
         for d in range(1, 26):
-            f = freq.get(d, 0) / len(recent)
-            a = 1.0 / (atraso[d] + 1)
-            r = 1.0 if d in ultimo else 0.0
-            scores[d] = f + peso_atraso * a + peso_rep * r
-        # Normalizar
-        total_score = sum(scores.values())
-        if total_score > 0:
+            fc = freq_curta.get(d, 0) / len(recent)
+            fl = freq_longa.get(d, 0) / len(longa)
+            edge = fc - fl  # positivo = quente, negativo = fria
+            # Reversão: penaliza quentes, bonifica frias
+            reversao_score = -edge * 2.0  # peso 2 para o efeito de reversão
+            # Bônus por atraso (normalizado)
+            atraso_score = peso_atraso * (atraso[d] / max_atraso)
+            scores[d] = reversao_score + atraso_score
+        # Normalizar para que o maior score seja 1 e o menor seja -1 (aproximadamente)
+        min_s = min(scores.values())
+        max_s = max(scores.values())
+        if max_s > min_s:
             for d in scores:
-                scores[d] /= total_score
+                scores[d] = (scores[d] - min_s) / (max_s - min_s)
         return scores
 
 # ============================================================
-# KMEANS MANUAL (PARA CLUSTERIZAÇÃO ESTRUTURAL)
+# KMEANS MANUAL
 # ============================================================
 class SimpleKMeans:
     def __init__(self, n_clusters=10, max_iter=50):
@@ -253,16 +281,13 @@ class SimpleKMeans:
         n = len(X)
         if n <= self.n_clusters:
             return np.arange(n)
-        # Inicializar centróides aleatoriamente
         idx = np.random.choice(n, self.n_clusters, replace=False)
         centroids = X[idx].copy()
         labels = np.zeros(n, dtype=int)
         for _ in range(self.max_iter):
-            # Atribuir labels
             for i in range(n):
                 dists = np.sum((centroids - X[i])**2, axis=1)
                 labels[i] = np.argmin(dists)
-            # Atualizar centróides
             new_centroids = np.zeros_like(centroids)
             for k in range(self.n_clusters):
                 members = X[labels == k]
@@ -276,9 +301,9 @@ class SimpleKMeans:
         return labels
 
 # ============================================================
-# OTIMIZADOR DE CARTEIRA v68
+# OTIMIZADOR DE CARTEIRA v69
 # ============================================================
-class PortfolioOptimizerV68:
+class PortfolioOptimizerV69:
     def __init__(self, contests, fixed=None, semifixed=None, min_semifixed=0, max_semifixed=None):
         self.contests = contests
         self.generator = LooseGenerator()
@@ -286,8 +311,8 @@ class PortfolioOptimizerV68:
         self.semifixed = semifixed if semifixed else []
         self.min_semifixed = min_semifixed
         self.max_semifixed = max_semifixed
-        self.predictor = StructuralPredictorV68(contests)
-        self.dezena_model = DezenaModel(contests)
+        self.predictor = StructuralPredictorV69(contests)
+        self.dezena_model = DezenaModelReversao(contests)
 
     def _compute_game_features(self, game, prev_dezenas):
         return {
@@ -300,7 +325,6 @@ class PortfolioOptimizerV68:
         }
 
     def _score_game(self, game, centers, prev_dezenas, dezena_scores):
-        """Score combinado: distância estrutural ponderada − bônus das dezenas."""
         features = self._compute_game_features(game, prev_dezenas)
         score_estrutural = 0.0
         for filtro, center in centers.items():
@@ -312,12 +336,10 @@ class PortfolioOptimizerV68:
                 else:
                     dist = abs(features[filtro] - center)
                 score_estrutural += self.predictor.weights[filtro] * dist
-        # Bônus das dezenas: soma dos scores das 15 dezenas do jogo
         bonus_dezenas = sum(dezena_scores.get(d, 0.0) for d in game)
-        return score_estrutural - 0.3 * bonus_dezenas  # peso 0.3 para dezenas
+        return score_estrutural - 0.3 * bonus_dezenas
 
     def _build_feature_matrix(self, games, prev_dezenas):
-        """Constrói matriz de features estruturais para clusterização."""
         features = []
         for g in games:
             f = self._compute_game_features(g, prev_dezenas)
@@ -358,57 +380,40 @@ class PortfolioOptimizerV68:
         return selected
 
     def optimize(self, n_games=5, n_candidates=50000, n_clusters=20, top_per_cluster=3):
-        print(f"\n🧩 CARTEIRA v68: {n_games} jogos")
+        print(f"\n🧩 CARTEIRA v69: {n_games} jogos")
         if self.fixed: print(f"   Fixas: {self.fixed}")
         if self.semifixed:
             print(f"   Semifixas: {self.semifixed} (mín={self.min_semifixed}, máx={self.max_semifixed})")
-        print(f"   Clusters: {n_clusters} | Top por cluster: {top_per_cluster}")
-
-        # Previsões
         centers = self.predictor.predict_centers()
         dezena_scores = self.dezena_model.compute_scores()
         print(f"\n📊 CENTROS PREVISTOS:")
         for f in centers:
             print(f"   {f:<12}: {centers[f]:<6} (peso={self.predictor.weights[f]:.3f})")
-        print(f"📊 TOP 5 DEZENAS: {sorted(dezena_scores.items(), key=lambda x: x[1], reverse=True)[:5]}")
-
-        # Gerar pool
+        top5 = sorted(dezena_scores.items(), key=lambda x: x[1], reverse=True)[:5]
+        bottom5 = sorted(dezena_scores.items(), key=lambda x: x[1])[:5]
+        print(f"📊 TOP 5 DEZENAS (reversão): {top5}")
+        print(f"📊 BOTTOM 5 DEZENAS (quentes): {bottom5}")
         t0 = time.time()
         prev_dezenas = self.contests[-1]['dezenas'] if self.contests else None
         pool = self.generate_pool(n_candidates, prev_dezenas)
         print(f"   Pool gerado: {len(pool)} jogos")
-
         if len(pool) < n_games:
             raise RuntimeError(f"Pool insuficiente: {len(pool)} < {n_games}.")
-
-        # Calcular scores para ordenação inicial
-        scored = []
-        for g in pool:
-            s = self._score_game(g, centers, prev_dezenas, dezena_scores)
-            scored.append((s, g))
+        scored = [(self._score_game(g, centers, prev_dezenas, dezena_scores), g) for g in pool]
         scored.sort(key=lambda x: x[0])
-        # Pegar os top 2000 para clusterizar
         top_pool = [g for _, g in scored[:2000]]
-
-        # Clusterização estrutural
         X = self._build_feature_matrix(top_pool, prev_dezenas)
         kmeans = SimpleKMeans(n_clusters=min(n_clusters, len(top_pool)))
         labels = kmeans.fit_predict(X)
-
-        # Selecionar os melhores de cada cluster
         cluster_best = {i: [] for i in range(n_clusters)}
         for i, (s, g) in enumerate(scored[:2000]):
             lbl = labels[i]
             cluster_best[lbl].append((s, g))
-
         diverse_pool = []
         for lbl in cluster_best:
             cluster_best[lbl].sort(key=lambda x: x[0])
             diverse_pool.extend([g for _, g in cluster_best[lbl][:top_per_cluster]])
-
         print(f"   Pool diversificado: {len(diverse_pool)} jogos (de {n_clusters} clusters)")
-
-        # Pair covering final
         portfolio = self.select_pair_covering(diverse_pool, n_games)
         print(f"✅ Carteira final: {len(portfolio)} jogos em {time.time()-t0:.1f}s")
         return portfolio
@@ -437,12 +442,53 @@ class PortfolioOptimizerV68:
                 'hit_distribution': hit_counts}
 
 # ============================================================
+# WALK‑FORWARD REAL DA CARTEIRA (v69)
+# ============================================================
+def walk_forward_carteira(contests, n_games=5, train_size=500, step=50):
+    """
+    Gera carteira para blocos de concursos e mede acertos.
+    Retorna distribuição de 11‑15 pontos ao longo do tempo.
+    """
+    print(f"\n🔬 WALK‑FORWARD REAL DA CARTEIRA")
+    print(f"   Treino: {train_size} | Teste: {step} | Jogos: {n_games}\n")
+    results = []
+    start = train_size
+    while start + step <= len(contests):
+        train_data = contests[start-train_size:start]
+        test_data = contests[start:start+step]
+        try:
+            opt = PortfolioOptimizerV69(train_data)
+            portfolio = opt.optimize(n_games, 30000, n_clusters=20, top_per_cluster=3)
+            bt = opt.backtest(portfolio, test_data)
+            results.append({
+                'start': start,
+                'lift': bt['lift'],
+                'roi': bt['roi'],
+                '13pts': bt['hit_distribution'].get(13, 0),
+                '14pts': bt['hit_distribution'].get(14, 0),
+                '15pts': bt['hit_distribution'].get(15, 0),
+            })
+            print(f"   Janela {start}: lift={bt['lift']:.3f} | ROI={bt['roi']:+.1f}% | "
+                  f"13pts={bt['hit_distribution'].get(13,0)} 14pts={bt['hit_distribution'].get(14,0)}")
+        except Exception as e:
+            print(f"   Janela {start}: ERRO - {e}")
+        start += step
+    if results:
+        print(f"\n📊 RESUMO:")
+        print(f"   Média lift: {np.mean([r['lift'] for r in results]):.3f}")
+        print(f"   Média ROI: {np.mean([r['roi'] for r in results]):.1f}%")
+        print(f"   Total 13pts: {sum(r['13pts'] for r in results)}")
+        print(f"   Total 14pts: {sum(r['14pts'] for r in results)}")
+        print(f"   Total 15pts: {sum(r['15pts'] for r in results)}")
+    return results
+
+# ============================================================
 # INTERFACE PRINCIPAL
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v68")
-    print("   PESOS REAIS + MODELO DE DEZENAS + CLUSTERIZAÇÃO")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v69")
+    print("   MODELO DE DEZENAS POR REVERSÃO + WALK‑FORWARD REAL")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
@@ -453,9 +499,10 @@ def main():
 
     while True:
         print("\nOpções:")
-        print("1. Gerar carteira otimizada (v68)")
-        print("2. Backtest nos últimos 200 concursos")
-        print("3. Mostrar centros previstos e pesos")
+        print("1. Gerar carteira otimizada (v69)")
+        print("2. Walk‑forward real da carteira")
+        print("3. Backtest nos últimos 200 concursos")
+        print("4. Mostrar centros previstos e scores de dezenas")
         print("0. Sair")
         op = input("Escolha: ").strip()
 
@@ -472,7 +519,7 @@ def main():
                     max_semi = int(input(f"   Máximo de semifixas [0-{len(semifixed)}]: ").strip() or str(len(semifixed)))
                 except:
                     min_semi, max_semi = 0, len(semifixed)
-            opt = PortfolioOptimizerV68(contests, fixed=fixed, semifixed=semifixed,
+            opt = PortfolioOptimizerV69(contests, fixed=fixed, semifixed=semifixed,
                                         min_semifixed=min_semi, max_semifixed=max_semi)
             portfolio = opt.optimize(5, 50000, n_clusters=20, top_per_cluster=3)
             for i, g in enumerate(portfolio, 1):
@@ -486,21 +533,31 @@ def main():
                       f"13={bt['hit_distribution'].get(13,0)} 14={bt['hit_distribution'].get(14,0)}")
 
         elif op == '2':
+            walk_forward_carteira(contests)
+
+        elif op == '3':
             fixed_str = input("\n   Fixas (ENTER para pular): ").strip()
             fixed = [int(x) for x in fixed_str.split()] if fixed_str else []
-            opt = PortfolioOptimizerV68(contests, fixed=fixed)
+            opt = PortfolioOptimizerV69(contests, fixed=fixed)
             portfolio = opt.optimize(5, 50000, n_clusters=20, top_per_cluster=3)
             bt = opt.backtest(portfolio, contests[-200:])
             print(f"\n🔬 BACKTEST (200): Lift={bt['lift']:.2f}x | ROI={bt['roi']:+.1f}%")
             print(f"   11={bt['hit_distribution'].get(11,0)} 12={bt['hit_distribution'].get(12,0)} "
                   f"13={bt['hit_distribution'].get(13,0)} 14={bt['hit_distribution'].get(14,0)}")
 
-        elif op == '3':
-            predictor = StructuralPredictorV68(contests)
+        elif op == '4':
+            predictor = StructuralPredictorV69(contests)
             centers = predictor.predict_centers()
+            dezena_model = DezenaModelReversao(contests)
+            scores = dezena_model.compute_scores()
             print(f"\n📊 CENTROS PREVISTOS E PESOS:")
             for f in predictor.active_filters:
                 print(f"   {f:<12}: centro={centers[f]:<6} peso={predictor.weights[f]:.3f}")
+            print(f"\n📊 SCORES DE DEZENAS (reversão):")
+            sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+            for d, s in sorted_scores:
+                bar = "█" * int(s * 20) if s > 0 else ""
+                print(f"   {d:2d}: {s:+.3f} {bar}")
 
         elif op == '0':
             break
