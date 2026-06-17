@@ -574,8 +574,8 @@ class StructuralPredictor:
                 recent = series[-50:]
                 mean_val = np.mean(recent)
                 std_val = np.std(recent)
-                low = max(info['min'], int(mean_val - std_val))
-                high = min(info['max'], int(mean_val + std_val) + 1)
+                low = max(info['min'], np.percentile(recent,35)
+                high = min(info['max'], np.percentile(recent,35) + 1)
                 ranges[filtro] = (low, high)
                 print(f"   {filtro:<15}: [{low}, {high}] (média={mean_val:.1f})")
             elif method == 'ipe':
