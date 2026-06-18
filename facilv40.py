@@ -2,17 +2,16 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v72
-MODELO DE PRESSÃO ESTRUTURAL TEMPORAL (5 CAMADAS)
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v73
+MODELO DE PRESSÃO ESTRUTURAL TEMPORAL ESTENDIDO
 
-CAMADAS DO SCORE:
-✅ Centro estrutural (distância ao centro previsto)
-✅ Persistência (duração da sequência atual vs. média histórica)
-✅ Ciclo (atraso atual vs. intervalo médio de ocorrência)
-✅ Correlação condicional (distribuição de pares dado moldura, etc.)
-✅ Matriz de transição (Markov: probabilidade do próximo estado dado o atual)
-✅ Score global = combinação ponderada das 5 camadas
-✅ Walk‑forward comparativo: modelo plano (v71) vs. modelo de pressão (v72)
+NOVAS CAMADAS (vs v72):
+✅ Z‑score dos ciclos (usa desvio padrão, não razão simples)
+✅ Pesos reais dos parâmetros na pressão (herdados do predictor)
+✅ Pressão por linhas (0 a 5 dezenas em cada uma das 5 linhas)
+✅ Pressão por blocos (01‑05, 06‑10, 11‑15, 16‑20, 21‑25)
+✅ Mantém as 5 camadas anteriores (centro, persistência, ciclo, correlação, transição)
+✅ Walk‑forward comparativo: modelo plano vs modelo de pressão estendido
 """
 
 import numpy as np
@@ -34,8 +33,24 @@ HYPE_PROBS = {k: hypergeom.pmf(k, 25, 15, 15) for k in range(0, 16)}
 PREMIO_VALORES = {11: 6.0, 12: 12.0, 13: 30.0, 14: 1500.0, 15: 1800000.0}
 CUSTO_APOSTA = 3.5
 
-# Parâmetros estruturais monitorados
+# Parâmetros estruturais principais
 STRUCTURAL_PARAMS = ['pares', 'moldura', 'primos', 'repeticoes', 'amplitude']
+
+# Linhas e blocos
+LINHAS = {
+    1: [1, 2, 3, 4, 5],
+    2: [6, 7, 8, 9, 10],
+    3: [11, 12, 13, 14, 15],
+    4: [16, 17, 18, 19, 20],
+    5: [21, 22, 23, 24, 25]
+}
+BLOCOS = {
+    'B1 (01-05)': [1, 2, 3, 4, 5],
+    'B2 (06-10)': [6, 7, 8, 9, 10],
+    'B3 (11-15)': [11, 12, 13, 14, 15],
+    'B4 (16-20)': [16, 17, 18, 19, 20],
+    'B5 (21-25)': [21, 22, 23, 24, 25]
+}
 
 # ============================================================
 # BITMASK
@@ -133,205 +148,20 @@ def extract_filter(dezenas, filter_name, prev_dezenas=None):
         return len(set(d) & set(prev_dezenas))
     return 0
 
-# ============================================================
-# MODELO DE PRESSÃO ESTRUTURAL TEMPORAL (5 CAMADAS)
-# ============================================================
-class PressaoEstruturalTemporal:
-    def __init__(self, contests):
-        self.contests = contests
-        self._build_historical_stats()
+def count_in_line(dezenas, linha_num):
+    """Conta quantas dezenas estão em uma determinada linha (1 a 5)."""
+    linha_dezenas = set(LINHAS[linha_num])
+    return len(set(dezenas) & linha_dezenas)
 
-    def _extract_param_series(self, param_name):
-        """Extrai a série temporal de um parâmetro estrutural."""
-        series = []
-        for i, c in enumerate(self.contests):
-            prev = self.contests[i-1]['dezenas'] if i > 0 else None
-            series.append(extract_filter(c['dezenas'], param_name, prev))
-        return np.array(series, dtype=int)
-
-    def _build_historical_stats(self):
-        """Pré‑computa estatísticas históricas para todos os parâmetros."""
-        self.series = {}
-        self.freq = {}
-        self.intervalo_medio = {}
-        self.desvio_intervalo = {}
-        self.atraso_atual = {}
-        self.persistencia_atual = {}
-        self.persistencia_media = {}
-        for param in STRUCTURAL_PARAMS:
-            s = self._extract_param_series(param)
-            self.series[param] = s
-            # Frequência de cada valor
-            self.freq[param] = Counter(s)
-            # Intervalo entre ocorrências de cada valor
-            self.intervalo_medio[param] = {}
-            self.desvio_intervalo[param] = {}
-            self.atraso_atual[param] = {}
-            for val in set(s):
-                ocorrencias = np.where(s == val)[0]
-                if len(ocorrencias) > 1:
-                    intervalos = np.diff(ocorrencias)
-                    self.intervalo_medio[param][val] = np.mean(intervalos)
-                    self.desvio_intervalo[param][val] = np.std(intervalos)
-                else:
-                    self.intervalo_medio[param][val] = len(s)
-                    self.desvio_intervalo[param][val] = len(s)
-                # Atraso atual
-                if len(ocorrencias) > 0:
-                    self.atraso_atual[param][val] = len(s) - 1 - ocorrencias[-1]
-                else:
-                    self.atraso_atual[param][val] = len(s)
-            # Persistência (sequências)
-            self.persistencia_atual[param] = {}
-            self.persistencia_media[param] = {}
-            runs = []
-            current_val = s[0]
-            current_len = 1
-            for i in range(1, len(s)):
-                if s[i] == current_val:
-                    current_len += 1
-                else:
-                    runs.append((current_val, current_len))
-                    current_val = s[i]
-                    current_len = 1
-            runs.append((current_val, current_len))
-            # Persistência atual = duração da sequência mais recente
-            last_val, last_len = runs[-1]
-            self.persistencia_atual[param][last_val] = last_len
-            # Persistência média por valor
-            for val in set(s):
-                lengths = [l for v, l in runs if v == val]
-                if lengths:
-                    self.persistencia_media[param][val] = np.mean(lengths)
-                else:
-                    self.persistencia_media[param][val] = 1.0
-
-    # Camada 1: Centro estrutural
-    def score_centro(self, game_features, centers, weights):
-        """Distância ponderada aos centros previstos."""
-        score = 0.0
-        for param in STRUCTURAL_PARAMS:
-            if param in game_features and param in centers:
-                if param == 'amplitude':
-                    dist = abs(game_features[param] - centers[param]) / 14.0
-                else:
-                    dist = abs(game_features[param] - centers[param])
-                score += weights.get(param, 0.2) * dist
-        return score
-
-    # Camada 2: Persistência
-    def score_persistencia(self, game_features):
-        """
-        Mede se a duração atual de um valor está acima da média histórica.
-        Persistência alta → o sistema pode "cansar" e reverter.
-        Score positivo = persistência acima da média (pressionado para cair).
-        """
-        score = 0.0
-        for param in STRUCTURAL_PARAMS:
-            if param in game_features:
-                val = game_features[param]
-                pers_atual = self.persistencia_atual[param].get(val, 1)
-                pers_media = self.persistencia_media[param].get(val, 1.0)
-                if pers_media > 0:
-                    score += (pers_atual / pers_media - 1.0)  # >0 se acima da média
-        return score / len(STRUCTURAL_PARAMS)
-
-    # Camada 3: Ciclo
-    def score_ciclo(self, game_features):
-        """
-        Mede o atraso atual em relação ao intervalo médio de ocorrência.
-        Valores muito atrasados recebem pressão positiva (devem voltar).
-        """
-        score = 0.0
-        for param in STRUCTURAL_PARAMS:
-            if param in game_features:
-                val = game_features[param]
-                atraso = self.atraso_atual[param].get(val, 0)
-                intervalo = self.intervalo_medio[param].get(val, len(self.contests))
-                if intervalo > 0:
-                    score += (atraso / intervalo - 1.0)  # >0 se atrasado
-        return score / len(STRUCTURAL_PARAMS)
-
-    # Camada 4: Correlação condicional
-    def score_correlacao(self, game_features):
-        """
-        Exemplo: dado que moldura = 10, qual a distribuição típica de pares?
-        Penaliza combinações atípicas.
-        """
-        score = 0.0
-        # Pares de parâmetros correlacionados
-        pairs = [('moldura', 'pares'), ('primos', 'pares'), ('repeticoes', 'moldura')]
-        for p1, p2 in pairs:
-            if p1 in game_features and p2 in game_features:
-                v1, v2 = game_features[p1], game_features[p2]
-                # Frequência conjunta nos últimos 200 concursos
-                recent = self.contests[-200:] if len(self.contests) >= 200 else self.contests
-                joint_count = 0
-                total_with_v1 = 0
-                for i, c in enumerate(recent):
-                    prev = self.contests[len(self.contests)-len(recent)+i-1]['dezenas'] if i > 0 else None
-                    f1 = extract_filter(c['dezenas'], p1, prev)
-                    f2 = extract_filter(c['dezenas'], p2, prev)
-                    if f1 == v1:
-                        total_with_v1 += 1
-                        if f2 == v2:
-                            joint_count += 1
-                if total_with_v1 > 0:
-                    prob = joint_count / total_with_v1
-                    # Penaliza se a combinação é rara (prob < 0.2)
-                    if prob < 0.2:
-                        score += (0.2 - prob) * 5.0
-        return score
-
-    # Camada 5: Matriz de transição (Markov)
-    def score_transicao(self, game_features):
-        """
-        Dado o último estado de cada parâmetro, qual a probabilidade do estado do jogo?
-        Penaliza transições improváveis.
-        """
-        if len(self.contests) < 2:
-            return 0.0
-        score = 0.0
-        for param in STRUCTURAL_PARAMS:
-            if param in game_features:
-                s = self.series[param]
-                if len(s) >= 2:
-                    prev_val = s[-1]
-                    curr_val = game_features[param]
-                    # Contar transições prev_val → curr_val
-                    trans_count = 0
-                    total_prev = 0
-                    for i in range(1, len(s)):
-                        if s[i-1] == prev_val:
-                            total_prev += 1
-                            if s[i] == curr_val:
-                                trans_count += 1
-                    if total_prev > 0:
-                        prob = trans_count / total_prev
-                        # Penaliza se a transição é improvável (< 0.15)
-                        if prob < 0.15:
-                            score += (0.15 - prob) * 5.0
-        return score
-
-    # Score global
-    def compute_global_score(self, game_features, centers, weights):
-        """
-        Score combinado das 5 camadas.
-        Pesos: centro 30%, persistência 25%, ciclo 25%, correlação 10%, transição 10%
-        """
-        s_centro = self.score_centro(game_features, centers, weights)
-        s_persist = self.score_persistencia(game_features)
-        s_ciclo = self.score_ciclo(game_features)
-        s_correl = self.score_correlacao(game_features)
-        s_trans = self.score_transicao(game_features)
-        return (0.30 * s_centro + 0.25 * s_persist + 0.25 * s_ciclo +
-                0.10 * s_correl + 0.10 * s_trans)
+def count_in_block(dezenas, block_dezenas):
+    """Conta quantas dezenas estão em um bloco específico."""
+    return len(set(dezenas) & set(block_dezenas))
 
 # ============================================================
-# STRUCTURAL PREDICTOR (CENTROS E PESOS)
+# STRUCTURAL PREDICTOR (CENTROS E PESOS REAIS)
 # ============================================================
-class StructuralPredictorV72:
-    def __init__(self, contests, cache_file='v72_weights_cache.json'):
+class StructuralPredictorV73:
+    def __init__(self, contests, cache_file='v73_weights_cache.json'):
         self.contests = contests
         self.active_filters = STRUCTURAL_PARAMS
         self.windows = [20, 50, 100, 200]
@@ -404,9 +234,257 @@ class StructuralPredictorV72:
         return centers
 
 # ============================================================
-# OTIMIZADOR DE CARTEIRA v72 (COM MODELO DE PRESSÃO)
+# MODELO DE PRESSÃO ESTRUTURAL TEMPORAL ESTENDIDO (v73)
 # ============================================================
-class PortfolioOptimizerV72:
+class PressaoEstruturalTemporalV73:
+    def __init__(self, contests, predictor_weights=None):
+        self.contests = contests
+        self.predictor_weights = predictor_weights if predictor_weights else {p: 0.2 for p in STRUCTURAL_PARAMS}
+        self._build_historical_stats()
+
+    def _extract_param_series(self, param_name):
+        series = []
+        for i, c in enumerate(self.contests):
+            prev = self.contests[i-1]['dezenas'] if i > 0 else None
+            series.append(extract_filter(c['dezenas'], param_name, prev))
+        return np.array(series, dtype=int)
+
+    def _compute_stats_for_series(self, series, name):
+        """Calcula estatísticas (freq, intervalo médio, desvio, atraso, persistência) para uma série."""
+        stats = {}
+        s = np.array(series, dtype=int)
+        stats['series'] = s
+        stats['freq'] = Counter(s)
+        stats['intervalo_medio'] = {}
+        stats['desvio_intervalo'] = {}
+        stats['atraso_atual'] = {}
+        stats['z_score_atraso'] = {}
+        for val in set(s):
+            ocorrencias = np.where(s == val)[0]
+            if len(ocorrencias) > 1:
+                intervalos = np.diff(ocorrencias)
+                stats['intervalo_medio'][val] = np.mean(intervalos)
+                stats['desvio_intervalo'][val] = np.std(intervalos)
+            else:
+                stats['intervalo_medio'][val] = len(s)
+                stats['desvio_intervalo'][val] = len(s)
+            if len(ocorrencias) > 0:
+                atraso = len(s) - 1 - ocorrencias[-1]
+                stats['atraso_atual'][val] = atraso
+                # Z‑score do atraso
+                intervalo = stats['intervalo_medio'][val]
+                desvio = stats['desvio_intervalo'][val]
+                if desvio > 0:
+                    stats['z_score_atraso'][val] = (atraso - intervalo) / desvio
+                else:
+                    stats['z_score_atraso'][val] = 0.0
+            else:
+                stats['atraso_atual'][val] = len(s)
+                stats['z_score_atraso'][val] = 0.0
+        # Persistência
+        runs = []
+        if len(s) > 0:
+            current_val = s[0]
+            current_len = 1
+            for i in range(1, len(s)):
+                if s[i] == current_val:
+                    current_len += 1
+                else:
+                    runs.append((current_val, current_len))
+                    current_val = s[i]
+                    current_len = 1
+            runs.append((current_val, current_len))
+        stats['persistencia_atual'] = {}
+        stats['persistencia_media'] = {}
+        if runs:
+            last_val, last_len = runs[-1]
+            stats['persistencia_atual'][last_val] = last_len
+        for val in set(s):
+            lengths = [l for v, l in runs if v == val]
+            if lengths:
+                stats['persistencia_media'][val] = np.mean(lengths)
+            else:
+                stats['persistencia_media'][val] = 1.0
+        return stats
+
+    def _build_historical_stats(self):
+        """Pré‑computa estatísticas para parâmetros estruturais, linhas e blocos."""
+        self.stats = {}
+        # Parâmetros estruturais
+        for param in STRUCTURAL_PARAMS:
+            s = self._extract_param_series(param)
+            self.stats[param] = self._compute_stats_for_series(s, param)
+        # Linhas
+        self.stats['linhas'] = {}
+        for linha_num in range(1, 6):
+            s = [count_in_line(c['dezenas'], linha_num) for c in self.contests]
+            self.stats['linhas'][linha_num] = self._compute_stats_for_series(s, f'linha_{linha_num}')
+        # Blocos
+        self.stats['blocos'] = {}
+        for bloco_nome, bloco_dezenas in BLOCOS.items():
+            s = [count_in_block(c['dezenas'], bloco_dezenas) for c in self.contests]
+            self.stats['blocos'][bloco_nome] = self._compute_stats_for_series(s, bloco_nome)
+
+    def _compute_game_features(self, game, prev_dezenas):
+        """Extrai todas as características de um jogo."""
+        features = {}
+        for param in STRUCTURAL_PARAMS:
+            features[param] = extract_filter(game, param, prev_dezenas)
+        # Linhas
+        for linha_num in range(1, 6):
+            features[f'linha_{linha_num}'] = count_in_line(game, linha_num)
+        # Blocos
+        for bloco_nome in BLOCOS:
+            features[bloco_nome] = count_in_block(game, BLOCOS[bloco_nome])
+        return features
+
+    # Camada 1: Centro estrutural
+    def score_centro(self, game_features, centers):
+        """Distância ponderada aos centros previstos (apenas params estruturais)."""
+        score = 0.0
+        for param in STRUCTURAL_PARAMS:
+            if param in game_features and param in centers:
+                if param == 'amplitude':
+                    dist = abs(game_features[param] - centers[param]) / 14.0
+                else:
+                    dist = abs(game_features[param] - centers[param])
+                score += self.predictor_weights.get(param, 0.2) * dist
+        return score
+
+    # Camada 2: Persistência (igual ao v72)
+    def score_persistencia(self, game_features):
+        score = 0.0
+        count = 0
+        for param in STRUCTURAL_PARAMS:
+            if param in game_features and param in self.stats:
+                val = game_features[param]
+                pers_atual = self.stats[param]['persistencia_atual'].get(val, 1)
+                pers_media = self.stats[param]['persistencia_media'].get(val, 1.0)
+                if pers_media > 0:
+                    score += (pers_atual / pers_media - 1.0) * self.predictor_weights.get(param, 0.2)
+                    count += 1
+        return score / max(1, count)
+
+    # Camada 3: Ciclo com Z‑score
+    def score_ciclo(self, game_features):
+        """
+        Usa Z‑score do atraso em relação ao intervalo médio.
+        Pondera pelo peso real do parâmetro.
+        """
+        score = 0.0
+        count = 0
+        # Parâmetros estruturais
+        for param in STRUCTURAL_PARAMS:
+            if param in game_features and param in self.stats:
+                val = game_features[param]
+                z = self.stats[param]['z_score_atraso'].get(val, 0.0)
+                score += z * self.predictor_weights.get(param, 0.2)
+                count += 1
+        # Linhas
+        for linha_num in range(1, 6):
+            key = f'linha_{linha_num}'
+            if key in game_features and 'linhas' in self.stats and linha_num in self.stats['linhas']:
+                val = game_features[key]
+                z = self.stats['linhas'][linha_num]['z_score_atraso'].get(val, 0.0)
+                score += z * 0.15  # peso fixo para linhas
+                count += 1
+        # Blocos
+        for bloco_nome in BLOCOS:
+            if bloco_nome in game_features and 'blocos' in self.stats and bloco_nome in self.stats['blocos']:
+                val = game_features[bloco_nome]
+                z = self.stats['blocos'][bloco_nome]['z_score_atraso'].get(val, 0.0)
+                score += z * 0.15  # peso fixo para blocos
+                count += 1
+        return score / max(1, count)
+
+    # Camada 4: Correlação condicional (igual ao v72)
+    def score_correlacao(self, game_features):
+        score = 0.0
+        pairs = [('moldura', 'pares'), ('primos', 'pares'), ('repeticoes', 'moldura')]
+        for p1, p2 in pairs:
+            if p1 in game_features and p2 in game_features:
+                v1, v2 = game_features[p1], game_features[p2]
+                recent = self.contests[-200:] if len(self.contests) >= 200 else self.contests
+                joint_count = 0
+                total_with_v1 = 0
+                for i, c in enumerate(recent):
+                    idx = len(self.contests) - len(recent) + i
+                    prev = self.contests[idx-1]['dezenas'] if idx > 0 else None
+                    f1 = extract_filter(c['dezenas'], p1, prev)
+                    f2 = extract_filter(c['dezenas'], p2, prev)
+                    if f1 == v1:
+                        total_with_v1 += 1
+                        if f2 == v2:
+                            joint_count += 1
+                if total_with_v1 > 0:
+                    prob = joint_count / total_with_v1
+                    if prob < 0.2:
+                        score += (0.2 - prob) * 5.0
+        return score
+
+    # Camada 5: Matriz de transição (igual ao v72)
+    def score_transicao(self, game_features):
+        score = 0.0
+        for param in STRUCTURAL_PARAMS:
+            if param in game_features and param in self.stats:
+                s = self.stats[param]['series']
+                if len(s) >= 2:
+                    prev_val = s[-1]
+                    curr_val = game_features[param]
+                    trans_count = 0
+                    total_prev = 0
+                    for i in range(1, len(s)):
+                        if s[i-1] == prev_val:
+                            total_prev += 1
+                            if s[i] == curr_val:
+                                trans_count += 1
+                    if total_prev > 0:
+                        prob = trans_count / total_prev
+                        if prob < 0.15:
+                            score += (0.15 - prob) * 5.0
+        return score
+
+    # Score global (7 camadas)
+    def compute_global_score(self, game_features, centers):
+        s_centro = self.score_centro(game_features, centers)
+        s_persist = self.score_persistencia(game_features)
+        s_ciclo = self.score_ciclo(game_features)
+        s_correl = self.score_correlacao(game_features)
+        s_trans = self.score_transicao(game_features)
+        # Pesos: centro 25%, persistência 20%, ciclo 25%, correlação 10%, transição 10%, linhas+blocos já estão no ciclo
+        return (0.25 * s_centro + 0.20 * s_persist + 0.25 * s_ciclo +
+                0.10 * s_correl + 0.10 * s_trans)
+
+    def display_current_pressure(self):
+        """Exibe a pressão atual de todos os parâmetros, linhas e blocos."""
+        print(f"\n📊 PRESSÃO ATUAL (Z‑SCORE DO ATRASO):")
+        print(f"\n   Parâmetros estruturais:")
+        for param in STRUCTURAL_PARAMS:
+            s = self.stats[param]['series']
+            curr_val = s[-1]
+            z = self.stats[param]['z_score_atraso'].get(curr_val, 0.0)
+            atraso = self.stats[param]['atraso_atual'].get(curr_val, 0)
+            intervalo = self.stats[param]['intervalo_medio'].get(curr_val, 1)
+            print(f"   {param:<12}: valor={curr_val}, atraso={atraso}, intervalo médio={intervalo:.1f}, z={z:+.2f}")
+        print(f"\n   Linhas:")
+        for linha_num in range(1, 6):
+            s = self.stats['linhas'][linha_num]['series']
+            curr_val = s[-1]
+            z = self.stats['linhas'][linha_num]['z_score_atraso'].get(curr_val, 0.0)
+            atraso = self.stats['linhas'][linha_num]['atraso_atual'].get(curr_val, 0)
+            print(f"   Linha {linha_num} ({LINHAS[linha_num]}): valor={curr_val}, atraso={atraso}, z={z:+.2f}")
+        print(f"\n   Blocos:")
+        for bloco_nome in BLOCOS:
+            s = self.stats['blocos'][bloco_nome]['series']
+            curr_val = s[-1]
+            z = self.stats['blocos'][bloco_nome]['z_score_atraso'].get(curr_val, 0.0)
+            atraso = self.stats['blocos'][bloco_nome]['atraso_atual'].get(curr_val, 0)
+            print(f"   {bloco_nome}: valor={curr_val}, atraso={atraso}, z={z:+.2f}")
+
+# ============================================================
+# OTIMIZADOR DE CARTEIRA v73
+# ============================================================
+class PortfolioOptimizerV73:
     def __init__(self, contests, fixed=None, semifixed=None, min_semifixed=0, max_semifixed=None,
                  use_pressure_model=False):
         self.contests = contests
@@ -415,28 +493,28 @@ class PortfolioOptimizerV72:
         self.semifixed = semifixed if semifixed else []
         self.min_semifixed = min_semifixed
         self.max_semifixed = max_semifixed
-        self.predictor = StructuralPredictorV72(contests)
+        self.predictor = StructuralPredictorV73(contests)
         self.use_pressure_model = use_pressure_model
         if use_pressure_model:
-            self.pressure = PressaoEstruturalTemporal(contests)
+            self.pressure = PressaoEstruturalTemporalV73(contests, self.predictor.weights)
         else:
             self.pressure = None
 
     def _compute_game_features(self, game, prev_dezenas):
-        return {
-            'pares': extract_filter(game, 'pares'),
-            'moldura': extract_filter(game, 'moldura'),
-            'primos': extract_filter(game, 'primos'),
-            'amplitude': extract_filter(game, 'amplitude'),
-            'repeticoes': extract_filter(game, 'repeticoes', prev_dezenas)
-        }
+        features = {}
+        for param in STRUCTURAL_PARAMS:
+            features[param] = extract_filter(game, param, prev_dezenas)
+        for linha_num in range(1, 6):
+            features[f'linha_{linha_num}'] = count_in_line(game, linha_num)
+        for bloco_nome in BLOCOS:
+            features[bloco_nome] = count_in_block(game, BLOCOS[bloco_nome])
+        return features
 
     def _score_game(self, game, centers, prev_dezenas):
         features = self._compute_game_features(game, prev_dezenas)
         if self.use_pressure_model and self.pressure is not None:
-            return self.pressure.compute_global_score(features, centers, self.predictor.weights)
+            return self.pressure.compute_global_score(features, centers)
         else:
-            # Score plano (v71): apenas distância ao centro
             score = 0.0
             for filtro, center in centers.items():
                 if filtro in features and filtro in self.predictor.weights:
@@ -512,10 +590,10 @@ class PortfolioOptimizerV72:
                 'hit_distribution': hit_counts}
 
 # ============================================================
-# WALK‑FORWARD COMPARATIVO: PLANO vs PRESSÃO
+# WALK‑FORWARD COMPARATIVO: PLANO vs PRESSÃO ESTENDIDO
 # ============================================================
 def walk_forward_compare(contests, train_size=500, step=50):
-    print(f"\n🔬 WALK‑FORWARD: MODELO PLANO vs MODELO DE PRESSÃO")
+    print(f"\n🔬 WALK‑FORWARD: MODELO PLANO vs MODELO DE PRESSÃO (v73)")
     print(f"   Treino: {train_size} | Teste: {step}\n")
     results = {'plano': [], 'pressao': []}
     start = train_size
@@ -524,7 +602,7 @@ def walk_forward_compare(contests, train_size=500, step=50):
         test_data = contests[start:start+step]
         for modelo, use_press in [('plano', False), ('pressao', True)]:
             try:
-                opt = PortfolioOptimizerV72(train_data, use_pressure_model=use_press)
+                opt = PortfolioOptimizerV73(train_data, use_pressure_model=use_press)
                 portfolio = opt.optimize(5, 20000, 2, 2, 1)
                 bt = opt.backtest(portfolio, test_data)
                 results[modelo].append({
@@ -539,14 +617,13 @@ def walk_forward_compare(contests, train_size=500, step=50):
         l_press = results['pressao'][-1]['lift'] if results['pressao'] else 0
         print(f"   Janela {start}: plano(lift={l_plano:.3f}) | pressão(lift={l_press:.3f})")
         start += step
-    # Consolidação
     print(f"\n📊 RESULTADO FINAL:")
     for modelo in ['plano', 'pressao']:
         avg_lift = np.mean([r['lift'] for r in results[modelo]]) if results[modelo] else 0
         avg_roi = np.mean([r['roi'] for r in results[modelo]]) if results[modelo] else 0
         total_13 = sum(r['13pts'] for r in results[modelo])
         total_14 = sum(r['14pts'] for r in results[modelo])
-        nome = "Modelo plano (v71)" if modelo == 'plano' else "Modelo de pressão (v72)"
+        nome = "Modelo plano (v71)" if modelo == 'plano' else "Modelo de pressão (v73)"
         print(f"   {nome}:")
         print(f"      Média lift: {avg_lift:.3f} | Média ROI: {avg_roi:.1f}%")
         print(f"      Total 13pts: {total_13} | 14pts: {total_14}")
@@ -557,8 +634,8 @@ def walk_forward_compare(contests, train_size=500, step=50):
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v72")
-    print("   MODELO DE PRESSÃO ESTRUTURAL TEMPORAL")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v73")
+    print("   MODELO DE PRESSÃO ESTRUTURAL TEMPORAL ESTENDIDO")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
@@ -569,9 +646,9 @@ def main():
 
     while True:
         print("\nOpções:")
-        print("1. Walk‑forward comparativo: modelo plano vs modelo de pressão")
-        print("2. Gerar carteira com modelo de pressão")
-        print("3. Exibir pressão atual dos parâmetros estruturais")
+        print("1. Walk‑forward comparativo: modelo plano vs modelo de pressão estendido")
+        print("2. Gerar carteira com modelo de pressão estendido")
+        print("3. Exibir pressão atual de todos os parâmetros (linhas, blocos, estruturais)")
         print("0. Sair")
         op = input("Escolha: ").strip()
 
@@ -591,7 +668,7 @@ def main():
                     max_semi = int(input(f"   Máximo de semifixas [0-{len(semifixed)}]: ").strip() or str(len(semifixed)))
                 except:
                     min_semi, max_semi = 0, len(semifixed)
-            opt = PortfolioOptimizerV72(contests, fixed=fixed, semifixed=semifixed,
+            opt = PortfolioOptimizerV73(contests, fixed=fixed, semifixed=semifixed,
                                         min_semifixed=min_semi, max_semifixed=max_semi,
                                         use_pressure_model=True)
             portfolio = opt.optimize(5, 50000, 2, 2, 1)
@@ -604,19 +681,9 @@ def main():
                 print(f"\n🔬 BACKTEST (200): Lift={bt['lift']:.2f}x | ROI={bt['roi']:+.1f}%")
 
         elif op == '3':
-            pressure = PressaoEstruturalTemporal(contests)
-            print(f"\n📊 PRESSÃO ATUAL DOS PARÂMETROS ESTRUTURAIS:")
-            for param in STRUCTURAL_PARAMS:
-                s = pressure.series[param]
-                curr_val = s[-1]
-                atraso = pressure.atraso_atual[param].get(curr_val, 0)
-                intervalo = pressure.intervalo_medio[param].get(curr_val, 1)
-                pers_atual = pressure.persistencia_atual[param].get(curr_val, 1)
-                pers_media = pressure.persistencia_media[param].get(curr_val, 1.0)
-                ciclo_score = atraso / intervalo if intervalo > 0 else 0
-                persist_score = pers_atual / pers_media if pers_media > 0 else 1.0
-                print(f"   {param:<12}: valor atual={curr_val}, atraso={atraso}, "
-                      f"ciclo={ciclo_score:.2f}, persistência={persist_score:.2f}")
+            predictor = StructuralPredictorV73(contests)
+            pressure = PressaoEstruturalTemporalV73(contests, predictor.weights)
+            pressure.display_current_pressure()
 
         elif op == '0':
             break
