@@ -2,19 +2,20 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v77
-MODELO PONDERADO + REMOÇÃO DE REPETICOES
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v78
+DIAGNÓSTICO DE PARES: QUAIS VALORES GERAM MAIS 13+?
 
-EVOLUÇÃO vs v76:
-✅ Remove 'repeticoes' (impacto negativo na ablação)
-✅ Pesos das features baseados no impacto real da ablação
-✅ Comparação walk‑forward: modelo uniforme (v76) vs modelo ponderado (v77)
-✅ Mantém features: pares, linha_4, linha_3, moldura, coluna_2
+OBJETIVO:
+✅ Rodar walk‑forward com o modelo ponderado (v77)
+✅ Registrar, para cada jogo da carteira, o valor de pares e quantos 13+/14+ gerou
+✅ Agregar por valor de pares: frequência, acertos de 13+, acertos de 14+
+✅ Calcular "taxa de sucesso" de cada valor
+✅ Sugerir calibragem alternativa para o peso de pares
 """
 
 import numpy as np
 from scipy.stats import hypergeom
-from collections import Counter
+from collections import Counter, defaultdict
 from itertools import combinations
 import os, random, time, warnings
 from tqdm import tqdm
@@ -29,12 +30,8 @@ HYPE_PROBS = {k: hypergeom.pmf(k, 25, 15, 15) for k in range(0, 16)}
 PREMIO_VALORES = {11: 6.0, 12: 12.0, 13: 30.0, 14: 1500.0, 15: 1800000.0}
 CUSTO_APOSTA = 3.5
 
-# Features ativas (sem repeticoes)
 ACTIVE_FEATURES = ['pares', 'linha_4', 'linha_3', 'coluna_2', 'moldura']
 
-# Pesos baseados no impacto da ablação (v76)
-# Impactos: pares=0.0131, linha_4=0.0069, linha_3=0.0051, coluna_2=0.0045, moldura=0.0044
-# Normalizados para soma = 1
 FEATURE_WEIGHTS = {
     'pares': 0.38,
     'linha_4': 0.20,
@@ -43,10 +40,6 @@ FEATURE_WEIGHTS = {
     'moldura': 0.13
 }
 
-# Pesos uniformes para comparação
-UNIFORM_WEIGHTS = {f: 0.20 for f in ACTIVE_FEATURES}
-
-# Geometrias
 LINHAS = {
     3: [11, 12, 13, 14, 15],
     4: [16, 17, 18, 19, 20]
@@ -144,7 +137,6 @@ def count_in_set(dezenas, elementos):
     return len(set(dezenas) & set(elementos))
 
 def extract_feature(game, prev_dezenas, feature_name):
-    """Extrai o valor de uma feature específica para um jogo."""
     d = sorted(game)
     if feature_name == 'pares':
         return sum(1 for x in d if x % 2 == 0)
@@ -159,7 +151,6 @@ def extract_feature(game, prev_dezenas, feature_name):
     return 0
 
 def compute_z_scores(train_contests, feature_name):
-    """Calcula z‑score de atraso para cada valor possível da feature."""
     series = []
     for i, c in enumerate(train_contests):
         prev = train_contests[i-1]['dezenas'] if i > 0 else None
@@ -182,7 +173,7 @@ def compute_z_scores(train_contests, feature_name):
     return z_scores
 
 # ============================================================
-# OTIMIZADOR DE CARTEIRA v77 (COM PESOS CONFIGURÁVEIS)
+# OTIMIZADOR DE CARTEIRA (MODELO PONDERADO, IGUAL v77)
 # ============================================================
 class PortfolioOptimizerV77:
     def __init__(self, contests, feature_weights=None):
@@ -192,10 +183,6 @@ class PortfolioOptimizerV77:
         self.active_features = list(self.feature_weights.keys())
 
     def _score_game(self, game, prev_dezenas, feature_z_scores):
-        """
-        Score = soma ponderada dos z‑scores das features ativas.
-        Subtrai para bonificar valores atrasados (z positivo).
-        """
         score = 0.0
         for feat_name in self.active_features:
             val = extract_feature(game, prev_dezenas, feat_name)
@@ -243,19 +230,26 @@ class PortfolioOptimizerV77:
 
     def backtest(self, portfolio, test_draws):
         if len(portfolio) == 0:
-            return {'lift': 0, 'roi': 0, 'hit_distribution': {k:0 for k in range(11,16)}}
+            return {'lift': 0, 'roi': 0, 'hit_distribution': {k:0 for k in range(11,16)}, 'details': []}
         n_success = total_premio = 0
         total_custo = len(portfolio) * len(test_draws) * CUSTO_APOSTA
         portfolio_masks = np.array([BITMASK_CACHE.get_mask(g) for g in portfolio], dtype=np.uint32)
         hit_counts = {k:0 for k in range(11,16)}
+        details = []  # (concurso, hits, pares_do_jogo)
         for draw in test_draws:
             dm = BITMASK_CACHE.get_mask(draw['dezenas'])
-            for pm in portfolio_masks:
+            for i, pm in enumerate(portfolio_masks):
                 hits = mask_intersection(pm, dm)
                 if hits >= 11:
                     n_success += 1
                     total_premio += PREMIO_VALORES.get(hits, 0)
                     hit_counts[hits] += 1
+                    details.append({
+                        'concurso': draw['concurso'],
+                        'hits': hits,
+                        'pares': extract_feature(portfolio[i], None, 'pares'),
+                        'jogo': portfolio[i]
+                    })
         prob = n_success/(len(portfolio)*len(test_draws)) if test_draws else 0
         p_single = sum(HYPE_PROBS[k] for k in range(11,16))
         theo_prob = 1 - (1-p_single)**len(portfolio)
@@ -264,60 +258,101 @@ class PortfolioOptimizerV77:
                 'n_test': len(test_draws), 'n_success': n_success,
                 'total_premio': total_premio, 'total_custo': total_custo,
                 'roi': (total_premio-total_custo)/total_custo*100 if total_custo>0 else 0,
-                'hit_distribution': hit_counts}
+                'hit_distribution': hit_counts, 'details': details}
 
 # ============================================================
-# COMPARAÇÃO WALK‑FORWARD: UNIFORME vs PONDERADO
+# DIAGNÓSTICO DE PARES
 # ============================================================
-def compare_uniform_vs_weighted(contests, train_size=500, test_size=50, step=50):
-    print(f"\n🔬 COMPARAÇÃO: MODELO UNIFORME (v76) vs MODELO PONDERADO (v77)")
-    print(f"   Features: {ACTIVE_FEATURES}")
-    print(f"   Pesos uniformes: {UNIFORM_WEIGHTS}")
-    print(f"   Pesos ponderados: {FEATURE_WEIGHTS}")
+def diagnostic_pares(contests, train_size=500, test_size=50, step=50):
+    """
+    Walk‑forward com o modelo ponderado (v77).
+    Para cada acerto de 11+, registra o valor de pares do jogo.
+    Agrega por valor de pares e calcula taxa de sucesso.
+    """
+    print(f"\n🔬 DIAGNÓSTICO DE PARES: QUAIS VALORES GERAM MAIS 13+?")
     print(f"   Treino: {train_size} | Teste: {test_size} | Passo: {step}\n")
 
-    results = {'uniforme': [], 'ponderado': []}
+    # Acumuladores por valor de pares (0 a 12)
+    pares_stats = {p: {'total_jogos': 0, 'acertos_11': 0, 'acertos_12': 0, 'acertos_13': 0, 'acertos_14': 0, 'acertos_15': 0} for p in range(0, 13)}
+    total_jogos_gerados = 0
+
     start = train_size
     while start + test_size <= len(contests):
         train_data = contests[start-train_size:start]
         test_data = contests[start:start+test_size]
-        for modelo, pesos in [('uniforme', UNIFORM_WEIGHTS), ('ponderado', FEATURE_WEIGHTS)]:
-            try:
-                opt = PortfolioOptimizerV77(train_data, feature_weights=pesos)
-                portfolio = opt.optimize(5, 15000, 2, 2, 1)
-                bt = opt.backtest(portfolio, test_data)
-                results[modelo].append({
-                    'lift': bt['lift'],
-                    'roi': bt['roi'],
-                    '13pts': bt['hit_distribution'].get(13, 0),
-                    '14pts': bt['hit_distribution'].get(14, 0),
-                })
-            except Exception as e:
-                results[modelo].append({'lift': 0, 'roi': 0, '13pts': 0, '14pts': 0})
-        l_unif = results['uniforme'][-1]['lift'] if results['uniforme'] else 0
-        l_pond = results['ponderado'][-1]['lift'] if results['ponderado'] else 0
-        print(f"   Janela {start}: uniforme(lift={l_unif:.3f}) | ponderado(lift={l_pond:.3f})")
+        try:
+            opt = PortfolioOptimizerV77(train_data, feature_weights=FEATURE_WEIGHTS)
+            portfolio = opt.optimize(5, 15000, 2, 2, 1)
+            bt = opt.backtest(portfolio, test_data)
+            # Registrar pares de cada jogo da carteira
+            for g in portfolio:
+                p = extract_feature(g, None, 'pares')
+                pares_stats[p]['total_jogos'] += len(test_data)
+                total_jogos_gerados += len(test_data)
+            # Registrar acertos detalhados
+            for det in bt['details']:
+                p = det['pares']
+                hits = det['hits']
+                if hits == 11:
+                    pares_stats[p]['acertos_11'] += 1
+                elif hits == 12:
+                    pares_stats[p]['acertos_12'] += 1
+                elif hits == 13:
+                    pares_stats[p]['acertos_13'] += 1
+                elif hits == 14:
+                    pares_stats[p]['acertos_14'] += 1
+                elif hits == 15:
+                    pares_stats[p]['acertos_15'] += 1
+        except Exception as e:
+            pass
         start += step
 
-    print(f"\n📊 RESULTADO FINAL:")
-    for modelo in ['uniforme', 'ponderado']:
-        avg_lift = np.mean([r['lift'] for r in results[modelo]]) if results[modelo] else 0
-        avg_roi = np.mean([r['roi'] for r in results[modelo]]) if results[modelo] else 0
-        total_13 = sum(r['13pts'] for r in results[modelo])
-        total_14 = sum(r['14pts'] for r in results[modelo])
-        nome = "Modelo uniforme (v76)" if modelo == 'uniforme' else "Modelo ponderado (v77)"
-        print(f"   {nome}:")
-        print(f"      Média lift: {avg_lift:.4f} | Média ROI: {avg_roi:.1f}%")
-        print(f"      Total 13pts: {total_13} | 14pts: {total_14}")
-    return results
+    # Exibir tabela
+    print(f"📊 TAXA DE SUCESSO POR VALOR DE PARES:")
+    print(f"{'Pares':<8} {'Jogos':<10} {'11pts':<8} {'12pts':<8} {'13pts':<8} {'14pts':<8} {'Taxa 13+':<12} {'Taxa 14+':<12}")
+    print("-" * 85)
+    for p in range(0, 13):
+        stats = pares_stats[p]
+        total = stats['total_jogos']
+        if total > 0:
+            taxa_13 = (stats['acertos_13'] + stats['acertos_14'] + stats['acertos_15']) / total * 100
+            taxa_14 = (stats['acertos_14'] + stats['acertos_15']) / total * 100
+            print(f"{p:<8} {total:<10} {stats['acertos_11']:<8} {stats['acertos_12']:<8} {stats['acertos_13']:<8} {stats['acertos_14']:<8} {taxa_13:<12.4f}% {taxa_14:<12.4f}%")
+        else:
+            print(f"{p:<8} {0:<10} -")
+
+    # Resumo
+    total_13_plus = sum(stats['acertos_13'] + stats['acertos_14'] + stats['acertos_15'] for stats in pares_stats.values())
+    print(f"\n📊 RESUMO:")
+    print(f"   Total de 13+ pontos gerados: {total_13_plus}")
+    # Valor de pares mais eficiente
+    best_pares = max(range(0, 13), key=lambda p: (pares_stats[p]['acertos_13'] + pares_stats[p]['acertos_14'] + pares_stats[p]['acertos_15']) / max(1, pares_stats[p]['total_jogos']))
+    print(f"   Valor de pares com maior taxa de 13+: {best_pares} ({ (pares_stats[best_pares]['acertos_13'] + pares_stats[best_pares]['acertos_14'] + pares_stats[best_pares]['acertos_15']) / max(1, pares_stats[best_pares]['total_jogos']) * 100:.2f}%)")
+    
+    # Distribuição dos valores de pares nos jogos gerados
+    print(f"\n📊 DISTRIBUIÇÃO DOS VALORES DE PARES NOS JOGOS GERADOS:")
+    for p in range(0, 13):
+        stats = pares_stats[p]
+        if stats['total_jogos'] > 0:
+            bar = "█" * int(stats['total_jogos'] / max(1, total_jogos_gerados) * 50)
+            print(f"   {p}: {stats['total_jogos']:6d} {bar}")
+
+    # Sugestão de calibragem
+    print(f"\n💡 SUGESTÃO DE CALIBRAGEM:")
+    print(f"   O modelo atual força jogos com z‑score de pares mais negativo (favorecendo atrasados).")
+    print(f"   Se os valores de pares com maior taxa de 13+ não estão sendo gerados,")
+    print(f"   considere ajustar o peso de pares ou adicionar um termo de recompensa")
+    print(f"   para valores específicos de pares com alta taxa de sucesso.")
+
+    return pares_stats
 
 # ============================================================
 # INTERFACE PRINCIPAL
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v77")
-    print("   MODELO PONDERADO + REMOÇÃO DE REPETICOES")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v78")
+    print("   DIAGNÓSTICO DE PARES: QUAIS VALORES GERAM MAIS 13+?")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
@@ -326,46 +361,7 @@ def main():
     print(f"\n📂 {len(contests)} concursos")
     print(f"📌 Último: {contests[-1]['concurso']} - {contests[-1]['dezenas']}")
 
-    while True:
-        print("\nOpções:")
-        print("1. Walk‑forward comparativo: uniforme vs ponderado")
-        print("2. Gerar carteira com modelo ponderado (v77)")
-        print("3. Gerar carteira com modelo uniforme (v76)")
-        print("0. Sair")
-        op = input("Escolha: ").strip()
-
-        if op == '1':
-            compare_uniform_vs_weighted(contests)
-
-        elif op in ('2', '3'):
-            pesos = FEATURE_WEIGHTS if op == '2' else UNIFORM_WEIGHTS
-            nome = "ponderado (v77)" if op == '2' else "uniforme (v76)"
-            print(f"\n📝 CONFIGURAÇÃO DA CARTEIRA ({nome})")
-            fixed_str = input("   Dezenas fixas (ex: 15 16 20 ou ENTER): ").strip()
-            fixed = [int(x) for x in fixed_str.split()] if fixed_str else []
-            semifixed_str = input("   Dezenas semifixas (ex: 03 07 14 25 ou ENTER): ").strip()
-            semifixed = [int(x) for x in semifixed_str.split()] if semifixed_str else []
-            min_semi, max_semi = 0, None
-            if semifixed:
-                try:
-                    min_semi = int(input(f"   Mínimo de semifixas [0-{len(semifixed)}]: ").strip() or "0")
-                    max_semi = int(input(f"   Máximo de semifixas [0-{len(semifixed)}]: ").strip() or str(len(semifixed)))
-                except:
-                    min_semi, max_semi = 0, len(semifixed)
-            opt = PortfolioOptimizerV77(contests, feature_weights=pesos)
-            portfolio = opt.optimize(5, 20000, 2, 2, 1)
-            for i, g in enumerate(portfolio, 1):
-                p = sum(1 for x in g if x%2==0); pr = sum(1 for x in g if x in {2,3,5,7,11,13,17,19,23}); m = sum(1 for x in g if x in MOLDURA)
-                rep = len(set(g) & set(contests[-1]['dezenas'])) if contests else 0
-                print(f" {i}. {g} | P:{p} Pr:{pr} M:{m} Rep:{rep}")
-            if len(contests) > 200:
-                bt = opt.backtest(portfolio, contests[-200:])
-                print(f"\n🔬 BACKTEST (200): Lift={bt['lift']:.2f}x | ROI={bt['roi']:+.1f}%")
-
-        elif op == '0':
-            break
-        else:
-            print("Opção inválida.")
+    diagnostic_pares(contests)
 
 if __name__ == "__main__":
     main()
