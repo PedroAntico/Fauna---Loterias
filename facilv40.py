@@ -2,23 +2,22 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v71
-PORTFÓLIO MULTI‑REGIME: CENTRO + INTERMEDIÁRIO + PERIFERIA
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v72
+MODELO DE PRESSÃO ESTRUTURAL TEMPORAL (5 CAMADAS)
 
-MELHORIA CENTRAL:
-✅ Em vez de escolher apenas os jogos mais centrais,
-   a carteira mescla:
-   - 2 jogos da região central (score baixo)
-   - 2 jogos da região intermediária
-   - 1 jogo da periferia (score alto, potencial explosivo)
-✅ Mantém clusterização e diversidade forçada
-✅ Walk‑forward comparativo contra a estratégia anterior (v70.1)
-✅ Estrutura pura (A) e estrutura + reversão (B)
+CAMADAS DO SCORE:
+✅ Centro estrutural (distância ao centro previsto)
+✅ Persistência (duração da sequência atual vs. média histórica)
+✅ Ciclo (atraso atual vs. intervalo médio de ocorrência)
+✅ Correlação condicional (distribuição de pares dado moldura, etc.)
+✅ Matriz de transição (Markov: probabilidade do próximo estado dado o atual)
+✅ Score global = combinação ponderada das 5 camadas
+✅ Walk‑forward comparativo: modelo plano (v71) vs. modelo de pressão (v72)
 """
 
 import numpy as np
 from scipy.stats import hypergeom
-from collections import Counter
+from collections import Counter, defaultdict
 from itertools import combinations
 import os, random, time, warnings, json
 from math import comb
@@ -34,6 +33,9 @@ MOLDURA = {1,2,3,4,5, 6,10, 11,15, 16,20, 21,22,23,24,25}
 HYPE_PROBS = {k: hypergeom.pmf(k, 25, 15, 15) for k in range(0, 16)}
 PREMIO_VALORES = {11: 6.0, 12: 12.0, 13: 30.0, 14: 1500.0, 15: 1800000.0}
 CUSTO_APOSTA = 3.5
+
+# Parâmetros estruturais monitorados
+STRUCTURAL_PARAMS = ['pares', 'moldura', 'primos', 'repeticoes', 'amplitude']
 
 # ============================================================
 # BITMASK
@@ -132,12 +134,206 @@ def extract_filter(dezenas, filter_name, prev_dezenas=None):
     return 0
 
 # ============================================================
-# STRUCTURAL PREDICTOR
+# MODELO DE PRESSÃO ESTRUTURAL TEMPORAL (5 CAMADAS)
 # ============================================================
-class StructuralPredictorV71:
-    def __init__(self, contests, cache_file='v71_weights_cache.json'):
+class PressaoEstruturalTemporal:
+    def __init__(self, contests):
         self.contests = contests
-        self.active_filters = ['pares', 'moldura', 'primos', 'amplitude', 'repeticoes']
+        self._build_historical_stats()
+
+    def _extract_param_series(self, param_name):
+        """Extrai a série temporal de um parâmetro estrutural."""
+        series = []
+        for i, c in enumerate(self.contests):
+            prev = self.contests[i-1]['dezenas'] if i > 0 else None
+            series.append(extract_filter(c['dezenas'], param_name, prev))
+        return np.array(series, dtype=int)
+
+    def _build_historical_stats(self):
+        """Pré‑computa estatísticas históricas para todos os parâmetros."""
+        self.series = {}
+        self.freq = {}
+        self.intervalo_medio = {}
+        self.desvio_intervalo = {}
+        self.atraso_atual = {}
+        self.persistencia_atual = {}
+        self.persistencia_media = {}
+        for param in STRUCTURAL_PARAMS:
+            s = self._extract_param_series(param)
+            self.series[param] = s
+            # Frequência de cada valor
+            self.freq[param] = Counter(s)
+            # Intervalo entre ocorrências de cada valor
+            self.intervalo_medio[param] = {}
+            self.desvio_intervalo[param] = {}
+            self.atraso_atual[param] = {}
+            for val in set(s):
+                ocorrencias = np.where(s == val)[0]
+                if len(ocorrencias) > 1:
+                    intervalos = np.diff(ocorrencias)
+                    self.intervalo_medio[param][val] = np.mean(intervalos)
+                    self.desvio_intervalo[param][val] = np.std(intervalos)
+                else:
+                    self.intervalo_medio[param][val] = len(s)
+                    self.desvio_intervalo[param][val] = len(s)
+                # Atraso atual
+                if len(ocorrencias) > 0:
+                    self.atraso_atual[param][val] = len(s) - 1 - ocorrencias[-1]
+                else:
+                    self.atraso_atual[param][val] = len(s)
+            # Persistência (sequências)
+            self.persistencia_atual[param] = {}
+            self.persistencia_media[param] = {}
+            runs = []
+            current_val = s[0]
+            current_len = 1
+            for i in range(1, len(s)):
+                if s[i] == current_val:
+                    current_len += 1
+                else:
+                    runs.append((current_val, current_len))
+                    current_val = s[i]
+                    current_len = 1
+            runs.append((current_val, current_len))
+            # Persistência atual = duração da sequência mais recente
+            last_val, last_len = runs[-1]
+            self.persistencia_atual[param][last_val] = last_len
+            # Persistência média por valor
+            for val in set(s):
+                lengths = [l for v, l in runs if v == val]
+                if lengths:
+                    self.persistencia_media[param][val] = np.mean(lengths)
+                else:
+                    self.persistencia_media[param][val] = 1.0
+
+    # Camada 1: Centro estrutural
+    def score_centro(self, game_features, centers, weights):
+        """Distância ponderada aos centros previstos."""
+        score = 0.0
+        for param in STRUCTURAL_PARAMS:
+            if param in game_features and param in centers:
+                if param == 'amplitude':
+                    dist = abs(game_features[param] - centers[param]) / 14.0
+                else:
+                    dist = abs(game_features[param] - centers[param])
+                score += weights.get(param, 0.2) * dist
+        return score
+
+    # Camada 2: Persistência
+    def score_persistencia(self, game_features):
+        """
+        Mede se a duração atual de um valor está acima da média histórica.
+        Persistência alta → o sistema pode "cansar" e reverter.
+        Score positivo = persistência acima da média (pressionado para cair).
+        """
+        score = 0.0
+        for param in STRUCTURAL_PARAMS:
+            if param in game_features:
+                val = game_features[param]
+                pers_atual = self.persistencia_atual[param].get(val, 1)
+                pers_media = self.persistencia_media[param].get(val, 1.0)
+                if pers_media > 0:
+                    score += (pers_atual / pers_media - 1.0)  # >0 se acima da média
+        return score / len(STRUCTURAL_PARAMS)
+
+    # Camada 3: Ciclo
+    def score_ciclo(self, game_features):
+        """
+        Mede o atraso atual em relação ao intervalo médio de ocorrência.
+        Valores muito atrasados recebem pressão positiva (devem voltar).
+        """
+        score = 0.0
+        for param in STRUCTURAL_PARAMS:
+            if param in game_features:
+                val = game_features[param]
+                atraso = self.atraso_atual[param].get(val, 0)
+                intervalo = self.intervalo_medio[param].get(val, len(self.contests))
+                if intervalo > 0:
+                    score += (atraso / intervalo - 1.0)  # >0 se atrasado
+        return score / len(STRUCTURAL_PARAMS)
+
+    # Camada 4: Correlação condicional
+    def score_correlacao(self, game_features):
+        """
+        Exemplo: dado que moldura = 10, qual a distribuição típica de pares?
+        Penaliza combinações atípicas.
+        """
+        score = 0.0
+        # Pares de parâmetros correlacionados
+        pairs = [('moldura', 'pares'), ('primos', 'pares'), ('repeticoes', 'moldura')]
+        for p1, p2 in pairs:
+            if p1 in game_features and p2 in game_features:
+                v1, v2 = game_features[p1], game_features[p2]
+                # Frequência conjunta nos últimos 200 concursos
+                recent = self.contests[-200:] if len(self.contests) >= 200 else self.contests
+                joint_count = 0
+                total_with_v1 = 0
+                for i, c in enumerate(recent):
+                    prev = self.contests[len(self.contests)-len(recent)+i-1]['dezenas'] if i > 0 else None
+                    f1 = extract_filter(c['dezenas'], p1, prev)
+                    f2 = extract_filter(c['dezenas'], p2, prev)
+                    if f1 == v1:
+                        total_with_v1 += 1
+                        if f2 == v2:
+                            joint_count += 1
+                if total_with_v1 > 0:
+                    prob = joint_count / total_with_v1
+                    # Penaliza se a combinação é rara (prob < 0.2)
+                    if prob < 0.2:
+                        score += (0.2 - prob) * 5.0
+        return score
+
+    # Camada 5: Matriz de transição (Markov)
+    def score_transicao(self, game_features):
+        """
+        Dado o último estado de cada parâmetro, qual a probabilidade do estado do jogo?
+        Penaliza transições improváveis.
+        """
+        if len(self.contests) < 2:
+            return 0.0
+        score = 0.0
+        for param in STRUCTURAL_PARAMS:
+            if param in game_features:
+                s = self.series[param]
+                if len(s) >= 2:
+                    prev_val = s[-1]
+                    curr_val = game_features[param]
+                    # Contar transições prev_val → curr_val
+                    trans_count = 0
+                    total_prev = 0
+                    for i in range(1, len(s)):
+                        if s[i-1] == prev_val:
+                            total_prev += 1
+                            if s[i] == curr_val:
+                                trans_count += 1
+                    if total_prev > 0:
+                        prob = trans_count / total_prev
+                        # Penaliza se a transição é improvável (< 0.15)
+                        if prob < 0.15:
+                            score += (0.15 - prob) * 5.0
+        return score
+
+    # Score global
+    def compute_global_score(self, game_features, centers, weights):
+        """
+        Score combinado das 5 camadas.
+        Pesos: centro 30%, persistência 25%, ciclo 25%, correlação 10%, transição 10%
+        """
+        s_centro = self.score_centro(game_features, centers, weights)
+        s_persist = self.score_persistencia(game_features)
+        s_ciclo = self.score_ciclo(game_features)
+        s_correl = self.score_correlacao(game_features)
+        s_trans = self.score_transicao(game_features)
+        return (0.30 * s_centro + 0.25 * s_persist + 0.25 * s_ciclo +
+                0.10 * s_correl + 0.10 * s_trans)
+
+# ============================================================
+# STRUCTURAL PREDICTOR (CENTROS E PESOS)
+# ============================================================
+class StructuralPredictorV72:
+    def __init__(self, contests, cache_file='v72_weights_cache.json'):
+        self.contests = contests
+        self.active_filters = STRUCTURAL_PARAMS
         self.windows = [20, 50, 100, 200]
         self.cache_file = cache_file
         self._load_or_compute_weights()
@@ -156,16 +352,13 @@ class StructuralPredictorV71:
                     data = json.load(f)
                 self.weights = data['weights']
                 self.gains = data['gains']
-                print(f"📂 Pesos carregados do cache ({self.cache_file})")
                 return
             except:
                 pass
-        print("📊 Calculando ganhos reais dos filtros (walk‑forward)...")
         self._compute_real_gains()
         try:
             with open(self.cache_file, 'w') as f:
                 json.dump({'weights': self.weights, 'gains': self.gains}, f)
-            print(f"   Cache salvo em {self.cache_file}")
         except:
             pass
 
@@ -197,9 +390,6 @@ class StructuralPredictorV71:
             self.weights = {f: max(0, gains[f]) / total_gain for f in gains}
         else:
             self.weights = {f: 1.0/len(gains) for f in gains}
-        print("   Pesos calculados:")
-        for f in self.active_filters:
-            print(f"   {f:<12}: ganho={gains[f]:+.2f}% → peso={self.weights[f]:.3f}")
 
     def predict_centers(self):
         centers = {}
@@ -214,99 +404,23 @@ class StructuralPredictorV71:
         return centers
 
 # ============================================================
-# MODELO DE DEZENAS POR REVERSÃO (INCORPORADO)
+# OTIMIZADOR DE CARTEIRA v72 (COM MODELO DE PRESSÃO)
 # ============================================================
-class DezenaModelReversao:
-    def __init__(self, contests):
-        self.contests = contests
-
-    def compute_scores(self, janela_curta=20, janela_longa=100, peso_atraso=0.3):
-        if len(self.contests) == 0:
-            return {d: 0.0 for d in range(1, 26)}
-        total = len(self.contests)
-        recent = self.contests[-janela_curta:] if janela_curta < total else self.contests
-        long_data = self.contests[-janela_longa:] if janela_longa < total else self.contests
-        freq_curta = Counter()
-        for c in recent:
-            freq_curta.update(c['dezenas'])
-        freq_longa = Counter()
-        for c in long_data:
-            freq_longa.update(c['dezenas'])
-        last_seen = {d: -1 for d in range(1, 26)}
-        for i, c in enumerate(self.contests):
-            for d in c['dezenas']:
-                last_seen[d] = i
-        atraso = {d: (total - 1 - last_seen[d]) for d in range(1, 26)}
-        max_atraso = max(atraso.values()) + 1
-        scores = {}
-        n_curta = len(recent)
-        n_longa = max(1, len(long_data))
-        for d in range(1, 26):
-            fc = freq_curta.get(d, 0) / n_curta
-            fl = freq_longa.get(d, 0) / n_longa
-            edge = fc - fl
-            reversao_score = -edge * 2.0
-            atraso_score = peso_atraso * (atraso[d] / max_atraso)
-            scores[d] = reversao_score + atraso_score
-        mean_score = np.mean(list(scores.values()))
-        std_score = np.std(list(scores.values()))
-        if std_score > 0:
-            for d in scores:
-                scores[d] = (scores[d] - mean_score) / std_score
-        else:
-            for d in scores:
-                scores[d] = 0.0
-        return scores
-
-# ============================================================
-# KMEANS MANUAL
-# ============================================================
-class SimpleKMeans:
-    def __init__(self, n_clusters=10, max_iter=50):
-        self.n_clusters = n_clusters
-        self.max_iter = max_iter
-
-    def fit_predict(self, X):
-        n = len(X)
-        if n <= self.n_clusters:
-            return np.arange(n)
-        idx = np.random.choice(n, self.n_clusters, replace=False)
-        centroids = X[idx].copy()
-        labels = np.zeros(n, dtype=int)
-        for _ in range(self.max_iter):
-            for i in range(n):
-                dists = np.sum((centroids - X[i])**2, axis=1)
-                labels[i] = np.argmin(dists)
-            new_centroids = np.zeros_like(centroids)
-            for k in range(self.n_clusters):
-                members = X[labels == k]
-                if len(members) > 0:
-                    new_centroids[k] = np.mean(members, axis=0)
-                else:
-                    new_centroids[k] = centroids[k]
-            if np.allclose(centroids, new_centroids):
-                break
-            centroids = new_centroids
-        return labels
-
-# ============================================================
-# OTIMIZADOR DE CARTEIRA v71 (MULTI‑REGIME)
-# ============================================================
-class PortfolioOptimizerV71:
+class PortfolioOptimizerV72:
     def __init__(self, contests, fixed=None, semifixed=None, min_semifixed=0, max_semifixed=None,
-                 use_reversao=False):
+                 use_pressure_model=False):
         self.contests = contests
         self.generator = LooseGenerator()
         self.fixed = fixed if fixed else []
         self.semifixed = semifixed if semifixed else []
         self.min_semifixed = min_semifixed
         self.max_semifixed = max_semifixed
-        self.predictor = StructuralPredictorV71(contests)
-        self.use_reversao = use_reversao
-        if use_reversao:
-            self.dezena_model = DezenaModelReversao(contests)
+        self.predictor = StructuralPredictorV72(contests)
+        self.use_pressure_model = use_pressure_model
+        if use_pressure_model:
+            self.pressure = PressaoEstruturalTemporal(contests)
         else:
-            self.dezena_model = None
+            self.pressure = None
 
     def _compute_game_features(self, game, prev_dezenas):
         return {
@@ -317,33 +431,25 @@ class PortfolioOptimizerV71:
             'repeticoes': extract_filter(game, 'repeticoes', prev_dezenas)
         }
 
-    def _score_game(self, game, centers, prev_dezenas, dezena_scores=None):
+    def _score_game(self, game, centers, prev_dezenas):
         features = self._compute_game_features(game, prev_dezenas)
-        score_estrutural = 0.0
-        for filtro, center in centers.items():
-            if filtro in features and filtro in self.predictor.weights:
-                if filtro == 'amplitude':
-                    dist = abs(features[filtro] - center) / 14.0
-                else:
-                    dist = abs(features[filtro] - center)
-                score_estrutural += self.predictor.weights[filtro] * dist
-        if dezena_scores is not None:
-            bonus_dezenas = sum(dezena_scores.get(d, 0.0) for d in game)
-            return score_estrutural - 0.3 * bonus_dezenas
+        if self.use_pressure_model and self.pressure is not None:
+            return self.pressure.compute_global_score(features, centers, self.predictor.weights)
         else:
-            return score_estrutural
-
-    def _build_feature_matrix(self, games, prev_dezenas):
-        features = []
-        for g in games:
-            f = self._compute_game_features(g, prev_dezenas)
-            vec = [f['pares'], f['moldura'], f['primos'], f['amplitude']/24, f['repeticoes']]
-            features.append(vec)
-        return np.array(features)
+            # Score plano (v71): apenas distância ao centro
+            score = 0.0
+            for filtro, center in centers.items():
+                if filtro in features and filtro in self.predictor.weights:
+                    if filtro == 'amplitude':
+                        dist = abs(features[filtro] - center) / 14.0
+                    else:
+                        dist = abs(features[filtro] - center)
+                    score += self.predictor.weights.get(filtro, 0.2) * dist
+            return score
 
     def generate_pool(self, n_candidates, prev_dezenas=None):
         pool, seen = [], set()
-        for _ in tqdm(range(n_candidates), desc="Gerando pool"):
+        for _ in tqdm(range(n_candidates), desc="Gerando pool", leave=False):
             try:
                 g = self.generator.generate_one(
                     fixed=self.fixed, semifixed=self.semifixed,
@@ -356,140 +462,33 @@ class PortfolioOptimizerV71:
                 break
         return pool
 
-    def _select_diverse_from_group(self, group, n_select, n_clusters=10, top_per_cluster=2):
-        """Dentro de um grupo (central/intermediário/periferia), aplica clusterização e seleciona os melhores."""
-        if len(group) <= n_select:
-            return group[:n_select]
-        # Ordenar por score (crescente)
-        group.sort(key=lambda x: x[0])
-        top_pool = [g for _, g in group[:min(1500, len(group))]]
-        if len(top_pool) < n_select:
-            return [g for _, g in group[:n_select]]
-        X = self._build_feature_matrix(top_pool, None)
-        kmeans = SimpleKMeans(n_clusters=min(n_clusters, len(top_pool)))
-        labels = kmeans.fit_predict(X)
-        cluster_best = {i: [] for i in range(n_clusters)}
-        for i, (s, g) in enumerate(group[:min(1500, len(group))]):
-            lbl = labels[i]
-            cluster_best[lbl].append((s, g))
-        diverse = []
-        for lbl in cluster_best:
-            cluster_best[lbl].sort(key=lambda x: x[0])
-            diverse.extend([g for _, g in cluster_best[lbl][:top_per_cluster]])
-        return diverse[:n_select]
-
-    def _ensure_diversity(self, candidates, n_select, max_intersection=9, min_dezenas=22):
-        """Garante diversidade na carteira final."""
-        if len(candidates) < n_select:
-            return candidates
-        selected = []
-        masks = []
-        for c in candidates:
-            if len(selected) >= n_select:
-                break
-            mask_c = BITMASK_CACHE.get_mask(c)
-            if masks and any(mask_intersection(mask_c, m) > max_intersection for m in masks):
-                continue
-            selected.append(c)
-            masks.append(mask_c)
-        if len(selected) < n_select:
-            for relax in range(max_intersection+1, 15):
-                for c in candidates:
-                    if c in selected:
-                        continue
-                    if len(selected) >= n_select:
-                        break
-                    mask_c = BITMASK_CACHE.get_mask(c)
-                    if masks and any(mask_intersection(mask_c, m) > relax for m in masks):
-                        continue
-                    selected.append(c)
-                    masks.append(mask_c)
-                if len(selected) >= n_select:
-                    break
-        dezenas_cobertas = set()
-        for g in selected:
-            dezenas_cobertas.update(g)
-        if len(dezenas_cobertas) < min_dezenas:
-            for c in candidates:
-                if c in selected:
-                    continue
-                new_cob = dezenas_cobertas | set(c)
-                if len(new_cob) > len(dezenas_cobertas):
-                    mask_c = BITMASK_CACHE.get_mask(c)
-                    if not any(mask_intersection(mask_c, BITMASK_CACHE.get_mask(s)) > max_intersection for s in selected[:-1]):
-                        selected[-1] = c
-                        dezenas_cobertas = new_cob
-                        if len(dezenas_cobertas) >= min_dezenas:
-                            break
-        return selected[:n_select]
-
-    def optimize_multi_regime(self, n_games=5, n_candidates=50000, 
-                              n_central=2, n_intermed=2, n_perif=1):
-        """
-        Portfólio multi‑regime:
-        - n_central jogos da região de menor score
-        - n_intermed jogos da região intermediária
-        - n_perif jogos da periferia (maior score)
-        """
-        mode = "B (estrutura + reversão)" if self.use_reversao else "A (estrutura pura)"
-        print(f"\n🧩 CARTEIRA MULTI‑REGIME {mode}")
-        print(f"   Composição: {n_central} central(is) + {n_intermed} intermediário(s) + {n_perif} periférico(s)")
-        if self.fixed: print(f"   Fixas: {self.fixed}")
-        if self.semifixed:
-            print(f"   Semifixas: {self.semifixed} (mín={self.min_semifixed}, máx={self.max_semifixed})")
-
+    def optimize(self, n_games=5, n_candidates=50000, n_central=2, n_intermed=2, n_perif=1):
         centers = self.predictor.predict_centers()
-        dezena_scores = self.dezena_model.compute_scores() if self.dezena_model else None
-        print(f"\n📊 CENTROS PREVISTOS:")
-        for f in centers:
-            print(f"   {f:<12}: {centers[f]:<6} (peso={self.predictor.weights[f]:.3f})")
-        if dezena_scores:
-            top5 = sorted(dezena_scores.items(), key=lambda x: x[1], reverse=True)[:5]
-            bottom5 = sorted(dezena_scores.items(), key=lambda x: x[1])[:5]
-            print(f"📊 TOP 5 DEZENAS (reversão): {top5}")
-            print(f"📊 BOTTOM 5 DEZENAS (quentes): {bottom5}")
-
-        t0 = time.time()
         prev_dezenas = self.contests[-1]['dezenas'] if self.contests else None
         pool = self.generate_pool(n_candidates, prev_dezenas)
-        print(f"   Pool gerado: {len(pool)} jogos")
         if len(pool) < n_games:
-            raise RuntimeError(f"Pool insuficiente: {len(pool)} < {n_games}.")
-
-        # Calcular scores e ordenar
-        scored = [(self._score_game(g, centers, prev_dezenas, dezena_scores), g) for g in pool]
-        scored.sort(key=lambda x: x[0])  # menor score = mais central
-
+            return []
+        scored = [(self._score_game(g, centers, prev_dezenas), g) for g in pool]
+        scored.sort(key=lambda x: x[0])
         n_total = len(scored)
-        # Divisão em três partes
-        idx_central = int(n_total * 0.33)
-        idx_intermed = int(n_total * 0.66)
-
-        grupo_central = scored[:idx_central]
-        grupo_intermed = scored[idx_central:idx_intermed]
-        grupo_perif = scored[idx_intermed:]
-
-        print(f"   Grupo central: {len(grupo_central)} jogos (score até {grupo_central[-1][0]:.4f})")
-        print(f"   Grupo intermediário: {len(grupo_intermed)} jogos")
-        print(f"   Grupo periferia: {len(grupo_perif)} jogos (score a partir de {grupo_perif[0][0]:.4f})")
-
-        # Selecionar de cada grupo
-        centrais = self._select_diverse_from_group(grupo_central, n_central)
-        intermed = self._select_diverse_from_group(grupo_intermed, n_intermed)
-        perifs = self._select_diverse_from_group(grupo_perif, n_perif)
-
-        # Combinar e aplicar diversidade
+        idx1 = min(n_central * n_total // n_games, n_total)
+        idx2 = min((n_central + n_intermed) * n_total // n_games, n_total)
+        grupo_central = scored[:idx1]
+        grupo_intermed = scored[idx1:idx2]
+        grupo_perif = scored[idx2:]
+        def select_diverse(group, n_select):
+            if len(group) <= n_select:
+                return [g for _, g in group[:n_select]]
+            return [g for _, g in group[:n_select]]
+        centrais = select_diverse(grupo_central, n_central)
+        intermed = select_diverse(grupo_intermed, n_intermed)
+        perifs = select_diverse(grupo_perif, n_perif)
         combined = centrais + intermed + perifs
-        portfolio = self._ensure_diversity(combined, n_games)
-
-        print(f"✅ Carteira final: {len(portfolio)} jogos em {time.time()-t0:.1f}s")
-        todas = set()
-        for g in portfolio:
-            todas.update(g)
-        print(f"   Dezenas distintas: {len(todas)}")
-        return portfolio
+        return combined[:n_games]
 
     def backtest(self, portfolio, test_draws):
+        if len(portfolio) == 0:
+            return {'lift': 0, 'roi': 0, 'hit_distribution': {k:0 for k in range(11,16)}}
         n_success = total_premio = 0
         total_custo = len(portfolio) * len(test_draws) * CUSTO_APOSTA
         portfolio_masks = np.array([BITMASK_CACHE.get_mask(g) for g in portfolio], dtype=np.uint32)
@@ -513,60 +512,44 @@ class PortfolioOptimizerV71:
                 'hit_distribution': hit_counts}
 
 # ============================================================
-# WALK‑FORWARD COMPARATIVO
+# WALK‑FORWARD COMPARATIVO: PLANO vs PRESSÃO
 # ============================================================
-def walk_forward_multi_regime(contests, n_games=5, train_size=500, step=50):
-    print(f"\n🔬 WALK‑FORWARD MULTI‑REGIME")
-    print(f"   Treino: {train_size} | Teste: {step} | Composição: 2C+2I+1P\n")
-    results = {'A': [], 'B': []}
+def walk_forward_compare(contests, train_size=500, step=50):
+    print(f"\n🔬 WALK‑FORWARD: MODELO PLANO vs MODELO DE PRESSÃO")
+    print(f"   Treino: {train_size} | Teste: {step}\n")
+    results = {'plano': [], 'pressao': []}
     start = train_size
     while start + step <= len(contests):
         train_data = contests[start-train_size:start]
         test_data = contests[start:start+step]
-        for versao, use_rev in [('A', False), ('B', True)]:
+        for modelo, use_press in [('plano', False), ('pressao', True)]:
             try:
-                opt = PortfolioOptimizerV71(train_data, use_reversao=use_rev)
-                portfolio = opt.optimize_multi_regime(n_games, 30000, 
-                                                      n_central=2, n_intermed=2, n_perif=1)
+                opt = PortfolioOptimizerV72(train_data, use_pressure_model=use_press)
+                portfolio = opt.optimize(5, 20000, 2, 2, 1)
                 bt = opt.backtest(portfolio, test_data)
-                results[versao].append({
+                results[modelo].append({
                     'lift': bt['lift'],
                     'roi': bt['roi'],
                     '13pts': bt['hit_distribution'].get(13, 0),
                     '14pts': bt['hit_distribution'].get(14, 0),
-                    '15pts': bt['hit_distribution'].get(15, 0),
                 })
             except Exception as e:
-                results[versao].append({'lift': 0, 'roi': 0, '13pts': 0, '14pts': 0, '15pts': 0})
-        lift_a = results['A'][-1]['lift'] if results['A'] else 0
-        lift_b = results['B'][-1]['lift'] if results['B'] else 0
-        pts13_a = results['A'][-1]['13pts'] if results['A'] else 0
-        pts13_b = results['B'][-1]['13pts'] if results['B'] else 0
-        pts14_a = results['A'][-1]['14pts'] if results['A'] else 0
-        pts14_b = results['B'][-1]['14pts'] if results['B'] else 0
-        print(f"   Janela {start}: A(lift={lift_a:.3f},13={pts13_a},14={pts14_a}) | "
-              f"B(lift={lift_b:.3f},13={pts13_b},14={pts14_b})")
+                results[modelo].append({'lift': 0, 'roi': 0, '13pts': 0, '14pts': 0})
+        l_plano = results['plano'][-1]['lift'] if results['plano'] else 0
+        l_press = results['pressao'][-1]['lift'] if results['pressao'] else 0
+        print(f"   Janela {start}: plano(lift={l_plano:.3f}) | pressão(lift={l_press:.3f})")
         start += step
-    if results['A'] and results['B']:
-        print(f"\n📊 RESULTADO FINAL:")
-        for versao in ['A', 'B']:
-            avg_lift = np.mean([r['lift'] for r in results[versao]])
-            avg_roi = np.mean([r['roi'] for r in results[versao]])
-            total_13 = sum(r['13pts'] for r in results[versao])
-            total_14 = sum(r['14pts'] for r in results[versao])
-            total_15 = sum(r['15pts'] for r in results[versao])
-            nome = "A (estrutura pura)" if versao == 'A' else "B (estrutura + reversão)"
-            print(f"   {nome}:")
-            print(f"      Média lift: {avg_lift:.3f} | Média ROI: {avg_roi:.1f}%")
-            print(f"      Total 13pts: {total_13} | 14pts: {total_14} | 15pts: {total_15}")
-        diff_lift = np.mean([r['lift'] for r in results['A']]) - np.mean([r['lift'] for r in results['B']])
-        diff_13 = sum(r['13pts'] for r in results['A']) - sum(r['13pts'] for r in results['B'])
-        diff_14 = sum(r['14pts'] for r in results['A']) - sum(r['14pts'] for r in results['B'])
-        print(f"\n   Diferença A − B: lift={diff_lift:+.3f}, 13pts={diff_13:+d}, 14pts={diff_14:+d}")
-        if diff_lift > 0:
-            print(f"   ✅ Carteira A numericamente superior.")
-        else:
-            print(f"   📊 Carteira B numericamente superior ou equivalente.")
+    # Consolidação
+    print(f"\n📊 RESULTADO FINAL:")
+    for modelo in ['plano', 'pressao']:
+        avg_lift = np.mean([r['lift'] for r in results[modelo]]) if results[modelo] else 0
+        avg_roi = np.mean([r['roi'] for r in results[modelo]]) if results[modelo] else 0
+        total_13 = sum(r['13pts'] for r in results[modelo])
+        total_14 = sum(r['14pts'] for r in results[modelo])
+        nome = "Modelo plano (v71)" if modelo == 'plano' else "Modelo de pressão (v72)"
+        print(f"   {nome}:")
+        print(f"      Média lift: {avg_lift:.3f} | Média ROI: {avg_roi:.1f}%")
+        print(f"      Total 13pts: {total_13} | 14pts: {total_14}")
     return results
 
 # ============================================================
@@ -574,8 +557,8 @@ def walk_forward_multi_regime(contests, n_games=5, train_size=500, step=50):
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v71")
-    print("   PORTFÓLIO MULTI‑REGIME: CENTRO + INTERMEDIÁRIO + PERIFERIA")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v72")
+    print("   MODELO DE PRESSÃO ESTRUTURAL TEMPORAL")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
@@ -586,18 +569,16 @@ def main():
 
     while True:
         print("\nOpções:")
-        print("1. Walk‑forward multi‑regime (comparar A vs B)")
-        print("2. Gerar carteira multi‑regime (A)")
-        print("3. Gerar carteira multi‑regime (B)")
-        print("4. Backtest nos últimos 200 concursos (A e B)")
+        print("1. Walk‑forward comparativo: modelo plano vs modelo de pressão")
+        print("2. Gerar carteira com modelo de pressão")
+        print("3. Exibir pressão atual dos parâmetros estruturais")
         print("0. Sair")
         op = input("Escolha: ").strip()
 
         if op == '1':
-            walk_forward_multi_regime(contests)
+            walk_forward_compare(contests)
 
-        elif op in ('2', '3'):
-            use_rev = (op == '3')
+        elif op == '2':
             print("\n📝 CONFIGURAÇÃO DA CARTEIRA")
             fixed_str = input("   Dezenas fixas (ex: 15 16 20 ou ENTER): ").strip()
             fixed = [int(x) for x in fixed_str.split()] if fixed_str else []
@@ -610,10 +591,10 @@ def main():
                     max_semi = int(input(f"   Máximo de semifixas [0-{len(semifixed)}]: ").strip() or str(len(semifixed)))
                 except:
                     min_semi, max_semi = 0, len(semifixed)
-            opt = PortfolioOptimizerV71(contests, fixed=fixed, semifixed=semifixed,
+            opt = PortfolioOptimizerV72(contests, fixed=fixed, semifixed=semifixed,
                                         min_semifixed=min_semi, max_semifixed=max_semi,
-                                        use_reversao=use_rev)
-            portfolio = opt.optimize_multi_regime(5, 50000, n_central=2, n_intermed=2, n_perif=1)
+                                        use_pressure_model=True)
+            portfolio = opt.optimize(5, 50000, 2, 2, 1)
             for i, g in enumerate(portfolio, 1):
                 p = sum(1 for x in g if x%2==0); pr = sum(1 for x in g if x in PRIMES); m = sum(1 for x in g if x in MOLDURA)
                 rep = len(set(g) & set(contests[-1]['dezenas'])) if contests else 0
@@ -621,19 +602,21 @@ def main():
             if len(contests) > 200:
                 bt = opt.backtest(portfolio, contests[-200:])
                 print(f"\n🔬 BACKTEST (200): Lift={bt['lift']:.2f}x | ROI={bt['roi']:+.1f}%")
-                print(f"   11={bt['hit_distribution'].get(11,0)} 12={bt['hit_distribution'].get(12,0)} "
-                      f"13={bt['hit_distribution'].get(13,0)} 14={bt['hit_distribution'].get(14,0)}")
 
-        elif op == '4':
-            print("\n📊 BACKTEST COMPARATIVO (últimos 200 concursos)")
-            for versao, use_rev in [('A (estrutura pura)', False), ('B (estrutura + reversão)', True)]:
-                opt = PortfolioOptimizerV71(contests, use_reversao=use_rev)
-                portfolio = opt.optimize_multi_regime(5, 50000, n_central=2, n_intermed=2, n_perif=1)
-                bt = opt.backtest(portfolio, contests[-200:])
-                print(f"\n   {versao}:")
-                print(f"      Lift={bt['lift']:.2f}x | ROI={bt['roi']:+.1f}%")
-                print(f"      11={bt['hit_distribution'].get(11,0)} 12={bt['hit_distribution'].get(12,0)} "
-                      f"13={bt['hit_distribution'].get(13,0)} 14={bt['hit_distribution'].get(14,0)}")
+        elif op == '3':
+            pressure = PressaoEstruturalTemporal(contests)
+            print(f"\n📊 PRESSÃO ATUAL DOS PARÂMETROS ESTRUTURAIS:")
+            for param in STRUCTURAL_PARAMS:
+                s = pressure.series[param]
+                curr_val = s[-1]
+                atraso = pressure.atraso_atual[param].get(curr_val, 0)
+                intervalo = pressure.intervalo_medio[param].get(curr_val, 1)
+                pers_atual = pressure.persistencia_atual[param].get(curr_val, 1)
+                pers_media = pressure.persistencia_media[param].get(curr_val, 1.0)
+                ciclo_score = atraso / intervalo if intervalo > 0 else 0
+                persist_score = pers_atual / pers_media if pers_media > 0 else 1.0
+                print(f"   {param:<12}: valor atual={curr_val}, atraso={atraso}, "
+                      f"ciclo={ciclo_score:.2f}, persistência={persist_score:.2f}")
 
         elif op == '0':
             break
