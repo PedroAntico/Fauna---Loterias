@@ -2,18 +2,19 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v79
-EFICIÊNCIA HISTÓRICA + DIAGNÓSTICO DE INTERAÇÃO
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v80
+TESTE DE SANIDADE: MODELO v79 vs SELEÇÃO ALEATÓRIA
 
-EVOLUÇÃO vs v78:
-✅ Score de pares agora usa eficiência (taxa de 13+) em vez de z‑score de atraso
-✅ Diagnóstico de interação: pares × linha_4
-✅ Walk‑forward comparativo: modelo com z‑score (v77) vs modelo com eficiência (v79)
-✅ Mantém features: pares, linha_4, linha_3, coluna_2, moldura (pesos calibrados)
+OBJETIVO:
+✅ Walk‑forward comparando o modelo de eficiência (v79) com seleção aleatória
+✅ 50 simulações aleatórias por janela para distribuição robusta
+✅ Teste de Wilcoxon para verificar significância estatística
+✅ Métricas: lift médio, total 13pts, total 14pts, ROI
+✅ Responde: o ranking de jogos agrega valor sobre o acaso?
 """
 
 import numpy as np
-from scipy.stats import hypergeom
+from scipy.stats import hypergeom, wilcoxon
 from collections import Counter, defaultdict
 from itertools import combinations
 import os, random, time, warnings
@@ -47,8 +48,6 @@ COLUNAS = {
     2: [2, 7, 12, 17, 22]
 }
 
-# Eficiência dos pares (calculada no v78)
-# Taxa de 13+ por valor de pares (normalizada para o máximo = 1.0)
 PARES_EFFICIENCY = {
     4: 0.00,
     5: 0.22,
@@ -162,7 +161,6 @@ def extract_feature(game, prev_dezenas, feature_name):
     return 0
 
 def compute_z_scores(train_contests, feature_name):
-    """Z‑score de atraso (mantido para as outras features)."""
     series = []
     for i, c in enumerate(train_contests):
         prev = train_contests[i-1]['dezenas'] if i > 0 else None
@@ -185,36 +183,26 @@ def compute_z_scores(train_contests, feature_name):
     return z_scores
 
 # ============================================================
-# OTIMIZADOR DE CARTEIRA v79 (EFICIÊNCIA PARA PARES)
+# OTIMIZADOR DE CARTEIRA v79 (EFICIÊNCIA)
 # ============================================================
 class PortfolioOptimizerV79:
-    def __init__(self, contests, feature_weights=None, use_efficiency=True):
+    def __init__(self, contests, feature_weights=None):
         self.contests = contests
         self.generator = LooseGenerator()
         self.feature_weights = feature_weights if feature_weights else FEATURE_WEIGHTS
         self.active_features = list(self.feature_weights.keys())
-        self.use_efficiency = use_efficiency
 
     def _score_game(self, game, prev_dezenas, feature_z_scores):
-        """
-        Score combinado:
-        - pares: eficiência histórica (se use_efficiency=True) ou z‑score (se False)
-        - demais features: z‑score de atraso
-        """
         score = 0.0
         for feat_name in self.active_features:
             val = extract_feature(game, prev_dezenas, feat_name)
             weight = self.feature_weights.get(feat_name, 0.2)
-            
-            if feat_name == 'pares' and self.use_efficiency:
-                # Usa eficiência: valor mais alto = melhor (subtrai para score menor)
+            if feat_name == 'pares':
                 eff = PARES_EFFICIENCY.get(val, 0.0)
-                score -= eff * weight * 2.0  # fator 2 para equiparar escala com z‑score
+                score -= eff * weight * 2.0
             else:
-                # Z‑score de atraso (mantido para as outras features)
                 z = feature_z_scores.get(feat_name, {}).get(val, 0.0)
                 score -= z * weight
-        
         return score
 
     def generate_pool(self, n_candidates, prev_dezenas=None):
@@ -231,21 +219,16 @@ class PortfolioOptimizerV79:
         return pool
 
     def optimize(self, n_games=5, n_candidates=20000, n_central=2, n_intermed=2, n_perif=1):
-        # Z‑scores para as features (exceto pares, se use_efficiency=True)
         feature_z_scores = {}
         for feat_name in self.active_features:
-            if feat_name == 'pares' and self.use_efficiency:
-                continue  # pares usa eficiência, não z‑score
-            feature_z_scores[feat_name] = compute_z_scores(self.contests, feat_name)
-        
+            if feat_name != 'pares':
+                feature_z_scores[feat_name] = compute_z_scores(self.contests, feat_name)
         prev_dezenas = self.contests[-1]['dezenas'] if self.contests else None
         pool = self.generate_pool(n_candidates, prev_dezenas)
         if len(pool) < n_games:
             return []
-        
         scored = [(self._score_game(g, prev_dezenas, feature_z_scores), g) for g in pool]
         scored.sort(key=lambda x: x[0])
-        
         n_total = len(scored)
         idx1 = min(n_central * n_total // n_games, n_total)
         idx2 = min((n_central + n_intermed) * n_total // n_games, n_total)
@@ -259,27 +242,19 @@ class PortfolioOptimizerV79:
 
     def backtest(self, portfolio, test_draws):
         if len(portfolio) == 0:
-            return {'lift': 0, 'roi': 0, 'hit_distribution': {k:0 for k in range(11,16)}, 'details': []}
+            return {'lift': 0, 'roi': 0, 'hit_distribution': {k:0 for k in range(11,16)}}
         n_success = total_premio = 0
         total_custo = len(portfolio) * len(test_draws) * CUSTO_APOSTA
         portfolio_masks = np.array([BITMASK_CACHE.get_mask(g) for g in portfolio], dtype=np.uint32)
         hit_counts = {k:0 for k in range(11,16)}
-        details = []
         for draw in test_draws:
             dm = BITMASK_CACHE.get_mask(draw['dezenas'])
-            for i, pm in enumerate(portfolio_masks):
+            for pm in portfolio_masks:
                 hits = mask_intersection(pm, dm)
                 if hits >= 11:
                     n_success += 1
                     total_premio += PREMIO_VALORES.get(hits, 0)
                     hit_counts[hits] += 1
-                    details.append({
-                        'concurso': draw['concurso'],
-                        'hits': hits,
-                        'pares': extract_feature(portfolio[i], None, 'pares'),
-                        'linha_4': extract_feature(portfolio[i], None, 'linha_4'),
-                        'jogo': portfolio[i]
-                    })
         prob = n_success/(len(portfolio)*len(test_draws)) if test_draws else 0
         p_single = sum(HYPE_PROBS[k] for k in range(11,16))
         theo_prob = 1 - (1-p_single)**len(portfolio)
@@ -288,125 +263,124 @@ class PortfolioOptimizerV79:
                 'n_test': len(test_draws), 'n_success': n_success,
                 'total_premio': total_premio, 'total_custo': total_custo,
                 'roi': (total_premio-total_custo)/total_custo*100 if total_custo>0 else 0,
-                'hit_distribution': hit_counts, 'details': details}
+                'hit_distribution': hit_counts}
 
 # ============================================================
-# DIAGNÓSTICO DE INTERAÇÃO: PARES × LINHA_4
+# TESTE DE SANIDADE: MODELO vs ALEATÓRIO
 # ============================================================
-def diagnostic_interaction(contests, train_size=500, test_size=50, step=50):
+def sanity_check(contests, train_size=500, test_size=50, step=50, n_random=50):
     """
-    Walk‑forward com o modelo de eficiência (v79).
-    Para cada acerto de 11+, registra pares e linha_4.
-    Agrega por combinação (pares, linha_4) e calcula taxa de 13+.
+    Walk‑forward comparando o modelo v79 com seleção aleatória.
+    n_random: quantas carteiras aleatórias são geradas por janela.
     """
-    print(f"\n🔬 DIAGNÓSTICO DE INTERAÇÃO: PARES × LINHA_4")
-    print(f"   Treino: {train_size} | Teste: {test_size} | Passo: {step}\n")
+    print(f"\n🧪 TESTE DE SANIDADE: MODELO v79 vs SELEÇÃO ALEATÓRIA")
+    print(f"   Treino: {train_size} | Teste: {test_size} | Passo: {step}")
+    print(f"   Simulações aleatórias por janela: {n_random}\n")
 
-    # Acumuladores por (pares, linha_4)
-    inter_stats = defaultdict(lambda: {'total_jogos': 0, 'acertos_13': 0, 'acertos_14': 0, 'acertos_15': 0})
+    results_modelo = []
+    results_aleatorio = []
 
     start = train_size
     while start + test_size <= len(contests):
         train_data = contests[start-train_size:start]
         test_data = contests[start:start+test_size]
+
+        # Modelo v79
         try:
-            opt = PortfolioOptimizerV79(train_data, feature_weights=FEATURE_WEIGHTS, use_efficiency=True)
-            portfolio = opt.optimize(5, 15000, 2, 2, 1)
-            bt = opt.backtest(portfolio, test_data)
-            # Registrar cada jogo da carteira
-            for g in portfolio:
-                p = extract_feature(g, None, 'pares')
-                l4 = extract_feature(g, None, 'linha_4')
-                inter_stats[(p, l4)]['total_jogos'] += len(test_data)
-            # Registrar acertos detalhados
-            for det in bt['details']:
-                p = det['pares']
-                l4 = det['linha_4']
-                hits = det['hits']
-                if hits == 13:
-                    inter_stats[(p, l4)]['acertos_13'] += 1
-                elif hits == 14:
-                    inter_stats[(p, l4)]['acertos_14'] += 1
-                elif hits == 15:
-                    inter_stats[(p, l4)]['acertos_15'] += 1
+            opt = PortfolioOptimizerV79(train_data, feature_weights=FEATURE_WEIGHTS)
+            portfolio_modelo = opt.optimize(5, 15000, 2, 2, 1)
+            bt_modelo = opt.backtest(portfolio_modelo, test_data)
+            results_modelo.append({
+                'lift': bt_modelo['lift'],
+                'roi': bt_modelo['roi'],
+                '11pts': bt_modelo['hit_distribution'].get(11,0),
+                '12pts': bt_modelo['hit_distribution'].get(12,0),
+                '13pts': bt_modelo['hit_distribution'].get(13,0),
+                '14pts': bt_modelo['hit_distribution'].get(14,0),
+                '15pts': bt_modelo['hit_distribution'].get(15,0),
+            })
         except Exception as e:
-            pass
+            results_modelo.append({'lift': 0, 'roi': 0, '11pts': 0, '12pts': 0, '13pts': 0, '14pts': 0, '15pts': 0})
+
+        # Múltiplas carteiras aleatórias
+        aleatorio_lifts = []
+        aleatorio_rois = []
+        aleatorio_11 = []
+        aleatorio_12 = []
+        aleatorio_13 = []
+        aleatorio_14 = []
+        aleatorio_15 = []
+        for _ in range(n_random):
+            rand_portfolio = [sorted(np.random.choice(range(1,26), 15, replace=False)) for _ in range(5)]
+            bt_rand = opt.backtest(rand_portfolio, test_data)
+            aleatorio_lifts.append(bt_rand['lift'])
+            aleatorio_rois.append(bt_rand['roi'])
+            aleatorio_11.append(bt_rand['hit_distribution'].get(11,0))
+            aleatorio_12.append(bt_rand['hit_distribution'].get(12,0))
+            aleatorio_13.append(bt_rand['hit_distribution'].get(13,0))
+            aleatorio_14.append(bt_rand['hit_distribution'].get(14,0))
+            aleatorio_15.append(bt_rand['hit_distribution'].get(15,0))
+
+        results_aleatorio.append({
+            'lift_mean': np.mean(aleatorio_lifts),
+            'lift_std': np.std(aleatorio_lifts),
+            'roi_mean': np.mean(aleatorio_rois),
+            '11pts_mean': np.mean(aleatorio_11),
+            '12pts_mean': np.mean(aleatorio_12),
+            '13pts_mean': np.mean(aleatorio_13),
+            '14pts_mean': np.mean(aleatorio_14),
+            '15pts_mean': np.mean(aleatorio_15),
+        })
+
+        l_mod = results_modelo[-1]['lift']
+        l_ale = results_aleatorio[-1]['lift_mean']
+        print(f"   Janela {start}: modelo(lift={l_mod:.3f}) | aleatório(lift={l_ale:.3f})")
         start += step
 
-    # Exibir tabela para combinações mais frequentes
-    print(f"📊 TAXA DE 13+ POR COMBINAÇÃO (PARES, LINHA_4):")
-    print(f"{'Pares':<8} {'Linha_4':<10} {'Jogos':<10} {'13pts':<8} {'14pts':<8} {'15pts':<8} {'Taxa 13+':<12}")
-    print("-" * 70)
-    
-    # Ordenar por total de jogos
-    sorted_items = sorted(inter_stats.items(), key=lambda x: x[1]['total_jogos'], reverse=True)
-    for (p, l4), stats in sorted_items:
-        total = stats['total_jogos']
-        if total > 0:
-            taxa_13 = (stats['acertos_13'] + stats['acertos_14'] + stats['acertos_15']) / total * 100
-            if taxa_13 > 0.05 or stats['acertos_14'] > 0:  # filtra combinações com algum sinal
-                print(f"{p:<8} {l4:<10} {total:<10} {stats['acertos_13']:<8} {stats['acertos_14']:<8} {stats['acertos_15']:<8} {taxa_13:<12.4f}%")
+    # Consolidação final
+    lifts_modelo = [r['lift'] for r in results_modelo]
+    lifts_aleatorio = [r['lift_mean'] for r in results_aleatorio]
 
-    # Destacar melhores combinações
-    print(f"\n💡 MELHORES COMBINAÇÕES (TAXA 13+ > 0.2%):")
-    best_combos = [(k, v) for k, v in inter_stats.items() 
-                   if v['total_jogos'] > 0 and (v['acertos_13'] + v['acertos_14'] + v['acertos_15']) / v['total_jogos'] * 100 > 0.2]
-    best_combos.sort(key=lambda x: (x[1]['acertos_13'] + x[1]['acertos_14'] + x[1]['acertos_15']) / x[1]['total_jogos'], reverse=True)
-    for (p, l4), stats in best_combos[:10]:
-        taxa = (stats['acertos_13'] + stats['acertos_14'] + stats['acertos_15']) / stats['total_jogos'] * 100
-        print(f"   Pares={p}, Linha_4={l4}: taxa={taxa:.4f}% ({stats['acertos_13']}×13, {stats['acertos_14']}×14, {stats['acertos_15']}×15)")
+    print(f"\n📊 RESULTADO FINAL ({len(lifts_modelo)} janelas):")
+    print(f"   Modelo v79:")
+    print(f"      Lift médio: {np.mean(lifts_modelo):.4f}")
+    print(f"      ROI médio: {np.mean([r['roi'] for r in results_modelo]):.1f}%")
+    print(f"      Total 13pts: {sum(r['13pts'] for r in results_modelo)}")
+    print(f"      Total 14pts: {sum(r['14pts'] for r in results_modelo)}")
+    print(f"   Aleatório (média de {n_random} simulações):")
+    print(f"      Lift médio: {np.mean(lifts_aleatorio):.4f}")
+    print(f"      ROI médio: {np.mean([r['roi_mean'] for r in results_aleatorio]):.1f}%")
+    print(f"      Total 13pts: {sum(r['13pts_mean'] for r in results_aleatorio):.1f}")
+    print(f"      Total 14pts: {sum(r['14pts_mean'] for r in results_aleatorio):.1f}")
 
-    return inter_stats
+    # Teste de Wilcoxon
+    if len(lifts_modelo) >= 5:
+        try:
+            stat, p_value = wilcoxon(lifts_modelo, lifts_aleatorio)
+            print(f"\n📊 TESTE DE WILCOXON (modelo vs aleatório):")
+            print(f"   Estatística: {stat:.2f}")
+            print(f"   p‑valor: {p_value:.4f}")
+            if p_value < 0.05:
+                print(f"   🔍 Diferença estatisticamente significativa (p < 0.05).")
+                if np.mean(lifts_modelo) > np.mean(lifts_aleatorio):
+                    print(f"   ✅ Modelo SUPERIOR ao aleatório.")
+                else:
+                    print(f"   ❌ Modelo INFERIOR ao aleatório.")
+            else:
+                print(f"   📊 Sem diferença significativa (p ≥ 0.05).")
+                print(f"   O modelo NÃO agrega valor estatístico detectável sobre o acaso.")
+        except Exception as e:
+            print(f"   Não foi possível calcular Wilcoxon: {e}")
 
-# ============================================================
-# COMPARAÇÃO WALK‑FORWARD: Z‑SCORE vs EFICIÊNCIA
-# ============================================================
-def compare_zscore_vs_efficiency(contests, train_size=500, test_size=50, step=50):
-    print(f"\n🔬 COMPARAÇÃO: Z‑SCORE (v77) vs EFICIÊNCIA (v79)")
-    print(f"   Treino: {train_size} | Teste: {test_size} | Passo: {step}\n")
-
-    results = {'zscore': [], 'efficiency': []}
-    start = train_size
-    while start + test_size <= len(contests):
-        train_data = contests[start-train_size:start]
-        test_data = contests[start:start+test_size]
-        for modelo, use_eff in [('zscore', False), ('efficiency', True)]:
-            try:
-                opt = PortfolioOptimizerV79(train_data, feature_weights=FEATURE_WEIGHTS, use_efficiency=use_eff)
-                portfolio = opt.optimize(5, 15000, 2, 2, 1)
-                bt = opt.backtest(portfolio, test_data)
-                results[modelo].append({
-                    'lift': bt['lift'],
-                    'roi': bt['roi'],
-                    '13pts': bt['hit_distribution'].get(13, 0),
-                    '14pts': bt['hit_distribution'].get(14, 0),
-                })
-            except Exception as e:
-                results[modelo].append({'lift': 0, 'roi': 0, '13pts': 0, '14pts': 0})
-        l_z = results['zscore'][-1]['lift'] if results['zscore'] else 0
-        l_eff = results['efficiency'][-1]['lift'] if results['efficiency'] else 0
-        print(f"   Janela {start}: z‑score(lift={l_z:.3f}) | eficiência(lift={l_eff:.3f})")
-        start += step
-
-    print(f"\n📊 RESULTADO FINAL:")
-    for modelo in ['zscore', 'efficiency']:
-        avg_lift = np.mean([r['lift'] for r in results[modelo]]) if results[modelo] else 0
-        avg_roi = np.mean([r['roi'] for r in results[modelo]]) if results[modelo] else 0
-        total_13 = sum(r['13pts'] for r in results[modelo])
-        total_14 = sum(r['14pts'] for r in results[modelo])
-        nome = "Z‑score (v77)" if modelo == 'zscore' else "Eficiência (v79)"
-        print(f"   {nome}:")
-        print(f"      Média lift: {avg_lift:.4f} | Média ROI: {avg_roi:.1f}%")
-        print(f"      Total 13pts: {total_13} | 14pts: {total_14}")
-    return results
+    return results_modelo, results_aleatorio
 
 # ============================================================
 # INTERFACE PRINCIPAL
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v79")
-    print("   EFICIÊNCIA HISTÓRICA + DIAGNÓSTICO DE INTERAÇÃO")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v80")
+    print("   TESTE DE SANIDADE: MODELO v79 vs SELEÇÃO ALEATÓRIA")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
@@ -417,40 +391,16 @@ def main():
 
     while True:
         print("\nOpções:")
-        print("1. Walk‑forward comparativo: z‑score vs eficiência")
-        print("2. Diagnóstico de interação: pares × linha_4")
-        print("3. Gerar carteira com modelo de eficiência (v79)")
+        print("1. Executar teste de sanidade (modelo vs aleatório)")
         print("0. Sair")
         op = input("Escolha: ").strip()
 
         if op == '1':
-            compare_zscore_vs_efficiency(contests)
-
-        elif op == '2':
-            diagnostic_interaction(contests)
-
-        elif op == '3':
-            print("\n📝 CONFIGURAÇÃO DA CARTEIRA (MODELO DE EFICIÊNCIA)")
-            fixed_str = input("   Dezenas fixas (ex: 15 16 20 ou ENTER): ").strip()
-            fixed = [int(x) for x in fixed_str.split()] if fixed_str else []
-            semifixed_str = input("   Dezenas semifixas (ex: 03 07 14 25 ou ENTER): ").strip()
-            semifixed = [int(x) for x in semifixed_str.split()] if semifixed_str else []
-            min_semi, max_semi = 0, None
-            if semifixed:
-                try:
-                    min_semi = int(input(f"   Mínimo de semifixas [0-{len(semifixed)}]: ").strip() or "0")
-                    max_semi = int(input(f"   Máximo de semifixas [0-{len(semifixed)}]: ").strip() or str(len(semifixed)))
-                except:
-                    min_semi, max_semi = 0, len(semifixed)
-            opt = PortfolioOptimizerV79(contests, feature_weights=FEATURE_WEIGHTS, use_efficiency=True)
-            portfolio = opt.optimize(5, 20000, 2, 2, 1)
-            for i, g in enumerate(portfolio, 1):
-                p = sum(1 for x in g if x%2==0); pr = sum(1 for x in g if x in {2,3,5,7,11,13,17,19,23}); m = sum(1 for x in g if x in MOLDURA)
-                rep = len(set(g) & set(contests[-1]['dezenas'])) if contests else 0
-                print(f" {i}. {g} | P:{p} Pr:{pr} M:{m} Rep:{rep}")
-            if len(contests) > 200:
-                bt = opt.backtest(portfolio, contests[-200:])
-                print(f"\n🔬 BACKTEST (200): Lift={bt['lift']:.2f}x | ROI={bt['roi']:+.1f}%")
+            try:
+                n_random = int(input("   Quantas simulações aleatórias por janela? [50]: ").strip() or "50")
+            except:
+                n_random = 50
+            sanity_check(contests, n_random=n_random)
 
         elif op == '0':
             break
