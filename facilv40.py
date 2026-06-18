@@ -2,23 +2,21 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v76
-TESTE DE ABLAÇÃO: QUAIS FEATURES REALMENTE SUSTENTAM O MODELO?
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v77
+MODELO PONDERADO + REMOÇÃO DE REPETICOES
 
-OBJETIVO:
-✅ Construir modelo de pressão apenas com as features aprovadas no v75
-✅ Remover uma feature por vez e medir o impacto no lift (walk‑forward)
-✅ Identificar features essenciais, neutras e prejudiciais
-✅ Critério: variação > 0.005 → essencial; < -0.005 → prejudicial
-✅ Manter apenas o conjunto enxuto que realmente contribui
+EVOLUÇÃO vs v76:
+✅ Remove 'repeticoes' (impacto negativo na ablação)
+✅ Pesos das features baseados no impacto real da ablação
+✅ Comparação walk‑forward: modelo uniforme (v76) vs modelo ponderado (v77)
+✅ Mantém features: pares, linha_4, linha_3, moldura, coluna_2
 """
 
 import numpy as np
 from scipy.stats import hypergeom
-from collections import Counter, defaultdict
+from collections import Counter
 from itertools import combinations
-import os, random, time, warnings, json
-from math import comb
+import os, random, time, warnings
 from tqdm import tqdm
 
 warnings.filterwarnings('ignore')
@@ -26,16 +24,29 @@ warnings.filterwarnings('ignore')
 # ============================================================
 # CONSTANTES
 # ============================================================
-PRIMES = {2, 3, 5, 7, 11, 13, 17, 19, 23}
 MOLDURA = {1,2,3,4,5, 6,10, 11,15, 16,20, 21,22,23,24,25}
 HYPE_PROBS = {k: hypergeom.pmf(k, 25, 15, 15) for k in range(0, 16)}
 PREMIO_VALORES = {11: 6.0, 12: 12.0, 13: 30.0, 14: 1500.0, 15: 1800000.0}
 CUSTO_APOSTA = 3.5
 
-# Features estruturais (parâmetros clássicos)
-STRUCTURAL_PARAMS = ['pares', 'moldura', 'repeticoes']
+# Features ativas (sem repeticoes)
+ACTIVE_FEATURES = ['pares', 'linha_4', 'linha_3', 'coluna_2', 'moldura']
 
-# Features geométricas aprovadas no v75
+# Pesos baseados no impacto da ablação (v76)
+# Impactos: pares=0.0131, linha_4=0.0069, linha_3=0.0051, coluna_2=0.0045, moldura=0.0044
+# Normalizados para soma = 1
+FEATURE_WEIGHTS = {
+    'pares': 0.38,
+    'linha_4': 0.20,
+    'linha_3': 0.15,
+    'coluna_2': 0.13,
+    'moldura': 0.13
+}
+
+# Pesos uniformes para comparação
+UNIFORM_WEIGHTS = {f: 0.20 for f in ACTIVE_FEATURES}
+
+# Geometrias
 LINHAS = {
     3: [11, 12, 13, 14, 15],
     4: [16, 17, 18, 19, 20]
@@ -43,16 +54,6 @@ LINHAS = {
 COLUNAS = {
     2: [2, 7, 12, 17, 22]
 }
-
-# Todas as features do modelo (conjunto enxuto)
-MODEL_FEATURES = [
-    ('pares', 'estrutural'),
-    ('moldura', 'estrutural'),
-    ('repeticoes', 'estrutural'),
-    ('linha_3', 'linha'),
-    ('linha_4', 'linha'),
-    ('coluna_2', 'coluna')
-]
 
 # ============================================================
 # BITMASK
@@ -139,29 +140,16 @@ class LooseGenerator:
 # ============================================================
 # FUNÇÕES AUXILIARES
 # ============================================================
-def extract_filter(dezenas, filter_name, prev_dezenas=None):
-    d = sorted(dezenas)
-    if filter_name == 'pares': return sum(1 for x in d if x % 2 == 0)
-    if filter_name == 'moldura': return sum(1 for x in d if x in MOLDURA)
-    if filter_name == 'repeticoes':
-        if prev_dezenas is None: return 8
-        return len(set(d) & set(prev_dezenas))
-    return 0
-
 def count_in_set(dezenas, elementos):
     return len(set(dezenas) & set(elementos))
 
-# ============================================================
-# FEATURE EXTRACTOR (CONJUNTO ENXUTO)
-# ============================================================
 def extract_feature(game, prev_dezenas, feature_name):
     """Extrai o valor de uma feature específica para um jogo."""
+    d = sorted(game)
     if feature_name == 'pares':
-        return extract_filter(game, 'pares')
+        return sum(1 for x in d if x % 2 == 0)
     elif feature_name == 'moldura':
-        return extract_filter(game, 'moldura')
-    elif feature_name == 'repeticoes':
-        return extract_filter(game, 'repeticoes', prev_dezenas)
+        return sum(1 for x in d if x in MOLDURA)
     elif feature_name == 'linha_3':
         return count_in_set(game, LINHAS[3])
     elif feature_name == 'linha_4':
@@ -194,23 +182,26 @@ def compute_z_scores(train_contests, feature_name):
     return z_scores
 
 # ============================================================
-# OTIMIZADOR DE CARTEIRA (MODELO DE PRESSÃO ENXUTO)
+# OTIMIZADOR DE CARTEIRA v77 (COM PESOS CONFIGURÁVEIS)
 # ============================================================
-class PortfolioOptimizerV76:
-    def __init__(self, contests, active_features=None):
+class PortfolioOptimizerV77:
+    def __init__(self, contests, feature_weights=None):
         self.contests = contests
         self.generator = LooseGenerator()
-        self.active_features = active_features if active_features else [f[0] for f in MODEL_FEATURES]
+        self.feature_weights = feature_weights if feature_weights else FEATURE_WEIGHTS
+        self.active_features = list(self.feature_weights.keys())
 
     def _score_game(self, game, prev_dezenas, feature_z_scores):
         """
-        Score = soma dos z‑scores das features ativas (subtrai para bonificar atrasados).
+        Score = soma ponderada dos z‑scores das features ativas.
+        Subtrai para bonificar valores atrasados (z positivo).
         """
         score = 0.0
         for feat_name in self.active_features:
             val = extract_feature(game, prev_dezenas, feat_name)
             z = feature_z_scores.get(feat_name, {}).get(val, 0.0)
-            score -= z * 0.2  # peso uniforme para features selecionadas
+            weight = self.feature_weights.get(feat_name, 0.2)
+            score -= z * weight
         return score
 
     def generate_pool(self, n_candidates, prev_dezenas=None):
@@ -227,7 +218,6 @@ class PortfolioOptimizerV76:
         return pool
 
     def optimize(self, n_games=5, n_candidates=20000, n_central=2, n_intermed=2, n_perif=1):
-        # Calcular z‑scores para cada feature ativa no treino
         feature_z_scores = {}
         for feat_name in self.active_features:
             feature_z_scores[feat_name] = compute_z_scores(self.contests, feat_name)
@@ -237,10 +227,7 @@ class PortfolioOptimizerV76:
         if len(pool) < n_games:
             return []
         
-        scored = []
-        for g in pool:
-            s = self._score_game(g, prev_dezenas, feature_z_scores)
-            scored.append((s, g))
+        scored = [(self._score_game(g, prev_dezenas, feature_z_scores), g) for g in pool]
         scored.sort(key=lambda x: x[0])
         
         n_total = len(scored)
@@ -280,99 +267,57 @@ class PortfolioOptimizerV76:
                 'hit_distribution': hit_counts}
 
 # ============================================================
-# TESTE DE ABLAÇÃO
+# COMPARAÇÃO WALK‑FORWARD: UNIFORME vs PONDERADO
 # ============================================================
-def ablation_test(contests, train_size=500, test_size=50, step=50):
-    """
-    1. Mede o desempenho do modelo completo (todas as features).
-    2. Remove uma feature por vez e mede o impacto no lift.
-    """
-    all_features = [f[0] for f in MODEL_FEATURES]
-    print(f"\n🔬 TESTE DE ABLAÇÃO")
-    print(f"   Modelo completo: {all_features}")
+def compare_uniform_vs_weighted(contests, train_size=500, test_size=50, step=50):
+    print(f"\n🔬 COMPARAÇÃO: MODELO UNIFORME (v76) vs MODELO PONDERADO (v77)")
+    print(f"   Features: {ACTIVE_FEATURES}")
+    print(f"   Pesos uniformes: {UNIFORM_WEIGHTS}")
+    print(f"   Pesos ponderados: {FEATURE_WEIGHTS}")
     print(f"   Treino: {train_size} | Teste: {test_size} | Passo: {step}\n")
 
-    # 1. Modelo completo
-    print("Avaliando modelo completo...")
-    full_lifts = []
+    results = {'uniforme': [], 'ponderado': []}
     start = train_size
     while start + test_size <= len(contests):
         train_data = contests[start-train_size:start]
         test_data = contests[start:start+test_size]
-        try:
-            opt = PortfolioOptimizerV76(train_data, active_features=all_features)
-            portfolio = opt.optimize(5, 15000, 2, 2, 1)
-            bt = opt.backtest(portfolio, test_data)
-            full_lifts.append(bt['lift'])
-        except Exception as e:
-            full_lifts.append(0.0)
-        start += step
-    full_mean = np.mean(full_lifts) if full_lifts else 0.0
-    print(f"   Lift médio (completo): {full_mean:.4f} ({len(full_lifts)} janelas)\n")
-
-    # 2. Ablação: remover uma feature por vez
-    ablation_results = []
-    for feature_to_remove in all_features:
-        reduced_features = [f for f in all_features if f != feature_to_remove]
-        print(f"Removendo '{feature_to_remove}' → features restantes: {reduced_features}")
-        lifts = []
-        start = train_size
-        while start + test_size <= len(contests):
-            train_data = contests[start-train_size:start]
-            test_data = contests[start:start+test_size]
+        for modelo, pesos in [('uniforme', UNIFORM_WEIGHTS), ('ponderado', FEATURE_WEIGHTS)]:
             try:
-                opt = PortfolioOptimizerV76(train_data, active_features=reduced_features)
+                opt = PortfolioOptimizerV77(train_data, feature_weights=pesos)
                 portfolio = opt.optimize(5, 15000, 2, 2, 1)
                 bt = opt.backtest(portfolio, test_data)
-                lifts.append(bt['lift'])
+                results[modelo].append({
+                    'lift': bt['lift'],
+                    'roi': bt['roi'],
+                    '13pts': bt['hit_distribution'].get(13, 0),
+                    '14pts': bt['hit_distribution'].get(14, 0),
+                })
             except Exception as e:
-                lifts.append(0.0)
-            start += step
-        mean_lift = np.mean(lifts) if lifts else 0.0
-        impacto = full_mean - mean_lift  # positivo = feature removida faz falta
-        ablation_results.append({
-            'feature_removed': feature_to_remove,
-            'mean_lift': mean_lift,
-            'impacto': impacto,
-            'n_windows': len(lifts)
-        })
-        print(f"   Lift sem '{feature_to_remove}': {mean_lift:.4f} (impacto: {impacto:+.4f})\n")
+                results[modelo].append({'lift': 0, 'roi': 0, '13pts': 0, '14pts': 0})
+        l_unif = results['uniforme'][-1]['lift'] if results['uniforme'] else 0
+        l_pond = results['ponderado'][-1]['lift'] if results['ponderado'] else 0
+        print(f"   Janela {start}: uniforme(lift={l_unif:.3f}) | ponderado(lift={l_pond:.3f})")
+        start += step
 
-    # Ordenar por impacto (mais negativo = feature mais importante)
-    ablation_results.sort(key=lambda x: x['impacto'], reverse=True)
-
-    # Exibir ranking
-    print(f"\n📊 RANKING DE IMPORTÂNCIA POR ABLAÇÃO:")
-    print(f"   (Impacto positivo = feature é ESSENCIAL; negativo = feature atrapalha)")
-    print(f"{'Feature removida':<20} {'Lift s/ feature':<14} {'Impacto':<10} {'Status'}")
-    print("-" * 60)
-    for res in ablation_results:
-        if res['impacto'] > 0.005:
-            status = "🔴 ESSENCIAL"
-        elif res['impacto'] < -0.005:
-            status = "🟢 PREJUDICIAL"
-        else:
-            status = "⚪ NEUTRA"
-        print(f"{res['feature_removed']:<20} {res['mean_lift']:<14.4f} {res['impacto']:<10.4f} {status}")
-
-    # Recomendação
-    essenciais = [r for r in ablation_results if r['impacto'] > 0.005]
-    prejudiciais = [r for r in ablation_results if r['impacto'] < -0.005]
-    print(f"\n💡 RECOMENDAÇÃO:")
-    print(f"   Features essenciais (manter): {[r['feature_removed'] for r in essenciais]}")
-    print(f"   Features prejudiciais (remover): {[r['feature_removed'] for r in prejudiciais]}")
-    if prejudiciais:
-        print(f"   Modelo simplificado sugerido: {[f for f in all_features if f not in [r['feature_removed'] for r in prejudiciais]]}")
-
-    return ablation_results, full_mean
+    print(f"\n📊 RESULTADO FINAL:")
+    for modelo in ['uniforme', 'ponderado']:
+        avg_lift = np.mean([r['lift'] for r in results[modelo]]) if results[modelo] else 0
+        avg_roi = np.mean([r['roi'] for r in results[modelo]]) if results[modelo] else 0
+        total_13 = sum(r['13pts'] for r in results[modelo])
+        total_14 = sum(r['14pts'] for r in results[modelo])
+        nome = "Modelo uniforme (v76)" if modelo == 'uniforme' else "Modelo ponderado (v77)"
+        print(f"   {nome}:")
+        print(f"      Média lift: {avg_lift:.4f} | Média ROI: {avg_roi:.1f}%")
+        print(f"      Total 13pts: {total_13} | 14pts: {total_14}")
+    return results
 
 # ============================================================
 # INTERFACE PRINCIPAL
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v76")
-    print("   TESTE DE ABLAÇÃO: QUAIS FEATURES REALMENTE IMPORTAM?")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v77")
+    print("   MODELO PONDERADO + REMOÇÃO DE REPETICOES")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
@@ -383,27 +328,34 @@ def main():
 
     while True:
         print("\nOpções:")
-        print("1. Executar teste de ablação (walk‑forward)")
-        print("2. Gerar carteira com modelo enxuto (features essenciais)")
+        print("1. Walk‑forward comparativo: uniforme vs ponderado")
+        print("2. Gerar carteira com modelo ponderado (v77)")
+        print("3. Gerar carteira com modelo uniforme (v76)")
         print("0. Sair")
         op = input("Escolha: ").strip()
 
         if op == '1':
-            ablation_test(contests)
+            compare_uniform_vs_weighted(contests)
 
-        elif op == '2':
-            # Usa apenas as features que o teste de ablação anterior sugeriu (fallback: todas)
-            print("\n📝 CONFIGURAÇÃO DA CARTEIRA (MODELO ENXUTO)")
-            print("   Features disponíveis: pares, moldura, repeticoes, linha_3, linha_4, coluna_2")
-            features_str = input("   Digite as features a usar (ex: pares,moldura,linha_4) ou ENTER para todas: ").strip()
-            if features_str:
-                active = [f.strip() for f in features_str.split(',')]
-            else:
-                active = [f[0] for f in MODEL_FEATURES]
-            opt = PortfolioOptimizerV76(contests, active_features=active)
+        elif op in ('2', '3'):
+            pesos = FEATURE_WEIGHTS if op == '2' else UNIFORM_WEIGHTS
+            nome = "ponderado (v77)" if op == '2' else "uniforme (v76)"
+            print(f"\n📝 CONFIGURAÇÃO DA CARTEIRA ({nome})")
+            fixed_str = input("   Dezenas fixas (ex: 15 16 20 ou ENTER): ").strip()
+            fixed = [int(x) for x in fixed_str.split()] if fixed_str else []
+            semifixed_str = input("   Dezenas semifixas (ex: 03 07 14 25 ou ENTER): ").strip()
+            semifixed = [int(x) for x in semifixed_str.split()] if semifixed_str else []
+            min_semi, max_semi = 0, None
+            if semifixed:
+                try:
+                    min_semi = int(input(f"   Mínimo de semifixas [0-{len(semifixed)}]: ").strip() or "0")
+                    max_semi = int(input(f"   Máximo de semifixas [0-{len(semifixed)}]: ").strip() or str(len(semifixed)))
+                except:
+                    min_semi, max_semi = 0, len(semifixed)
+            opt = PortfolioOptimizerV77(contests, feature_weights=pesos)
             portfolio = opt.optimize(5, 20000, 2, 2, 1)
             for i, g in enumerate(portfolio, 1):
-                p = sum(1 for x in g if x%2==0); pr = sum(1 for x in g if x in PRIMES); m = sum(1 for x in g if x in MOLDURA)
+                p = sum(1 for x in g if x%2==0); pr = sum(1 for x in g if x in {2,3,5,7,11,13,17,19,23}); m = sum(1 for x in g if x in MOLDURA)
                 rep = len(set(g) & set(contests[-1]['dezenas'])) if contests else 0
                 print(f" {i}. {g} | P:{p} Pr:{pr} M:{m} Rep:{rep}")
             if len(contests) > 200:
