@@ -52,7 +52,7 @@ STEP = 50
 # ============================================================
 # CARREGAMENTO DE DADOS
 # ============================================================
-def load_megasena(csv_file='megasena.csv'):
+def load_megasena(csv_file='resultados_megasena.csv'):
     """Carrega concursos da Mega‑Sena. Formato: concurso;data;d1;d2;d3;d4;d5;d6"""
     if not os.path.exists(csv_file):
         print(f"⚠️ Arquivo {csv_file} não encontrado. Gerando dados sintéticos...")
