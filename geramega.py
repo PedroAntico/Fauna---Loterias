@@ -2,19 +2,19 @@
 # -*- coding: utf-8 -*-
 
 """
-MEGA‑SENA LAB v1.0
-LABORATÓRIO ESTATÍSTICO + MOTOR DE OTIMIZAÇÃO COMBINATÓRIA
+MEGA‑SENA LAB v2.0
+LABORATÓRIO ESTATÍSTICO + MOTOR DE OTIMIZAÇÃO COMBINATÓRIA COMPLETO
 
 Sistema completo que une:
-✅ Motor matemático: DPP, Simulated Annealing, Cobertura, Mahalanobis
+✅ Motor matemático: Mahalanobis, DPP, Simulated Annealing, Cobertura, Fitness Global
 ✅ Laboratório científico: Monte Carlo, Walk‑Forward, Ranking Preditivo,
-   Teste Concurso a Concurso, Structural Predictor, Busca OOS,
-   Análise de Ciclos, Baseline Aleatório, ROI Real
+   Teste Concurso a Concurso, Structural Predictor (com IPE), Busca OOS,
+   Análise de Ciclos, Baseline Aleatório, ROI Real, Anti‑Human Score
 
 ADAPTADO PARA MEGA‑SENA:
 - 60 dezenas, 6 sorteadas
 - Filtros: pares, primos, fibonacci, quadrantes (Q1‑Q4), soma, amplitude, consecutivos
-- Premiação baseada em arquivo CSV com valores reais (fallback: valores fixos)
+- Premiação real via CSV (fallback: valores fixos)
 """
 
 import numpy as np
@@ -22,6 +22,7 @@ from scipy.stats import hypergeom, binomtest
 from collections import Counter, defaultdict
 from itertools import combinations
 import os, random, time, warnings, json
+from math import comb
 from tqdm import tqdm
 
 warnings.filterwarnings('ignore')
@@ -40,8 +41,8 @@ Q2 = list(range(16, 31))  # 16‑30
 Q3 = list(range(31, 46))  # 31‑45
 Q4 = list(range(46, 61))  # 46‑60
 
-# Premiação (fallback fixo, será substituído por CSV se disponível)
-PREMIO_VALORES = {4: 900.0, 5: 40000.0, 6: 3500000.0}
+# Premiação (fallback fixo)
+PREMIO_FALLBACK = {4: 900.0, 5: 40000.0, 6: 3500000.0}
 CUSTO_APOSTA = 5.0
 
 # Parâmetros do walk‑forward
@@ -53,7 +54,7 @@ STEP = 50
 # CARREGAMENTO DE DADOS
 # ============================================================
 def load_megasena(csv_file='resultados_megasena.csv'):
-    """Carrega concursos da Mega‑Sena. Formato: concurso;data;d1;d2;d3;d4;d5;d6"""
+    """Carrega concursos da Mega‑Sena."""
     if not os.path.exists(csv_file):
         print(f"⚠️ Arquivo {csv_file} não encontrado. Gerando dados sintéticos...")
         return generate_synthetic_contests(2000)
@@ -72,15 +73,32 @@ def load_megasena(csv_file='resultados_megasena.csv'):
     print(f"✅ {len(contests)} concursos da Mega‑Sena carregados")
     return contests
 
+def load_premios(csv_file='premios_megasena.csv'):
+    """Carrega premiação real por concurso."""
+    if not os.path.exists(csv_file):
+        return {}
+    premios = {}
+    with open(csv_file, 'r', encoding='utf-8') as f:
+        for line in f.readlines()[1:]:
+            parts = line.strip().split(';')
+            if len(parts) < 4: continue
+            try:
+                concurso = int(parts[0])
+                quadra = float(parts[1])
+                quina = float(parts[2])
+                sena = float(parts[3])
+                premios[concurso] = {4: quadra, 5: quina, 6: sena}
+            except: continue
+    print(f"✅ Premiação carregada para {len(premios)} concursos")
+    return premios
+
 def generate_synthetic_contests(n):
-    """Gera concursos sintéticos para teste (i.i.d.)."""
     return [{'concurso': i+1, 'data': '', 'dezenas': sorted(np.random.choice(range(1,61), 6, replace=False))} for i in range(n)]
 
 # ============================================================
 # FUNÇÕES AUXILIARES – EXTRAÇÃO DE FILTROS
 # ============================================================
 def extract_filter(dezenas, filter_name):
-    """Extrai o valor de um filtro estrutural para um conjunto de dezenas."""
     d = sorted(dezenas)
     if filter_name == 'pares': return sum(1 for x in d if x % 2 == 0)
     if filter_name == 'primos': return sum(1 for x in d if x in PRIMES)
@@ -94,11 +112,10 @@ def extract_filter(dezenas, filter_name):
     if filter_name == 'q4': return sum(1 for x in d if x in Q4)
     return 0
 
-# Lista de todos os filtros disponíveis
 ALL_FILTERS = ['pares', 'primos', 'fibonacci', 'soma', 'amplitude', 'consecutivos', 'q1', 'q2', 'q3', 'q4']
 
 # ============================================================
-# BITMASK (para interseções rápidas)
+# BITMASK
 # ============================================================
 class BitmaskCache:
     def __init__(self):
@@ -126,18 +143,164 @@ class LooseGenerator:
         restantes = list(set(range(1, 61)) - fixed_set)
         complemento = np.random.choice(restantes, 6 - len(fixed_set), replace=False)
         return sorted(fixed_set | set(complemento))
+    def generate_filtered(self, fixed=None, ranges=None):
+        """Gera um jogo respeitando faixas de filtros."""
+        for _ in range(500):
+            g = self.generate_with_fixed(fixed) if fixed else self.generate_random()
+            if ranges is None:
+                return g
+            ok = True
+            for filtro, (low, high) in ranges.items():
+                val = extract_filter(g, filtro)
+                if val < low or val > high:
+                    ok = False
+                    break
+            if ok:
+                return g
+        # fallback: retorna aleatório
+        return self.generate_with_fixed(fixed) if fixed else self.generate_random()
 
 # ============================================================
-# OTIMIZADOR DE CARTEIRA (PAIR COVERING)
+# DISTÂNCIA DE MAHALANOBIS
+# ============================================================
+class MahalanobisDistance:
+    def __init__(self, train_data):
+        self.train_data = train_data
+        self._compute_covariance()
+    def _compute_covariance(self):
+        n = len(self.train_data)
+        if n < 2:
+            self.mean = np.zeros(TOTAL_DEZENAS)
+            self.inv_cov = np.eye(TOTAL_DEZENAS)
+            return
+        # Matriz binária: n x 60
+        X = np.zeros((n, TOTAL_DEZENAS))
+        for i, c in enumerate(self.train_data):
+            for d in c['dezenas']:
+                X[i, d-1] = 1
+        self.mean = np.mean(X, axis=0)
+        cov = np.cov(X, rowvar=False)
+        cov += np.eye(TOTAL_DEZENAS) * 1e-6
+        self.inv_cov = np.linalg.inv(cov)
+    def distance(self, game):
+        x = np.zeros(TOTAL_DEZENAS)
+        for d in game:
+            x[d-1] = 1
+        diff = x - self.mean
+        return np.sqrt(np.dot(np.dot(diff.T, self.inv_cov), diff))
+
+# ============================================================
+# DPP (Determinantal Point Process)
+# ============================================================
+def dpp_sample(pool, kernel_func, n_select=5):
+    """Amostragem via DPP usando autovetores do kernel."""
+    n = len(pool)
+    if n <= n_select:
+        return pool[:n_select]
+    # Construir matriz de kernel (similaridade)
+    K = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i, n):
+            sim = kernel_func(pool[i], pool[j])
+            K[i, j] = sim
+            K[j, i] = sim
+    # Decomposição espectral
+    eigenvalues, eigenvectors = np.linalg.eigh(K)
+    eigenvalues = np.maximum(eigenvalues, 0)
+    # Probabilidade de seleção proporcional aos autovalores
+    probs = eigenvalues / (eigenvalues + 1)
+    selected = []
+    indices = list(range(n))
+    for _ in range(n_select):
+        if not indices: break
+        p = probs[indices] / np.sum(probs[indices])
+        chosen = np.random.choice(indices, p=p)
+        selected.append(pool[chosen])
+        indices.remove(chosen)
+    return selected
+
+def kernel_similarity(g1, g2):
+    """Similaridade entre dois jogos (interseção normalizada)."""
+    inter = len(set(g1) & set(g2))
+    return inter / DEZENAS_SORTEADAS
+
+# ============================================================
+# ANTI‑HUMAN SCORE
+# ============================================================
+def anti_human_score(game):
+    """Penaliza padrões comuns (datas, sequências, etc.)."""
+    score = 0.0
+    # Penalizar muitos números baixos (dias)
+    dias = sum(1 for x in game if x <= 31)
+    if dias >= 4:
+        score -= 1.0
+    # Penalizar sequências longas
+    g = sorted(game)
+    run = 1
+    for i in range(len(g)-1):
+        if g[i+1] - g[i] == 1:
+            run += 1
+        else:
+            run = 1
+    if run >= 3:
+        score -= 1.0
+    # Penalizar múltiplos de 5 (padrão visual)
+    mult5 = sum(1 for x in g if x % 5 == 0)
+    if mult5 >= 3:
+        score -= 0.5
+    return score
+
+# ============================================================
+# FITNESS GLOBAL
+# ============================================================
+def fitness_global(portfolio):
+    """Avalia uma carteira combinando cobertura, diversidade, anti‑human e entropia."""
+    if len(portfolio) == 0:
+        return -1e9
+    # Cobertura de pares
+    covered_pairs = set()
+    for g in portfolio:
+        covered_pairs.update(combinations(sorted(g), 2))
+    total_pairs = comb(60, 2)
+    coverage = len(covered_pairs) / total_pairs
+    # Diversidade (1 - interseção média)
+    masks = [BITMASK_CACHE.get_mask(g) for g in portfolio]
+    intersections = []
+    for i in range(len(masks)):
+        for j in range(i+1, len(masks)):
+            intersections.append(mask_intersection(masks[i], masks[j]))
+    avg_inter = np.mean(intersections) if intersections else 0
+    diversity = 1 - avg_inter / DEZENAS_SORTEADAS
+    # Anti‑human médio
+    anti_human = np.mean([anti_human_score(g) for g in portfolio])
+    # Entropia (distribuição uniforme das dezenas)
+    freq = np.zeros(TOTAL_DEZENAS)
+    for g in portfolio:
+        for d in g:
+            freq[d-1] += 1
+    freq /= len(portfolio)
+    freq = freq[freq > 0]
+    entropy = -np.sum(freq * np.log2(freq)) / np.log2(60) if len(freq) > 0 else 0
+    return coverage * 0.3 + diversity * 0.3 + anti_human * 0.1 + entropy * 0.3
+
+# ============================================================
+# OTIMIZADOR DE CARTEIRA (MAHALANOBIS + DPP + ANNEALING + FITNESS)
 # ============================================================
 class PortfolioOptimizer:
-    def __init__(self, contests):
+    def __init__(self, contests, premios=None):
         self.contests = contests
         self.generator = LooseGenerator()
-    def generate_pool(self, n_candidates, fixed=None):
+        self.premios = premios if premios else {}
+        self.mahalanobis = None
+        if len(contests) >= 100:
+            self.mahalanobis = MahalanobisDistance(contests)
+    def generate_pool(self, n_candidates, fixed=None, ranges=None):
         pool, seen = [], set()
         for _ in range(n_candidates):
-            g = self.generator.generate_with_fixed(fixed) if fixed else self.generator.generate_random()
+            if ranges:
+                g = self.generator.generate_filtered(fixed, ranges)
+            else:
+                g = self.generator.generate_with_fixed(fixed) if fixed else self.generator.generate_random()
             key = tuple(g)
             if key not in seen:
                 seen.add(key)
@@ -158,6 +321,44 @@ class PortfolioOptimizer:
             selected.append(candidates[best_idx])
             covered.update(combinations(sorted(candidates[best_idx]), 2))
         return selected
+    def simulated_annealing(self, initial, steps=500, temp_start=1.0, temp_end=0.01):
+        current = initial[:]
+        current_score = fitness_global(current)
+        best = current[:]
+        best_score = current_score
+        for s in range(steps):
+            t = temp_start * (temp_end / temp_start) ** (s / steps)
+            # Perturba: troca um jogo da carteira por um novo aleatório
+            idx = random.randint(0, len(current)-1)
+            new_game = self.generator.generate_random()
+            new_port = current[:]
+            new_port[idx] = new_game
+            new_score = fitness_global(new_port)
+            delta = new_score - current_score
+            if delta > 0 or random.random() < np.exp(delta / t):
+                current = new_port
+                current_score = new_score
+                if current_score > best_score:
+                    best = current[:]
+                    best_score = current_score
+        return best
+    def optimize(self, n_games=5, n_candidates=5000, fixed=None, ranges=None, use_dpp=True, use_annealing=True):
+        # Gerar pool
+        pool = self.generate_pool(n_candidates, fixed, ranges)
+        if len(pool) < n_games:
+            return pool
+        # DPP ou Pair Covering
+        if use_dpp and len(pool) >= n_games:
+            portfolio = dpp_sample(pool, kernel_similarity, n_games)
+        else:
+            portfolio = self.select_pair_covering(pool, n_games)
+        # Simulated Annealing
+        if use_annealing:
+            portfolio = self.simulated_annealing(portfolio)
+        # Ordenar por distância de Mahalanobis (menor = mais típico)
+        if self.mahalanobis is not None:
+            portfolio = sorted(portfolio, key=lambda g: self.mahalanobis.distance(g))
+        return portfolio[:n_games]
     def backtest(self, portfolio, test_draws):
         n_success = total_premio = 0
         total_custo = len(portfolio) * len(test_draws) * CUSTO_APOSTA
@@ -165,11 +366,12 @@ class PortfolioOptimizer:
         hit_counts = {k:0 for k in range(4,7)}
         for draw in test_draws:
             dm = BITMASK_CACHE.get_mask(draw['dezenas'])
+            premio_concurso = self.premios.get(draw['concurso'], PREMIO_FALLBACK)
             for pm in portfolio_masks:
                 hits = mask_intersection(pm, dm)
                 if hits >= 4:
                     n_success += 1
-                    total_premio += PREMIO_VALORES.get(hits, 0)
+                    total_premio += premio_concurso.get(hits, 0)
                     hit_counts[hits] += 1
         prob = n_success/(len(portfolio)*len(test_draws)) if test_draws else 0
         p_single = sum(hypergeom.pmf(k, 60, 6, 6) for k in range(4,7))
@@ -179,7 +381,7 @@ class PortfolioOptimizer:
         return {'lift': lift, 'roi': roi, 'hit_distribution': hit_counts}
 
 # ============================================================
-# RANKING DE PODER PREDITIVO (MEGA‑SENA)
+# RANKING DE PODER PREDITIVO
 # ============================================================
 class PredictiveRanking:
     def __init__(self, contests):
@@ -266,7 +468,7 @@ def test_concurso_a_concurso(contests, min_history=200):
         print(f"   {filtro:<12}: reversão={acc_rev:.1f}% tendência={acc_tend:.1f}%")
 
 # ============================================================
-# STRUCTURAL PREDICTOR
+# STRUCTURAL PREDICTOR (COM IPE)
 # ============================================================
 class StructuralPredictor:
     def __init__(self, contests):
@@ -280,14 +482,27 @@ class StructuralPredictor:
                 recent = series[-50:] if len(series)>=50 else series
                 low = int(np.percentile(recent, 25))
                 high = int(np.percentile(recent, 75))
-                ranges[filtro] = (low, high)
-                print(f"   {filtro:<12}: [{low}, {high}]")
+            elif method == 'ipe':
+                short = np.mean(series[-20:]) if len(series)>=20 else np.mean(series)
+                long = np.mean(series[-200:]) if len(series)>=200 else np.mean(series)
+                ipe = (short - long) / long * 100 if long > 0 else 0
+                center = int(round(short))
+                if ipe > 10:
+                    low, high = center, center  # muito quente, espera-se queda
+                elif ipe < -10:
+                    low, high = center, center  # muito frio, espera-se alta
+                else:
+                    low, high = center - 1, center + 1
+            else:
+                low, high = 0, 60
+            ranges[filtro] = (max(0, low), min(60, high))
+            print(f"   {filtro:<12}: [{ranges[filtro][0]}, {ranges[filtro][1]}]")
         return ranges
 
 # ============================================================
-# WALK‑FORWARD DO STRUCTURAL PREDICTOR
+# WALK‑FORWARD (USA RANGES DO PREDICTOR)
 # ============================================================
-def walk_forward_structural(contests, train_size=TRAIN_SIZE, test_size=TEST_SIZE, step=STEP):
+def walk_forward_structural(contests, train_size=TRAIN_SIZE, test_size=TEST_SIZE, step=STEP, premios=None):
     print(f"\n🔬 WALK‑FORWARD (treino={train_size}, teste={test_size}, passo={step})")
     results = []
     start = train_size
@@ -297,9 +512,8 @@ def walk_forward_structural(contests, train_size=TRAIN_SIZE, test_size=TEST_SIZE
         try:
             predictor = StructuralPredictor(train_data)
             ranges = predictor.predict_ranges(method='recent')
-            opt = PortfolioOptimizer(train_data)
-            pool = opt.generate_pool(5000)
-            portfolio = opt.select_pair_covering(pool, 5)
+            opt = PortfolioOptimizer(train_data, premios)
+            portfolio = opt.optimize(5, 3000, ranges=ranges, use_dpp=True, use_annealing=True)
             bt = opt.backtest(portfolio, test_data)
             results.append({'start':start, 'lift':bt['lift'], 'roi':bt['roi'],
                            '4pts':bt['hit_distribution'].get(4,0), '5pts':bt['hit_distribution'].get(5,0), '6pts':bt['hit_distribution'].get(6,0)})
@@ -314,7 +528,7 @@ def walk_forward_structural(contests, train_size=TRAIN_SIZE, test_size=TEST_SIZE
 # ============================================================
 # BUSCA OOS DE FIXAS
 # ============================================================
-def search_best_fixed_oos(contests, n_fixed=2, top_n=20, train_size=1500):
+def search_best_fixed_oos(contests, n_fixed=2, top_n=20, train_size=1500, premios=None):
     print(f"\n🔎 BUSCANDO MELHORES {n_fixed} FIXAS (OUT‑OF‑SAMPLE)")
     train_data = contests[:train_size]
     test_data = contests[train_size:]
@@ -326,7 +540,7 @@ def search_best_fixed_oos(contests, n_fixed=2, top_n=20, train_size=1500):
     candidates.sort(key=lambda x: x[1], reverse=True)
     results = []
     for fixed_tuple, freq in tqdm(candidates[:200], desc="Backtest OOS"):
-        opt = PortfolioOptimizer(train_data)
+        opt = PortfolioOptimizer(train_data, premios)
         pool = opt.generate_pool(3000, fixed=list(fixed_tuple))
         portfolio = opt.select_pair_covering(pool, 5)
         bt = opt.backtest(portfolio, test_data)
@@ -338,15 +552,20 @@ def search_best_fixed_oos(contests, n_fixed=2, top_n=20, train_size=1500):
     return results
 
 # ============================================================
-# BUSCA OOS DE PARES
+# BUSCA OOS DE PARES (COM PRÉ‑FILTRO)
 # ============================================================
-def search_best_pairs_oos(contests, top_n=20, train_size=1500):
+def search_best_pairs_oos(contests, top_n=20, train_size=1500, premios=None):
     print(f"\n🔎 BUSCANDO MELHORES PARES (OUT‑OF‑SAMPLE)")
     train_data = contests[:train_size]
     test_data = contests[train_size:]
+    # Pré‑filtro: 200 pares mais frequentes no treino
+    freq_pairs = Counter()
+    for c in train_data:
+        freq_pairs.update(combinations(sorted(c['dezenas']), 2))
+    top_pairs = [pair for pair, _ in freq_pairs.most_common(200)]
     results = []
-    for pair in tqdm(combinations(range(1,61), 2), desc="Testando pares"):
-        opt = PortfolioOptimizer(train_data)
+    for pair in tqdm(top_pairs, desc="Testando pares"):
+        opt = PortfolioOptimizer(train_data, premios)
         pool = opt.generate_pool(3000, fixed=list(pair))
         portfolio = opt.select_pair_covering(pool, 5)
         bt = opt.backtest(portfolio, test_data)
@@ -358,7 +577,31 @@ def search_best_pairs_oos(contests, top_n=20, train_size=1500):
     return results
 
 # ============================================================
-# ANÁLISE DE CICLOS
+# BUSCA OOS DE TRINCAS (COM PRÉ‑FILTRO)
+# ============================================================
+def search_best_triples_oos(contests, top_n=20, train_size=1500, premios=None):
+    print(f"\n🔎 BUSCANDO MELHORES TRINCAS (OUT‑OF‑SAMPLE)")
+    train_data = contests[:train_size]
+    test_data = contests[train_size:]
+    freq_triples = Counter()
+    for c in train_data:
+        freq_triples.update(combinations(sorted(c['dezenas']), 3))
+    top_triples = [trip for trip, _ in freq_triples.most_common(200)]
+    results = []
+    for trip in tqdm(top_triples, desc="Testando trincas"):
+        opt = PortfolioOptimizer(train_data, premios)
+        pool = opt.generate_pool(3000, fixed=list(trip))
+        portfolio = opt.select_pair_covering(pool, 5)
+        bt = opt.backtest(portfolio, test_data)
+        results.append({'triple':trip, 'lift':bt['lift'], 'roi':bt['roi']})
+    results.sort(key=lambda x: x['roi'], reverse=True)
+    print(f"\n🏆 TOP {top_n} TRINCAS POR ROI:")
+    for i, res in enumerate(results[:top_n], 1):
+        print(f"   {i}. {res['triple']} | ROI={res['roi']:+.1f}%")
+    return results
+
+# ============================================================
+# ANÁLISE DE CICLOS (COM PERCENTIS)
 # ============================================================
 def analyze_cycles(contests):
     print(f"\n🔄 ANÁLISE DE CICLOS DE COBERTURA")
@@ -370,7 +613,8 @@ def analyze_cycles(contests):
         ciclo_atual.append(c['concurso'])
         if seen == todas_dezenas:
             break
-    print(f"   Dezenas ainda não vistas no ciclo atual: {sorted(todas_dezenas - seen)}")
+    faltantes = sorted(todas_dezenas - seen)
+    print(f"   Dezenas ainda não vistas no ciclo atual ({len(faltantes)}): {faltantes[:10]}...")
     print(f"   Concursos desde o início do ciclo: {len(ciclo_atual)}")
     # Histórico de ciclos
     ciclos = []
@@ -384,27 +628,63 @@ def analyze_cycles(contests):
             seen = set()
             count = 0
     if ciclos:
-        print(f"   Ciclos históricos: média={np.mean(ciclos):.1f}, mediana={np.median(ciclos):.1f}, mín={min(ciclos)}, máx={max(ciclos)}")
+        c_arr = np.array(ciclos)
+        print(f"   Ciclos históricos: média={np.mean(c_arr):.1f}, mediana={np.median(c_arr):.1f}")
+        print(f"   Percentis: 25%={np.percentile(c_arr,25):.0f}, 50%={np.percentile(c_arr,50):.0f}, 75%={np.percentile(c_arr,75):.0f}, 90%={np.percentile(c_arr,90):.0f}")
+        print(f"   Ciclo atual ({len(ciclo_atual)}): percentil {np.mean(c_arr <= len(ciclo_atual))*100:.0f}%")
     return ciclos
+
+# ============================================================
+# MONTE CARLO PARA CARTEIRAS
+# ============================================================
+def monte_carlo_portfolio(contests, n_sim=500, premios=None):
+    print(f"\n🎲 MONTE CARLO DE CARTEIRAS ({n_sim} simulações)")
+    opt = PortfolioOptimizer(contests, premios)
+    # Carteira do modelo
+    portfolio_modelo = opt.optimize(5, 5000, use_dpp=True, use_annealing=True)
+    bt_modelo = opt.backtest(portfolio_modelo, contests[-200:])
+    # Carteiras aleatórias
+    rois_aleatorios = []
+    for _ in tqdm(range(n_sim), desc="Simulando carteiras aleatórias"):
+        rand_port = [opt.generator.generate_random() for _ in range(5)]
+        bt_rand = opt.backtest(rand_port, contests[-200:])
+        rois_aleatorios.append(bt_rand['roi'])
+    rois_aleatorios = np.array(rois_aleatorios)
+    mean_rand = np.mean(rois_aleatorios)
+    std_rand = np.std(rois_aleatorios)
+    z_score = (bt_modelo['roi'] - mean_rand) / std_rand if std_rand > 0 else 0
+    pct = np.mean(rois_aleatorios <= bt_modelo['roi']) * 100
+    print(f"\n📊 RESULTADO:")
+    print(f"   ROI modelo: {bt_modelo['roi']:+.1f}%")
+    print(f"   ROI médio aleatório: {mean_rand:+.1f}%")
+    print(f"   Z‑score: {z_score:+.2f}")
+    print(f"   Percentil: {pct:.1f}%")
+    if z_score > 2.0:
+        print(f"   🔍 Carteira significativamente superior ao acaso!")
+    else:
+        print(f"   📊 Carteira não supera significativamente o aleatório.")
 
 # ============================================================
 # INTERFACE PRINCIPAL
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 MEGA‑SENA LAB v1.0")
-    print("   LABORATÓRIO ESTATÍSTICO + OTIMIZAÇÃO COMBINATÓRIA")
+    print("🔬 MEGA‑SENA LAB v2.0")
+    print("   LABORATÓRIO ESTATÍSTICO + OTIMIZAÇÃO COMBINATÓRIA COMPLETO")
     print("="*70)
-    contests = load_megasena('megasena.csv')
+    contests = load_megasena('resultados_megasena.csv')
     if not contests:
         print("❌ Nenhum concurso disponível.")
         return
+    premios = load_premios('premios_megasena.csv')
     print(f"\n📂 {len(contests)} concursos")
     print(f"📌 Último: {contests[-1]['concurso']} - {contests[-1]['dezenas']}")
 
     while True:
-        print("\nOpções:")
-        print("1. Gerar carteira otimizada (Pair Covering)")
+        print("\n" + "="*70)
+        print("MENU PRINCIPAL")
+        print("="*70)
+        print("1. Gerar carteira otimizada (Mahalanobis + DPP + Annealing + Fitness)")
         print("2. Backtest nos últimos 200 concursos")
         print("3. Ranking de poder preditivo")
         print("4. Controle Monte Carlo")
@@ -413,16 +693,17 @@ def main():
         print("7. Walk‑Forward do Structural Predictor")
         print("8. Buscar melhores fixas (OOS)")
         print("9. Buscar melhores pares (OOS)")
-        print("10. Análise de ciclos de cobertura")
+        print("10. Buscar melhores trincas (OOS)")
+        print("11. Análise de ciclos de cobertura")
+        print("12. Monte Carlo de carteiras")
         print("0. Sair")
         op = input("Escolha: ").strip()
 
         if op == '1':
             fixed_str = input("\n   Dezenas fixas (ex: 10,25,45 ou ENTER): ").strip()
             fixed = [int(x) for x in fixed_str.split(',')] if fixed_str else []
-            opt = PortfolioOptimizer(contests)
-            pool = opt.generate_pool(10000, fixed=fixed if fixed else None)
-            portfolio = opt.select_pair_covering(pool, 5)
+            opt = PortfolioOptimizer(contests, premios)
+            portfolio = opt.optimize(5, 5000, fixed=fixed if fixed else None, use_dpp=True, use_annealing=True)
             for i, g in enumerate(portfolio, 1):
                 p = sum(1 for x in g if x%2==0)
                 pr = sum(1 for x in g if x in PRIMES)
@@ -430,51 +711,44 @@ def main():
             if len(contests) > 200:
                 bt = opt.backtest(portfolio, contests[-200:])
                 print(f"\n🔬 BACKTEST (200): Lift={bt['lift']:.2f}x | ROI={bt['roi']:+.1f}%")
-
         elif op == '2':
-            opt = PortfolioOptimizer(contests)
-            pool = opt.generate_pool(10000)
-            portfolio = opt.select_pair_covering(pool, 5)
+            opt = PortfolioOptimizer(contests, premios)
+            portfolio = opt.optimize(5, 5000, use_dpp=True, use_annealing=True)
             bt = opt.backtest(portfolio, contests[-200:])
             print(f"\n🔬 BACKTEST (200): Lift={bt['lift']:.2f}x | ROI={bt['roi']:+.1f}%")
             print(f"   4pts={bt['hit_distribution'].get(4,0)} 5pts={bt['hit_distribution'].get(5,0)} 6pts={bt['hit_distribution'].get(6,0)}")
-
         elif op == '3':
             blocos_str = input("\n   Blocos (ex: 50,100,200) [50,100,200]: ").strip()
             try: block_sizes = [int(x) for x in blocos_str.split(',')] if blocos_str else [50,100,200]
             except: block_sizes = [50,100,200]
             PredictiveRanking(contests).rank_predictive_power(block_sizes)
-
         elif op == '4':
             try: n_sim = int(input("\n   Simulações [50]: ").strip() or "50")
             except: n_sim = 50
             monte_carlo_control(contests, n_sim)
-
         elif op == '5':
             try: min_hist = int(input("\n   Histórico mínimo [200]: ").strip() or "200")
             except: min_hist = 200
             test_concurso_a_concurso(contests, min_hist)
-
         elif op == '6':
             print("\n   Método: 1. Recente  2. IPE")
             metodo = input("   Escolha [1]: ").strip() or "1"
             method = 'recent' if metodo == '1' else 'ipe'
             StructuralPredictor(contests).predict_ranges(method=method)
-
         elif op == '7':
-            walk_forward_structural(contests)
-
+            walk_forward_structural(contests, premios=premios)
         elif op == '8':
             try: n_fixed = int(input("\n   Quantas fixas (1,2,3): ").strip())
             except: n_fixed = 2
-            search_best_fixed_oos(contests, n_fixed)
-
+            search_best_fixed_oos(contests, n_fixed, premios=premios)
         elif op == '9':
-            search_best_pairs_oos(contests)
-
+            search_best_pairs_oos(contests, premios=premios)
         elif op == '10':
+            search_best_triples_oos(contests, premios=premios)
+        elif op == '11':
             analyze_cycles(contests)
-
+        elif op == '12':
+            monte_carlo_portfolio(contests, premios=premios)
         elif op == '0':
             break
         else:
