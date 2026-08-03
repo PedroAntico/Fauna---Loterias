@@ -3,7 +3,7 @@
 
 """
 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v48.1
-CORREÇÃO: import random + exibição do p-global e marcação corrigidos
+CORREÇÃO: import random + exibição do p-global e marcação corrigidos + loop da MC corrigido
 
 EVOLUÇÃO DO v47:
 ✅ Correção de leakage no cálculo das médias (rank_predictive_power e test_concurso_a_concurso)
@@ -12,6 +12,7 @@ EVOLUÇÃO DO v47:
 ✅ Número de simulações padrão aumentado para 1000 (opção 10)
 ✅ Import do módulo random restaurado (corrige NameError nas opções de geração de carteira)
 ✅ Exibição aprimorada do p-global e destaque apenas da chave vencedora
+✅ Correção do loop da MC que tentava subtrair dicionário de float
 ✅ Mantém cobertura, busca OOS, fixas, semifixas
 """
 
@@ -429,7 +430,7 @@ class PredictiveRanking:
         return None
 
 # ============================================================
-# CONTROLE MONTE CARLO COM CORREÇÃO FWER
+# CONTROLE MONTE CARLO COM CORREÇÃO FWER (CORRIGIDO)
 # ============================================================
 def monte_carlo_control(contests, n_simulations=1000, block_sizes=None):
     """
@@ -482,8 +483,9 @@ def monte_carlo_control(contests, n_simulations=1000, block_sizes=None):
     print(f"{'Filtro':<15} {'Estratégia':<12} {'Bloco':<8} {'Real':<10} {'MC Médio':<10} {'MC Std':<10} {'Diferença':<10} {'p (MC)':<10}")
     print("-" * 90)
     
-    for key, real_acc in sorted(real_results.items(), key=lambda x: x[1]['accuracy'], reverse=True):
+    for key, res_dict in sorted(real_results.items(), key=lambda x: x[1]['accuracy'], reverse=True):
         filtro, strategy, block_size = key
+        real_acc = res_dict['accuracy']  # CORREÇÃO AQUI: extrai o float
         sim_accs = sim_accuracies_by_key.get(key, [])
         if not sim_accs:
             continue
@@ -491,9 +493,13 @@ def monte_carlo_control(contests, n_simulations=1000, block_sizes=None):
         std_sim = np.std(sim_accs)
         diff = real_acc - mean_sim
         p_emp = np.mean(np.array(sim_accs) >= real_acc)
+        if p_emp == 0.0:
+            p_emp_str = f"<{1.0/len(sim_accs):.4f}"
+        else:
+            p_emp_str = f"{p_emp:.4f}"
         # Destaca apenas a linha do melhor resultado global
         marker = " 🏆" if key == real_max_key else ""
-        print(f"{filtro:<15} {strategy:<12} {block_size:<8} {real_acc:<10.1f}% {mean_sim:<10.1f}% {std_sim:<10.1f} {diff:<10.1f}% {p_emp:<10.4f}{marker}")
+        print(f"{filtro:<15} {strategy:<12} {block_size:<8} {real_acc:<10.1f}% {mean_sim:<10.1f}% {std_sim:<10.1f} {diff:<10.1f}% {p_emp_str:<10}{marker}")
     
     print(f"\n🌟 Melhor resultado real: {real_max_key} com acurácia de {real_max_acc:.1f}%")
     print(f"   p‑global (corrigido para múltiplas comparações): {p_global_str}")
