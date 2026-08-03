@@ -2,20 +2,22 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v47
-CONTROLE MONTE CARLO + TESTE CONCURSO A CONCURSO + WALK‑FORWARD DO PREDITOR
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v48.1
+CORREÇÃO: import random + exibição do p-global e marcação corrigidos
 
-EVOLUÇÃO DO v46:
-✅ Opção 10: Controle Monte Carlo (baseline aleatório)
-✅ Opção 11: Teste preditivo concurso a concurso
-✅ Opção 12: Walk‑forward do Structural Predictor
-✅ Ranking com comparação real vs. simulado
+EVOLUÇÃO DO v47:
+✅ Correção de leakage no cálculo das médias (rank_predictive_power e test_concurso_a_concurso)
+✅ Controle Monte Carlo com correção de múltiplas comparações (máximo global)
+✅ Supressão de saída durante as simulações Monte Carlo
+✅ Número de simulações padrão aumentado para 1000 (opção 10)
+✅ Import do módulo random restaurado (corrige NameError nas opções de geração de carteira)
+✅ Exibição aprimorada do p-global e destaque apenas da chave vencedora
 ✅ Mantém cobertura, busca OOS, fixas, semifixas
 """
 
 import numpy as np
-from scipy.stats import hypergeom, wilcoxon, binomtest
-from collections import Counter, defaultdict
+from scipy.stats import hypergeom, binomtest
+from collections import defaultdict
 from itertools import combinations
 import os, random, time, warnings
 from math import comb
@@ -329,8 +331,8 @@ class PredictiveRanking:
     def __init__(self, contests):
         self.contests = contests
     
-    def rank_predictive_power(self, block_sizes=None):
-        """Testa reversão e tendência para múltiplos tamanhos de bloco."""
+    def rank_predictive_power(self, block_sizes=None, verbose=True):
+        """Testa reversão e tendência com histórico excluindo o bloco corrente."""
         if block_sizes is None:
             block_sizes = [50, 100, 200, 500]
         
@@ -338,9 +340,10 @@ class PredictiveRanking:
         all_results = {}
         
         for block_size in block_sizes:
-            print(f"\n📊 BLOCOS DE {block_size} CONCURSOS")
-            print(f"{'Filtro':<15} {'Estratégia':<12} {'Precisão':<10} {'Acertos':<10} {'p-value':<10}")
-            print("-" * 60)
+            if verbose:
+                print(f"\n📊 BLOCOS DE {block_size} CONCURSOS")
+                print(f"{'Filtro':<15} {'Estratégia':<12} {'Precisão':<10} {'Acertos':<10} {'p-value':<10}")
+                print("-" * 60)
             
             for filtro in filters:
                 series = np.array([extract_filter(c['dezenas'], filtro) for c in self.contests], dtype=float)
@@ -349,18 +352,18 @@ class PredictiveRanking:
                 if n_blocos < 3:
                     continue
                 
-                blocos = []
-                for i in range(n_blocos):
-                    blocos.append(series[i*block_size:(i+1)*block_size])
+                blocos = [series[i*block_size:(i+1)*block_size] for i in range(n_blocos)]
                 
                 for strategy in ['reversao', 'tendencia']:
                     acertos = 0
                     total_testes = 0
                     
-                    for i in range(1, len(blocos)):
+                    # Começa no bloco 2 para ter pelo menos um bloco de histórico antes do bloco anterior
+                    for i in range(2, len(blocos)):
                         mean_prev = np.mean(blocos[i-1])
                         mean_curr = np.mean(blocos[i])
-                        historical_mean = np.mean(series[:i*block_size])
+                        # histórico exclui os blocos i-1 e i (até i-2)
+                        historical_mean = np.mean(series[:(i-1)*block_size]) if (i-1)*block_size > 0 else mean_prev
                         
                         total_testes += 1
                         
@@ -383,8 +386,9 @@ class PredictiveRanking:
                         'accuracy': accuracy, 'acertos': acertos, 'total': total_testes, 'p_value': p_value
                     }
                     
-                    sig = "🔍" if p_value < 0.05 else ("📊" if p_value < 0.15 else "  ")
-                    print(f"{filtro:<15} {strategy:<12} {accuracy:<10.1f}% {acertos}/{total_testes:<10} {p_value:<10.4f} {sig}")
+                    if verbose:
+                        sig = "🔍" if p_value < 0.05 else ("📊" if p_value < 0.15 else "  ")
+                        print(f"{filtro:<15} {strategy:<12} {accuracy:<10.1f}% {acertos}/{total_testes:<10} {p_value:<10.4f} {sig}")
         
         return all_results
     
@@ -405,10 +409,10 @@ class PredictiveRanking:
                 blocos = [series[i*block_size:(i+1)*block_size] for i in range(n_blocos)]
                 acertos = 0
                 total = 0
-                for i in range(1, len(blocos)):
+                for i in range(2, len(blocos)):
                     freq_prev = np.mean(blocos[i-1])
                     freq_curr = np.mean(blocos[i])
-                    freq_hist = np.mean(series[:i*block_size])
+                    freq_hist = np.mean(series[:(i-1)*block_size]) if (i-1)*block_size > 0 else freq_prev
                     total += 1
                     if freq_prev > freq_hist and freq_curr < freq_prev:
                         acertos += 1
@@ -425,86 +429,92 @@ class PredictiveRanking:
         return None
 
 # ============================================================
-# CONTROLE MONTE CARLO (NOVO v47)
+# CONTROLE MONTE CARLO COM CORREÇÃO FWER
 # ============================================================
-def monte_carlo_control(contests, n_simulations=100, block_sizes=None):
+def monte_carlo_control(contests, n_simulations=1000, block_sizes=None):
     """
-    Gera n_simulations séries aleatórias de mesmo tamanho que contests,
-    executa o ranking de poder preditivo e compara com o resultado real.
+    Gera n_simulations séries aleatórias e controla FWER usando o máximo global.
     """
     if block_sizes is None:
         block_sizes = [50, 100, 200]
     
     n_concursos = len(contests)
-    print(f"\n🎲 CONTROLE MONTE CARLO")
+    print(f"\n🎲 CONTROLE MONTE CARLO (FWER corrigido)")
     print(f"   Simulações: {n_simulations}")
-    print(f"   Cada simulação: {n_concursos} concursos puramente aleatórios")
     print(f"   Blocos testados: {block_sizes}\n")
     
-    # Executar no dataset real primeiro
+    # Executar no dataset real primeiro (verbose=False para não poluir)
     ranker_real = PredictiveRanking(contests)
-    real_results = ranker_real.rank_predictive_power(block_sizes)
+    real_results = ranker_real.rank_predictive_power(block_sizes, verbose=False)
     
-    # Agregar resultados reais por bloco e estratégia
-    real_summary = {}
-    for (filtro, strategy, block_size), res in real_results.items():
-        key = (filtro, strategy, block_size)
-        real_summary[key] = res['accuracy']
+    # Estatística de interesse: máxima acurácia observada
+    real_max_acc = max(res['accuracy'] for res in real_results.values())
+    real_max_key = max(real_results, key=lambda k: real_results[k]['accuracy'])
     
-    # Executar nas simulações
-    sim_accuracies = defaultdict(list)
+    # Executar nas simulações (silencioso)
+    sim_max_accs = []
+    sim_accuracies_by_key = defaultdict(list)
     
-    for sim in tqdm(range(n_simulations), desc="Simulações Monte Carlo"):
-        # Gerar concursos aleatórios
+    for _ in tqdm(range(n_simulations), desc="Simulações Monte Carlo"):
         sim_contests = []
         for _ in range(n_concursos):
             sim_contests.append({'dezenas': sorted(np.random.choice(range(1, 26), 15, replace=False))})
-        
         ranker_sim = PredictiveRanking(sim_contests)
-        sim_results = ranker_sim.rank_predictive_power(block_sizes)
+        sim_results = ranker_sim.rank_predictive_power(block_sizes, verbose=False)
+        
+        # Máximo dessa simulação
+        sim_max = max(res['accuracy'] for res in sim_results.values())
+        sim_max_accs.append(sim_max)
         
         for (filtro, strategy, block_size), res in sim_results.items():
             key = (filtro, strategy, block_size)
-            sim_accuracies[key].append(res['accuracy'])
+            sim_accuracies_by_key[key].append(res['accuracy'])
     
-    # Comparar
-    print(f"\n📊 COMPARAÇÃO REAL vs. MONTE CARLO:")
-    print(f"{'Filtro':<15} {'Estratégia':<12} {'Bloco':<8} {'Real':<10} {'MC Médio':<10} {'MC Std':<10} {'Diferença':<10} {'p-value':<10}")
+    # p-global: fração de simulações cujo máximo >= real_max
+    p_global = np.mean(np.array(sim_max_accs) >= real_max_acc)
+    if p_global == 0.0:
+        p_global_str = f"<{1.0/n_simulations:.4f}"
+    else:
+        p_global_str = f"{p_global:.4f}"
+    
+    # Exibir resultado real com p-value individual
+    print(f"\n📊 COMPARAÇÃO REAL vs. MONTE CARLO (resultados individuais)")
+    print(f"{'Filtro':<15} {'Estratégia':<12} {'Bloco':<8} {'Real':<10} {'MC Médio':<10} {'MC Std':<10} {'Diferença':<10} {'p (MC)':<10}")
     print("-" * 90)
     
-    for key, real_acc in sorted(real_summary.items(), key=lambda x: x[1], reverse=True):
+    for key, real_acc in sorted(real_results.items(), key=lambda x: x[1]['accuracy'], reverse=True):
         filtro, strategy, block_size = key
-        sim_accs = sim_accuracies.get(key, [])
+        sim_accs = sim_accuracies_by_key.get(key, [])
         if not sim_accs:
             continue
-        
         mean_sim = np.mean(sim_accs)
         std_sim = np.std(sim_accs)
         diff = real_acc - mean_sim
-        
-        # p-value empírico: quantas simulações superaram o real?
         p_emp = np.mean(np.array(sim_accs) >= real_acc)
-        
-        sig = "🔍" if p_emp < 0.05 else ""
-        print(f"{filtro:<15} {strategy:<12} {block_size:<8} {real_acc:<10.1f}% {mean_sim:<10.1f}% {std_sim:<10.1f} {diff:<10.1f}% {p_emp:<10.4f} {sig}")
+        # Destaca apenas a linha do melhor resultado global
+        marker = " 🏆" if key == real_max_key else ""
+        print(f"{filtro:<15} {strategy:<12} {block_size:<8} {real_acc:<10.1f}% {mean_sim:<10.1f}% {std_sim:<10.1f} {diff:<10.1f}% {p_emp:<10.4f}{marker}")
     
-    print(f"\n🔍 Interpretação:")
-    print(f"   Se 'Diferença' for pequena e p-value > 0.05, o resultado real é compatível com aleatoriedade.")
-    print(f"   Se 'Diferença' for grande e p-value < 0.05, há evidência de sinal preditivo genuíno.")
+    print(f"\n🌟 Melhor resultado real: {real_max_key} com acurácia de {real_max_acc:.1f}%")
+    print(f"   p‑global (corrigido para múltiplas comparações): {p_global_str}")
+    if p_global < 0.05:
+        print("   ✅ Evidência de sinal preditivo genuíno (p < 0.05)")
+    else:
+        print("   ❌ Não há evidência significativa — resultado compatível com aleatoriedade")
     
-    return real_summary, sim_accuracies
+    return real_results, sim_accuracies_by_key
 
 # ============================================================
-# TESTE CONCURSO A CONCURSO (NOVO v47)
+# TESTE CONCURSO A CONCURSO (CORRIGIDO)
 # ============================================================
 def test_concurso_a_concurso(contests, min_history=200):
     """
-    Para cada concurso a partir de min_history, usa o histórico anterior
-    para prever o próximo concurso (apenas 1) e verifica se acertou.
+    Para cada concurso a partir de min_history, usa o histórico ATÉ O CONCURSO ANTERIOR
+    (sem incluir o valor atual) para prever a direção da mudança.
     """
-    print(f"\n🎯 TESTE CONCURSO A CONCURSO")
+    print(f"\n🎯 TESTE CONCURSO A CONCURSO (vazamento corrigido)")
     print(f"   Histórico mínimo: {min_history}")
-    print(f"   Testes: {len(contests) - min_history - 1} previsões\n")
+    print(f"   Testes: até {len(contests) - min_history - 1} previsões\n")
     
     filters = ['pares', 'moldura', 'primos', 'consecutivos', 'amplitude']
     
@@ -516,11 +526,14 @@ def test_concurso_a_concurso(contests, min_history=200):
         total = 0
         
         for t in range(min_history, len(contests) - 1):
-            history = series[:t+1]
             current_val = series[t]
             next_val = series[t+1]
+            history = series[:t]   # valores até t-1, excluindo t
             
-            mean_short = np.mean(history[-20:]) if len(history) >= 20 else np.mean(history)
+            if len(history) < 20:  # mínimo para média curta
+                continue
+            
+            mean_short = np.mean(history[-20:])
             mean_long = np.mean(history)
             
             total += 1
@@ -595,13 +608,9 @@ class StructuralPredictor:
         return ranges
 
 # ============================================================
-# WALK‑FORWARD DO STRUCTURAL PREDICTOR (NOVO v47)
+# WALK‑FORWARD DO STRUCTURAL PREDICTOR
 # ============================================================
 def walk_forward_structural(contests, train_size=500, test_size=50, step=50):
-    """
-    Walk‑forward usando o Structural Predictor para gerar faixas
-    e otimizar a carteira.
-    """
     print(f"\n🔬 WALK‑FORWARD DO STRUCTURAL PREDICTOR")
     print(f"   Treino: {train_size}, Teste: {test_size}, Passo: {step}")
     
@@ -611,11 +620,9 @@ def walk_forward_structural(contests, train_size=500, test_size=50, step=50):
         train_data = contests[start-train_size:start]
         test_data = contests[start:start+test_size]
         
-        # Usar o Structural Predictor no treino
         predictor = StructuralPredictor(train_data)
         ranges = predictor.predict_ranges(method='recent')
         
-        # Gerar carteira
         opt = PortfolioOptimizer(train_data,
                                  range_pares=ranges.get('pares'),
                                  range_moldura=ranges.get('moldura'),
@@ -652,7 +659,7 @@ def walk_forward_structural(contests, train_size=500, test_size=50, step=50):
     return results
 
 # ============================================================
-# BUSCA OOS E COMPARAÇÕES (mantidas)
+# BUSCA OOS E COMPARAÇÕES
 # ============================================================
 def search_best_fixed_oos(contests, n_fixed=3, top_n=20, train_size=3500, n_games=5, n_candidates=10000, method='pair_covering'):
     print(f"\n🔎 BUSCANDO MELHORES {n_fixed} FIXAS (OUT-OF-SAMPLE)")
@@ -702,8 +709,8 @@ def compare_trincas(contests, trinca1, trinca2, n_games=5, n_candidates=50000, m
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v47")
-    print("   MONTE CARLO + CONCURSO A CONCURSO + WALK‑FORWARD ESTRUTURAL")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v48.1")
+    print("   MONTE CARLO CORRIGIDO + WALK‑FORWARD ESTRUTURAL")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
@@ -723,8 +730,8 @@ def main():
         print("7. Poder preditivo das 25 dezenas")
         print("8. Structural Predictor (previsão de faixas)")
         print("9. Gerar carteira com previsões estruturais")
-        print("10. Controle Monte Carlo (baseline aleatório)")
-        print("11. Teste preditivo concurso a concurso")
+        print("10. Controle Monte Carlo (FWER corrigido)")
+        print("11. Teste preditivo concurso a concurso (corrigido)")
         print("12. Walk‑forward do Structural Predictor")
         print("0. Sair")
         op = input("Escolha: ").strip()
@@ -790,7 +797,6 @@ def main():
             metodo = input("   Método [1. Pair, 2. Triple]: ").strip() or "1"
             method = 'pair_covering' if metodo == '1' else 'triple_covering'
             
-            # Walk‑forward simples
             results = []
             for w in range(8):
                 test_end = len(contests) - w * 50
@@ -890,8 +896,8 @@ def main():
         
         elif op == '10':
             try:
-                n_sim = int(input("\n   Número de simulações [100]: ").strip() or "100")
-            except: n_sim = 100
+                n_sim = int(input("\n   Número de simulações [1000]: ").strip() or "1000")
+            except: n_sim = 1000
             blocos_str = input("   Blocos (ex: 50,100,200) [50,100,200]: ").strip()
             try:
                 block_sizes = [int(x) for x in blocos_str.split(',')] if blocos_str else [50, 100, 200]
