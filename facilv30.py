@@ -2,14 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v48.2
-+ EXCLUSÃO DE DEZENAS EM TODAS AS CARTEIRAS
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v48.3
+CORREÇÃO: exclusão agora remove dezenas também das semifixas (e fixas, se houver sobreposição)
 
-EVOLUÇÃO DO v48.1:
-✅ Exclusão de dezenas adicionada ao gerador (LooseGenerator) e ao PortfolioOptimizer
-✅ Menu atualizado: opções 1, 2, 3, 9 e 12 agora permitem excluir dezenas
-✅ Correção do loop da Monte Carlo (real_acc agora é extraído corretamente)
-✅ Mantém todas as correções estatísticas anteriores (leakage, FWER, Monte Carlo)
+EVOLUÇÃO DO v48.2:
+✅ Excluídas removidas de fixas, semifixas e restantes no gerador
+✅ Aviso no PortfolioOptimizer quando houver sobreposição com fixas/semifixas
+✅ Mantém todas as correções estatísticas anteriores
 """
 
 import numpy as np
@@ -103,11 +102,12 @@ class LooseGenerator:
         if semifixed is None: semifixed = []
         if excluded is None: excluded = []
         
-        fixed_set = set(fixed)
-        semifixed_set = set(semifixed) - fixed_set
-        excluded_set = set(excluded)  # <-- NOVO
+        excluded_set = set(excluded)
         
-        # Proibidas incluem fixas, semifixas e excluídas
+        # Remove excluídas das fixas e semifixas (evita que apareçam)
+        fixed_set = set(fixed) - excluded_set
+        semifixed_set = set(semifixed) - fixed_set - excluded_set
+        
         proibidas = fixed_set | semifixed_set | excluded_set
         
         todas = set(range(1, 26))
@@ -194,9 +194,22 @@ class PortfolioOptimizer:
                  range_soma=None, range_amplitude=None, range_consecutivos=None):
         self.contests = contests
         self.generator = LooseGenerator()
+        self.excluded = excluded if excluded else []
+        
+        # Tratamento de sobreposição com fixas e semifixas
+        excl_set = set(self.excluded)
         self.fixed = fixed if fixed else []
+        if excl_set & set(self.fixed):
+            removidas_fixas = excl_set & set(self.fixed)
+            print(f"⚠️ Dezenas fixas também excluídas; removendo das fixas: {sorted(removidas_fixas)}")
+            self.fixed = [d for d in self.fixed if d not in excl_set]
+        
         self.semifixed = semifixed if semifixed else []
-        self.excluded = excluded if excluded else []  # <-- NOVO
+        if excl_set & set(self.semifixed):
+            removidas_semi = excl_set & set(self.semifixed)
+            print(f"⚠️ Dezenas semifixas também excluídas; removendo das semifixas: {sorted(removidas_semi)}")
+            self.semifixed = [d for d in self.semifixed if d not in excl_set]
+        
         self.min_semifixed = min_semifixed
         self.max_semifixed = max_semifixed
         self.allowed_pares = allowed_pares
@@ -219,7 +232,7 @@ class PortfolioOptimizer:
                     semifixed=self.semifixed,
                     min_semifixed=self.min_semifixed,
                     max_semifixed=self.max_semifixed,
-                    excluded=self.excluded,  # <-- NOVO
+                    excluded=self.excluded,
                     allowed_pares=self.allowed_pares,
                     allowed_moldura=self.allowed_moldura,
                     allowed_primos=self.allowed_primos,
@@ -272,7 +285,7 @@ class PortfolioOptimizer:
         if self.fixed: print(f"   Fixas: {self.fixed}")
         if self.semifixed: print( f"   Semifixas: {self.semifixed} "
                                  f"(mín={self.min_semifixed}, máx={self.max_semifixed})" )
-        if self.excluded: print(f"   Excluídas: {self.excluded}")  # <-- NOVO
+        if self.excluded: print(f"   Excluídas: {self.excluded}")
         if self.range_pares: print(f"   Pares: {self.range_pares}")
         if self.range_moldura: print(f"   Moldura: {self.range_moldura}")
         if self.range_primos: print(f"   Primos: {self.range_primos}")
@@ -635,7 +648,7 @@ def walk_forward_structural(contests, train_size=500, test_size=50, step=50, exc
         ranges = predictor.predict_ranges(method='recent')
         
         opt = PortfolioOptimizer(train_data,
-                                 excluded=excluded,  # <-- NOVO
+                                 excluded=excluded,
                                  range_pares=ranges.get('pares'),
                                  range_moldura=ranges.get('moldura'),
                                  range_primos=ranges.get('primos'),
@@ -727,7 +740,7 @@ def compare_trincas(contests, trinca1, trinca2, n_games=5, n_candidates=50000, m
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v48.2")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v48.3")
     print("   MONTE CARLO CORRIGIDO + WALK‑FORWARD ESTRUTURAL + EXCLUSÃO")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
@@ -762,7 +775,6 @@ def main():
                 "   Dezenas semifixas (ex: 03 07 14 25 ou ENTER): ").strip()
             semifixed = [int(x) for x in semifixed_str.split()] if semifixed_str else []
             
-            # NOVO: exclusão de dezenas
             excl_str = input("   Dezenas excluídas (ex: 04 18 22 ou ENTER): ").strip()
             excluded = [int(x) for x in excl_str.split()] if excl_str else []
             
