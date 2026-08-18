@@ -968,8 +968,13 @@ def main():
         elif op == '9':
             predictor = StructuralPredictor(contests)
             ranges = predictor.predict_ranges(method='recent')
-            fixed = [10, 20, 30]  # sugestão ilustrativa
-            print(f"\n   Fixas sugeridas: {fixed}")
+            print("\n   Dezenas fixas sugeridas: 10 20 30")
+            fixed_str = input("   Digite as dezenas fixas (ex: 10 20 30) ou ENTER para usar a sugestão: ").strip()
+            if fixed_str:
+                fixed = [int(x) for x in fixed_str.split()]
+            else:
+                fixed = [10, 20, 30]   # sugestão padrão
+            print(f"   Fixas utilizadas: {fixed}")
             excl_str = input("   Excluídas (ENTER para pular): ").strip()
             excluded = [int(x) for x in excl_str.split()] if excl_str else []
             gerar = input("   Gerar carteira? (s/n): ").strip().lower()
