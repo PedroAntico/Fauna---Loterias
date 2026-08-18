@@ -2,18 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v48.1
-CORREÇÃO: import random + exibição do p-global e marcação corrigidos + loop da MC corrigido
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v48.2
++ EXCLUSÃO DE DEZENAS EM TODAS AS CARTEIRAS
 
-EVOLUÇÃO DO v47:
-✅ Correção de leakage no cálculo das médias (rank_predictive_power e test_concurso_a_concurso)
-✅ Controle Monte Carlo com correção de múltiplas comparações (máximo global)
-✅ Supressão de saída durante as simulações Monte Carlo
-✅ Número de simulações padrão aumentado para 1000 (opção 10)
-✅ Import do módulo random restaurado (corrige NameError nas opções de geração de carteira)
-✅ Exibição aprimorada do p-global e destaque apenas da chave vencedora
-✅ Correção do loop da MC que tentava subtrair dicionário de float
-✅ Mantém cobertura, busca OOS, fixas, semifixas
+EVOLUÇÃO DO v48.1:
+✅ Exclusão de dezenas adicionada ao gerador (LooseGenerator) e ao PortfolioOptimizer
+✅ Menu atualizado: opções 1, 2, 3, 9 e 12 agora permitem excluir dezenas
+✅ Correção do loop da Monte Carlo (real_acc agora é extraído corretamente)
+✅ Mantém todas as correções estatísticas anteriores (leakage, FWER, Monte Carlo)
 """
 
 import numpy as np
@@ -77,18 +73,20 @@ def load_all_contests(csv_file='resultados_lotofacil.csv'):
     return contests
 
 # ============================================================
-# GERADOR COM FIXAS, SEMIFIXAS E FAIXAS
+# GERADOR COM FIXAS, SEMIFIXAS, EXCLUSÕES E FAIXAS
 # ============================================================
 class LooseGenerator:
     def __init__(self):
         pass
 
     def generate_one(self, fixed=None, semifixed=None, min_semifixed=0, max_semifixed=None,
+                     excluded=None,
                      allowed_pares=None, allowed_moldura=None, allowed_primos=None,
                      range_pares=None, range_moldura=None, range_primos=None,
                      range_soma=None, range_amplitude=None, range_consecutivos=None):
         for _ in range(500):
             game = self._generate_raw(fixed, semifixed, min_semifixed, max_semifixed,
+                                      excluded,
                                       allowed_pares, allowed_moldura, allowed_primos,
                                       range_pares, range_moldura, range_primos,
                                       range_soma, range_amplitude, range_consecutivos)
@@ -97,15 +95,21 @@ class LooseGenerator:
         raise RuntimeError("Não foi possível gerar jogo com os parâmetros fornecidos.")
 
     def _generate_raw(self, fixed, semifixed, min_semifixed, max_semifixed,
+                      excluded,
                       allowed_pares, allowed_moldura, allowed_primos,
                       range_pares, range_moldura, range_primos,
                       range_soma, range_amplitude, range_consecutivos):
         if fixed is None: fixed = []
         if semifixed is None: semifixed = []
+        if excluded is None: excluded = []
         
         fixed_set = set(fixed)
         semifixed_set = set(semifixed) - fixed_set
-        proibidas = fixed_set | semifixed_set
+        excluded_set = set(excluded)  # <-- NOVO
+        
+        # Proibidas incluem fixas, semifixas e excluídas
+        proibidas = fixed_set | semifixed_set | excluded_set
+        
         todas = set(range(1, 26))
         restantes = list(todas - proibidas)
         
@@ -184,6 +188,7 @@ class LooseGenerator:
 # ============================================================
 class PortfolioOptimizer:
     def __init__(self, contests, fixed=None, semifixed=None, min_semifixed=0, max_semifixed=None,
+                 excluded=None,
                  allowed_pares=None, allowed_moldura=None, allowed_primos=None,
                  range_pares=None, range_moldura=None, range_primos=None,
                  range_soma=None, range_amplitude=None, range_consecutivos=None):
@@ -191,6 +196,7 @@ class PortfolioOptimizer:
         self.generator = LooseGenerator()
         self.fixed = fixed if fixed else []
         self.semifixed = semifixed if semifixed else []
+        self.excluded = excluded if excluded else []  # <-- NOVO
         self.min_semifixed = min_semifixed
         self.max_semifixed = max_semifixed
         self.allowed_pares = allowed_pares
@@ -209,13 +215,20 @@ class PortfolioOptimizer:
         for _ in tqdm(range(n_candidates), desc="Gerando pool"):
             try:
                 g = self.generator.generate_one(
-                    fixed=self.fixed, semifixed=self.semifixed,
-                    min_semifixed=self.min_semifixed, max_semifixed=self.max_semifixed,
-                    allowed_pares=self.allowed_pares, allowed_moldura=self.allowed_moldura,
+                    fixed=self.fixed,
+                    semifixed=self.semifixed,
+                    min_semifixed=self.min_semifixed,
+                    max_semifixed=self.max_semifixed,
+                    excluded=self.excluded,  # <-- NOVO
+                    allowed_pares=self.allowed_pares,
+                    allowed_moldura=self.allowed_moldura,
                     allowed_primos=self.allowed_primos,
-                    range_pares=self.range_pares, range_moldura=self.range_moldura,
-                    range_primos=self.range_primos, range_soma=self.range_soma,
-                    range_amplitude=self.range_amplitude, range_consecutivos=self.range_consecutivos
+                    range_pares=self.range_pares,
+                    range_moldura=self.range_moldura,
+                    range_primos=self.range_primos,
+                    range_soma=self.range_soma,
+                    range_amplitude=self.range_amplitude,
+                    range_consecutivos=self.range_consecutivos
                 )
                 key = tuple(g)
                 if key not in seen:
@@ -259,6 +272,7 @@ class PortfolioOptimizer:
         if self.fixed: print(f"   Fixas: {self.fixed}")
         if self.semifixed: print( f"   Semifixas: {self.semifixed} "
                                  f"(mín={self.min_semifixed}, máx={self.max_semifixed})" )
+        if self.excluded: print(f"   Excluídas: {self.excluded}")  # <-- NOVO
         if self.range_pares: print(f"   Pares: {self.range_pares}")
         if self.range_moldura: print(f"   Moldura: {self.range_moldura}")
         if self.range_primos: print(f"   Primos: {self.range_primos}")
@@ -359,11 +373,9 @@ class PredictiveRanking:
                     acertos = 0
                     total_testes = 0
                     
-                    # Começa no bloco 2 para ter pelo menos um bloco de histórico antes do bloco anterior
                     for i in range(2, len(blocos)):
                         mean_prev = np.mean(blocos[i-1])
                         mean_curr = np.mean(blocos[i])
-                        # histórico exclui os blocos i-1 e i (até i-2)
                         historical_mean = np.mean(series[:(i-1)*block_size]) if (i-1)*block_size > 0 else mean_prev
                         
                         total_testes += 1
@@ -374,7 +386,7 @@ class PredictiveRanking:
                                 acertos += 1
                             elif not predicted_down and mean_curr > mean_prev:
                                 acertos += 1
-                        else:  # tendencia
+                        else:
                             if mean_prev > historical_mean and mean_curr > mean_prev:
                                 acertos += 1
                             elif mean_prev < historical_mean and mean_curr < mean_prev:
@@ -430,7 +442,7 @@ class PredictiveRanking:
         return None
 
 # ============================================================
-# CONTROLE MONTE CARLO COM CORREÇÃO FWER (CORRIGIDO)
+# CONTROLE MONTE CARLO COM CORREÇÃO FWER
 # ============================================================
 def monte_carlo_control(contests, n_simulations=1000, block_sizes=None):
     """
@@ -444,15 +456,12 @@ def monte_carlo_control(contests, n_simulations=1000, block_sizes=None):
     print(f"   Simulações: {n_simulations}")
     print(f"   Blocos testados: {block_sizes}\n")
     
-    # Executar no dataset real primeiro (verbose=False para não poluir)
     ranker_real = PredictiveRanking(contests)
     real_results = ranker_real.rank_predictive_power(block_sizes, verbose=False)
     
-    # Estatística de interesse: máxima acurácia observada
     real_max_acc = max(res['accuracy'] for res in real_results.values())
     real_max_key = max(real_results, key=lambda k: real_results[k]['accuracy'])
     
-    # Executar nas simulações (silencioso)
     sim_max_accs = []
     sim_accuracies_by_key = defaultdict(list)
     
@@ -463,7 +472,6 @@ def monte_carlo_control(contests, n_simulations=1000, block_sizes=None):
         ranker_sim = PredictiveRanking(sim_contests)
         sim_results = ranker_sim.rank_predictive_power(block_sizes, verbose=False)
         
-        # Máximo dessa simulação
         sim_max = max(res['accuracy'] for res in sim_results.values())
         sim_max_accs.append(sim_max)
         
@@ -471,21 +479,19 @@ def monte_carlo_control(contests, n_simulations=1000, block_sizes=None):
             key = (filtro, strategy, block_size)
             sim_accuracies_by_key[key].append(res['accuracy'])
     
-    # p-global: fração de simulações cujo máximo >= real_max
     p_global = np.mean(np.array(sim_max_accs) >= real_max_acc)
     if p_global == 0.0:
         p_global_str = f"<{1.0/n_simulations:.4f}"
     else:
         p_global_str = f"{p_global:.4f}"
     
-    # Exibir resultado real com p-value individual
     print(f"\n📊 COMPARAÇÃO REAL vs. MONTE CARLO (resultados individuais)")
     print(f"{'Filtro':<15} {'Estratégia':<12} {'Bloco':<8} {'Real':<10} {'MC Médio':<10} {'MC Std':<10} {'Diferença':<10} {'p (MC)':<10}")
     print("-" * 90)
     
     for key, res_dict in sorted(real_results.items(), key=lambda x: x[1]['accuracy'], reverse=True):
         filtro, strategy, block_size = key
-        real_acc = res_dict['accuracy']  # CORREÇÃO AQUI: extrai o float
+        real_acc = res_dict['accuracy']
         sim_accs = sim_accuracies_by_key.get(key, [])
         if not sim_accs:
             continue
@@ -497,7 +503,6 @@ def monte_carlo_control(contests, n_simulations=1000, block_sizes=None):
             p_emp_str = f"<{1.0/len(sim_accs):.4f}"
         else:
             p_emp_str = f"{p_emp:.4f}"
-        # Destaca apenas a linha do melhor resultado global
         marker = " 🏆" if key == real_max_key else ""
         print(f"{filtro:<15} {strategy:<12} {block_size:<8} {real_acc:<10.1f}% {mean_sim:<10.1f}% {std_sim:<10.1f} {diff:<10.1f}% {p_emp_str:<10}{marker}")
     
@@ -534,9 +539,9 @@ def test_concurso_a_concurso(contests, min_history=200):
         for t in range(min_history, len(contests) - 1):
             current_val = series[t]
             next_val = series[t+1]
-            history = series[:t]   # valores até t-1, excluindo t
+            history = series[:t]
             
-            if len(history) < 20:  # mínimo para média curta
+            if len(history) < 20:
                 continue
             
             mean_short = np.mean(history[-20:])
@@ -544,7 +549,6 @@ def test_concurso_a_concurso(contests, min_history=200):
             
             total += 1
             
-            # Previsão por reversão
             if mean_short > mean_long:
                 pred_rev_down = True
             else:
@@ -555,7 +559,6 @@ def test_concurso_a_concurso(contests, min_history=200):
             elif not pred_rev_down and next_val > current_val:
                 acertos_reversao += 1
             
-            # Previsão por tendência
             if mean_short > mean_long and next_val > current_val:
                 acertos_tendencia += 1
             elif mean_short < mean_long and next_val < current_val:
@@ -616,9 +619,11 @@ class StructuralPredictor:
 # ============================================================
 # WALK‑FORWARD DO STRUCTURAL PREDICTOR
 # ============================================================
-def walk_forward_structural(contests, train_size=500, test_size=50, step=50):
+def walk_forward_structural(contests, train_size=500, test_size=50, step=50, excluded=None):
     print(f"\n🔬 WALK‑FORWARD DO STRUCTURAL PREDICTOR")
     print(f"   Treino: {train_size}, Teste: {test_size}, Passo: {step}")
+    if excluded:
+        print(f"   Excluídas: {excluded}")
     
     results = []
     start = train_size
@@ -630,6 +635,7 @@ def walk_forward_structural(contests, train_size=500, test_size=50, step=50):
         ranges = predictor.predict_ranges(method='recent')
         
         opt = PortfolioOptimizer(train_data,
+                                 excluded=excluded,  # <-- NOVO
                                  range_pares=ranges.get('pares'),
                                  range_moldura=ranges.get('moldura'),
                                  range_primos=ranges.get('primos'),
@@ -667,13 +673,17 @@ def walk_forward_structural(contests, train_size=500, test_size=50, step=50):
 # ============================================================
 # BUSCA OOS E COMPARAÇÕES
 # ============================================================
-def search_best_fixed_oos(contests, n_fixed=3, top_n=20, train_size=3500, n_games=5, n_candidates=10000, method='pair_covering'):
+def search_best_fixed_oos(contests, n_fixed=3, top_n=20, train_size=3500, n_games=5, n_candidates=10000, method='pair_covering', excluded=None):
     print(f"\n🔎 BUSCANDO MELHORES {n_fixed} FIXAS (OUT-OF-SAMPLE)")
+    if excluded:
+        print(f"   Excluídas: {excluded}")
     train_data = contests[:train_size]
     test_data = contests[train_size:]
     
     candidates = []
     for fixed_tuple in tqdm(combinations(range(1, 26), n_fixed), desc="Filtrando"):
+        if excluded and any(x in fixed_tuple for x in excluded):
+            continue
         fixed_set = set(fixed_tuple)
         acertos = sum(1 for c in train_data if fixed_set.issubset(set(c['dezenas'])))
         freq = acertos / len(train_data)
@@ -684,7 +694,7 @@ def search_best_fixed_oos(contests, n_fixed=3, top_n=20, train_size=3500, n_game
     
     results = []
     for fixed_tuple, freq, acertos in tqdm(candidates[:200], desc="Backtest OOS"):
-        opt = PortfolioOptimizer(train_data, fixed=list(fixed_tuple))
+        opt = PortfolioOptimizer(train_data, fixed=list(fixed_tuple), excluded=excluded)
         try:
             portfolio = opt.optimize(n_games, n_candidates, method=method)
             bt = opt.backtest(portfolio, test_data)
@@ -702,10 +712,12 @@ def search_best_fixed_oos(contests, n_fixed=3, top_n=20, train_size=3500, n_game
         print(f"{i:<5} {str(res['fixed']):<20} ROI={res['roi']:<10.1f}% 13pts={res['13pts']} 14pts={res['14pts']}")
     return results
 
-def compare_trincas(contests, trinca1, trinca2, n_games=5, n_candidates=50000, method='pair_covering'):
+def compare_trincas(contests, trinca1, trinca2, n_games=5, n_candidates=50000, method='pair_covering', excluded=None):
     print(f"\n⚔️ COMPARAÇÃO DE TRINCAS")
+    if excluded:
+        print(f"   Excluídas: {excluded}")
     for i, trinca in enumerate([trinca1, trinca2], 1):
-        opt = PortfolioOptimizer(contests, fixed=list(trinca))
+        opt = PortfolioOptimizer(contests, fixed=list(trinca), excluded=excluded)
         portfolio = opt.optimize(n_games, n_candidates, method=method)
         bt = opt.backtest(portfolio, contests[-200:])
         print(f"   Trinca {i} ({trinca}): Lift={bt['lift']:.2f}x | ROI={bt['roi']:+.1f}%")
@@ -715,8 +727,8 @@ def compare_trincas(contests, trinca1, trinca2, n_games=5, n_candidates=50000, m
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v48.1")
-    print("   MONTE CARLO CORRIGIDO + WALK‑FORWARD ESTRUTURAL")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v48.2")
+    print("   MONTE CARLO CORRIGIDO + WALK‑FORWARD ESTRUTURAL + EXCLUSÃO")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
@@ -748,22 +760,24 @@ def main():
               
             semifixed_str = input(
                 "   Dezenas semifixas (ex: 03 07 14 25 ou ENTER): ").strip()
-            
             semifixed = [int(x) for x in semifixed_str.split()] if semifixed_str else []
+            
+            # NOVO: exclusão de dezenas
+            excl_str = input("   Dezenas excluídas (ex: 04 18 22 ou ENTER): ").strip()
+            excluded = [int(x) for x in excl_str.split()] if excl_str else []
             
             if semifixed:
                 try:
                     min_semifixed = int(
                         input( f"   Mínimo de semifixas [0-{len(semifixed)}]: " ).strip() or "0" )
-            
                     max_semifixed = int( input( f"   Máximo de semifixas [0-{len(semifixed)}]: " ).strip() or str(len(semifixed)) )
-            
                 except:
                     min_semifixed = 0
                     max_semifixed = len(semifixed)
             else:
                 min_semifixed = 0
                 max_semifixed = None
+                
             print("   Faixas estruturais (ENTER para pular)")
             try:
                 pares_str = input("   Pares min,max (ex: 7,9): ").strip()
@@ -786,6 +800,7 @@ def main():
                 semifixed=semifixed,
                 min_semifixed=min_semifixed,
                 max_semifixed=max_semifixed,
+                excluded=excluded,
                 range_pares=range_pares,
                 range_moldura=range_moldura,
                 range_primos=range_primos)
@@ -800,6 +815,8 @@ def main():
         elif op == '2':
             fixed_str = input("\n   Fixas (ex: 15 16 20): ").strip()
             fixed = [int(x) for x in fixed_str.split()] if fixed_str else []
+            excl_str = input("   Excluídas (ex: 04 18 22 ou ENTER): ").strip()
+            excluded = [int(x) for x in excl_str.split()] if excl_str else []
             metodo = input("   Método [1. Pair, 2. Triple]: ").strip() or "1"
             method = 'pair_covering' if metodo == '1' else 'triple_covering'
             
@@ -810,7 +827,7 @@ def main():
                 train_end = test_start
                 train_start = max(0, train_end - 400)
                 if train_start >= train_end or test_start >= test_end: continue
-                opt = PortfolioOptimizer(contests[train_start:train_end], fixed=fixed)
+                opt = PortfolioOptimizer(contests[train_start:train_end], fixed=fixed, excluded=excluded)
                 portfolio = opt.optimize(5, 10000, method=method)
                 bt = opt.backtest(portfolio, contests[test_start:test_end])
                 results.append({'lift': bt['lift'], 'roi': bt['roi']})
@@ -821,9 +838,11 @@ def main():
         elif op == '3':
             fixed_str = input("\n   Fixas (ENTER para pular): ").strip()
             fixed = [int(x) for x in fixed_str.split()] if fixed_str else []
+            excl_str = input("   Excluídas (ENTER para pular): ").strip()
+            excluded = [int(x) for x in excl_str.split()] if excl_str else []
             metodo = input("   Método [1. Pair, 2. Triple]: ").strip() or "1"
             method = 'pair_covering' if metodo == '1' else 'triple_covering'
-            opt = PortfolioOptimizer(contests, fixed=fixed)
+            opt = PortfolioOptimizer(contests, fixed=fixed, excluded=excluded)
             portfolio = opt.optimize(5, 50000, method=method)
             bt = opt.backtest(portfolio, contests[-200:])
             print(f"\n🔬 BACKTEST (200): Lift={bt['lift']:.2f}x | ROI={bt['roi']:+.1f}%")
@@ -837,19 +856,23 @@ def main():
             except: continue
             top_n = int(input("   Resultados [20]: ").strip() or "20")
             train_size = int(input("   Tamanho treino [3500]: ").strip() or "3500")
+            excl_str = input("   Excluídas (ENTER para pular): ").strip()
+            excluded = [int(x) for x in excl_str.split()] if excl_str else []
             metodo = input("   Método [1. Pair, 2. Triple]: ").strip() or "1"
             method = 'pair_covering' if metodo == '1' else 'triple_covering'
-            search_best_fixed_oos(contests, n_fixed, top_n, train_size, method=method)
+            search_best_fixed_oos(contests, n_fixed, top_n, train_size, method=method, excluded=excluded)
         
         elif op == '5':
             trinca1_str = input("\n   Trinca 1: ").strip()
             trinca2_str = input("   Trinca 2: ").strip()
+            excl_str = input("   Excluídas (ENTER para pular): ").strip()
+            excluded = [int(x) for x in excl_str.split()] if excl_str else []
             try:
                 trinca1 = tuple(int(x) for x in trinca1_str.split())
                 trinca2 = tuple(int(x) for x in trinca2_str.split())
                 if len(trinca1)!=3 or len(trinca2)!=3: continue
             except: continue
-            compare_trincas(contests, trinca1, trinca2)
+            compare_trincas(contests, trinca1, trinca2, excluded=excluded)
         
         elif op == '6':
             blocos_str = input("\n   Tamanhos de bloco (ex: 50,100,200,500) [50,100,200,500]: ").strip()
@@ -881,11 +904,14 @@ def main():
             ranges = predictor.predict_ranges(method='recent')
             fixed = [15, 16, 20]
             print(f"\n   Fixas sugeridas: {fixed}")
+            excl_str = input("   Excluídas (ENTER para pular): ").strip()
+            excluded = [int(x) for x in excl_str.split()] if excl_str else []
             gerar = input("   Gerar carteira? (s/n): ").strip().lower()
             if gerar == 's':
                 metodo = input("   Método [1. Pair, 2. Triple]: ").strip() or "1"
                 method = 'pair_covering' if metodo == '1' else 'triple_covering'
                 opt = PortfolioOptimizer(contests, fixed=fixed,
+                                         excluded=excluded,
                                          range_pares=ranges.get('pares'),
                                          range_moldura=ranges.get('moldura'),
                                          range_primos=ranges.get('primos'),
@@ -924,7 +950,9 @@ def main():
                 step = int(input("   Passo [50]: ").strip() or "50")
             except:
                 train_size, test_size, step = 500, 50, 50
-            walk_forward_structural(contests, train_size, test_size, step)
+            excl_str = input("   Excluídas (ENTER para pular): ").strip()
+            excluded = [int(x) for x in excl_str.split()] if excl_str else []
+            walk_forward_structural(contests, train_size, test_size, step, excluded=excluded)
         
         elif op == '0':
             break
