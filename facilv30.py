@@ -280,7 +280,7 @@ class PortfolioOptimizer:
         
         return selected
 
-    def optimize(self, n_games=5, n_candidates=50000, method='pair_covering'):
+    def optimize(self, n_games=5, n_candidates=100000, method='pair_covering'):
         print(f"\n🧩 CARTEIRA: {n_games} jogos | método: {method}")
         if self.fixed: print(f"   Fixas: {self.fixed}")
         if self.semifixed: print( f"   Semifixas: {self.semifixed} "
@@ -725,7 +725,7 @@ def search_best_fixed_oos(contests, n_fixed=3, top_n=20, train_size=3500, n_game
         print(f"{i:<5} {str(res['fixed']):<20} ROI={res['roi']:<10.1f}% 13pts={res['13pts']} 14pts={res['14pts']}")
     return results
 
-def compare_trincas(contests, trinca1, trinca2, n_games=5, n_candidates=50000, method='pair_covering', excluded=None):
+def compare_trincas(contests, trinca1, trinca2, n_games=5, n_candidates=100000, method='pair_covering', excluded=None):
     print(f"\n⚔️ COMPARAÇÃO DE TRINCAS")
     if excluded:
         print(f"   Excluídas: {excluded}")
@@ -816,7 +816,7 @@ def main():
                 range_pares=range_pares,
                 range_moldura=range_moldura,
                 range_primos=range_primos)
-            portfolio = opt.optimize(5, 50000, method=method)
+            portfolio = opt.optimize(5, 100000, method=method)
             for i, g in enumerate(portfolio, 1):
                 p = sum(1 for x in g if x%2==0); pr = sum(1 for x in g if x in PRIMES); m = sum(1 for x in g if x in MOLDURA)
                 print(f" {i}. {g} | P:{p} Pr:{pr} M:{m}")
@@ -855,7 +855,7 @@ def main():
             metodo = input("   Método [1. Pair, 2. Triple]: ").strip() or "1"
             method = 'pair_covering' if metodo == '1' else 'triple_covering'
             opt = PortfolioOptimizer(contests, fixed=fixed, excluded=excluded)
-            portfolio = opt.optimize(5, 50000, method=method)
+            portfolio = opt.optimize(5, 100000, method=method)
             bt = opt.backtest(portfolio, contests[-200:])
             print(f"\n🔬 BACKTEST (200): Lift={bt['lift']:.2f}x | ROI={bt['roi']:+.1f}%")
             print(f"   11={bt['hit_distribution'].get(11,0)} 12={bt['hit_distribution'].get(12,0)} "
@@ -930,7 +930,7 @@ def main():
                                          range_soma=ranges.get('soma'),
                                          range_amplitude=ranges.get('amplitude'),
                                          range_consecutivos=ranges.get('consecutivos'))
-                portfolio = opt.optimize(5, 50000, method=method)
+                portfolio = opt.optimize(5, 100000, method=method)
                 for i, g in enumerate(portfolio, 1):
                     p = sum(1 for x in g if x%2==0); pr = sum(1 for x in g if x in PRIMES); m = sum(1 for x in g if x in MOLDURA)
                     print(f" {i}. {g} | P:{p} Pr:{pr} M:{m}")
