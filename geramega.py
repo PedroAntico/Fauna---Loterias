@@ -2,14 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
-MEGA‑SENA LAB v2.1
-CORREÇÕES CRÍTICAS:
+MEGA‑SENA LAB v2.2
+CORREÇÕES E MELHORIAS:
 ✅ Fixas preservadas no Simulated Annealing e DPP
 ✅ Validação final: todos os jogos contêm as fixas
 ✅ Limites de filtros corrigidos (soma até 345, amplitude até 59)
 ✅ Score ponderado na busca OOS para evitar falsos campeões
 ✅ Tipos nativos (int) em todos os jogos gerados
-✅ Mantém todas as funcionalidades do v2.0
+✅ Suporte a dezenas semifixas e excluídas na geração de carteira otimizada (opção 1)
+✅ Mantém todas as funcionalidades do v2.1
 """
 
 import numpy as np
@@ -130,19 +131,59 @@ BITMASK_CACHE = BitmaskCache()
 mask_intersection = lambda m1, m2: (m1 & m2).bit_count()
 
 # ============================================================
-# GERADOR DE JOGOS (CORRIGIDO)
+# GERADOR DE JOGOS (CORRIGIDO COM SEMIFIXAS E EXCLUÍDAS)
 # ============================================================
 class LooseGenerator:
     def generate_random(self):
         return [int(x) for x in np.random.choice(range(1, 61), 6, replace=False)]
-    def generate_with_fixed(self, fixed):
-        fixed_set = set(fixed)
-        restantes = list(set(range(1, 61)) - fixed_set)
-        complemento = np.random.choice(restantes, 6 - len(fixed_set), replace=False)
-        return sorted(fixed_set | set(int(x) for x in complemento))
-    def generate_filtered(self, fixed=None, ranges=None):
+
+    def generate_with_constraints(self, fixed=None, semifixed=None,
+                                  min_semifixed=0, max_semifixed=None,
+                                  excluded=None):
+        """Gera um jogo respeitando fixas, semifixas (com quantidade) e excluídas."""
+        fixed = fixed or []
+        semifixed = semifixed or []
+        excluded = excluded or []
+
+        excl_set = set(excluded)
+        fixed_set = set(fixed) - excl_set
+        semifixed_set = set(semifixed) - fixed_set - excl_set
+
+        if max_semifixed is None:
+            max_semifixed = len(semifixed_set)
+        else:
+            max_semifixed = min(max_semifixed, len(semifixed_set))
+
+        min_semifixed = max(min_semifixed, 0)
+        if min_semifixed > max_semifixed:
+            return None
+
+        n_semifixed = random.randint(min_semifixed, max_semifixed)
+        n_restantes = 6 - len(fixed_set) - n_semifixed
+
+        if n_restantes < 0:
+            return None
+
+        restantes = set(range(1, 61)) - fixed_set - semifixed_set - excl_set
+        if len(restantes) < n_restantes:
+            return None
+
+        chosen_semi = set(random.sample(list(semifixed_set), n_semifixed)) if n_semifixed > 0 and semifixed_set else set()
+        chosen_rest = set(random.sample(list(restantes), n_restantes)) if n_restantes > 0 else set()
+
+        jogo = sorted(fixed_set | chosen_semi | chosen_rest)
+        return [int(x) for x in jogo]
+
+    def generate_filtered(self, fixed=None, semifixed=None,
+                          min_semifixed=0, max_semifixed=None,
+                          excluded=None, ranges=None):
+        """Gera com restrições e filtros estruturais."""
         for _ in range(500):
-            g = self.generate_with_fixed(fixed) if fixed else self.generate_random()
+            g = self.generate_with_constraints(fixed, semifixed,
+                                               min_semifixed, max_semifixed,
+                                               excluded)
+            if g is None:
+                continue
             if ranges is None:
                 return g
             ok = True
@@ -153,7 +194,11 @@ class LooseGenerator:
                     break
             if ok:
                 return g
-        return self.generate_with_fixed(fixed) if fixed else self.generate_random()
+        # Fallback: tenta sem filtros
+        g = self.generate_with_constraints(fixed, semifixed,
+                                           min_semifixed, max_semifixed,
+                                           excluded)
+        return g if g is not None else self.generate_random()
 
 # ============================================================
 # DISTÂNCIA DE MAHALANOBIS
@@ -263,7 +308,7 @@ def fitness_global(portfolio):
     return coverage * 0.3 + diversity * 0.3 + anti_human * 0.1 + entropy * 0.3
 
 # ============================================================
-# OTIMIZADOR DE CARTEIRA (CORRIGIDO)
+# OTIMIZADOR DE CARTEIRA (CORRIGIDO COM SEMIFIXAS/EXCLUÍDAS)
 # ============================================================
 class PortfolioOptimizer:
     def __init__(self, contests, premios=None):
@@ -273,15 +318,26 @@ class PortfolioOptimizer:
         self.mahalanobis = None
         if len(contests) >= 100:
             self.mahalanobis = MahalanobisDistance(contests)
-        self.fixed = None  # armazena as fixas atuais
+        self.fixed = None
+        self.semifixed = None
+        self.min_semifixed = 0
+        self.max_semifixed = None
+        self.excluded = None
 
-    def generate_pool(self, n_candidates, fixed=None, ranges=None):
+    def generate_pool(self, n_candidates, fixed=None, semifixed=None,
+                      min_semifixed=0, max_semifixed=None, excluded=None, ranges=None):
         pool, seen = [], set()
         for _ in range(n_candidates):
             if ranges:
-                g = self.generator.generate_filtered(fixed, ranges)
+                g = self.generator.generate_filtered(fixed, semifixed,
+                                                     min_semifixed, max_semifixed,
+                                                     excluded, ranges)
             else:
-                g = self.generator.generate_with_fixed(fixed) if fixed else self.generator.generate_random()
+                g = self.generator.generate_with_constraints(fixed, semifixed,
+                                                             min_semifixed, max_semifixed,
+                                                             excluded)
+            if g is None:
+                continue
             key = tuple(g)
             if key not in seen:
                 seen.add(key)
@@ -304,28 +360,32 @@ class PortfolioOptimizer:
             covered.update(combinations(sorted(candidates[best_idx]), 2))
         return selected
 
-    def _enforce_fixed(self, portfolio, fixed):
-        """Garante que todos os jogos contenham as fixas."""
-        if not fixed:
+    def _enforce_constraints(self, portfolio, fixed=None, semifixed=None,
+                             min_semifixed=0, max_semifixed=None, excluded=None):
+        """Garante que todos os jogos contenham as fixas e respeitem semifixas/excluídas."""
+        if not fixed and not excluded and semifixed is None:
             return portfolio
-        fixed_set = set(fixed)
+        excl_set = set(excluded or [])
+        fixed_set = set(fixed or []) - excl_set
         result = []
         for g in portfolio:
-            missing = fixed_set - set(g)
-            if missing:
-                # Substitui dezenas aleatórias pelas fixas faltantes
-                g_set = set(g)
-                # Remove dezenas não-fixas para abrir espaço
+            g_set = set(g)
+            # Remove excluídas que tenham aparecido (não deveria)
+            g_set -= excl_set
+            missing_fixed = fixed_set - g_set
+            if missing_fixed:
                 non_fixed = list(g_set - fixed_set)
-                for m in missing:
+                for m in missing_fixed:
                     if non_fixed:
                         g_set.remove(non_fixed.pop())
                     g_set.add(m)
-                g = sorted(int(x) for x in g_set)
+            g = sorted(int(x) for x in g_set)
             result.append(g)
         return result
 
-    def simulated_annealing(self, initial, fixed=None, steps=500, temp_start=1.0, temp_end=0.01):
+    def simulated_annealing(self, initial, fixed=None, semifixed=None,
+                            min_semifixed=0, max_semifixed=None, excluded=None,
+                            steps=500, temp_start=1.0, temp_end=0.01):
         current = initial[:]
         current_score = fitness_global(current)
         best = current[:]
@@ -333,11 +393,11 @@ class PortfolioOptimizer:
         for s in range(steps):
             t = temp_start * (temp_end / temp_start) ** (s / steps)
             idx = random.randint(0, len(current)-1)
-            # Gera novo jogo respeitando as fixas (CORRIGIDO)
-            if fixed:
-                new_game = self.generator.generate_with_fixed(fixed)
-            else:
-                new_game = self.generator.generate_random()
+            new_game = self.generator.generate_with_constraints(fixed, semifixed,
+                                                               min_semifixed, max_semifixed,
+                                                               excluded)
+            if new_game is None:
+                continue
             new_port = current[:]
             new_port[idx] = new_game
             new_score = fitness_global(new_port)
@@ -350,9 +410,17 @@ class PortfolioOptimizer:
                     best_score = current_score
         return best
 
-    def optimize(self, n_games=5, n_candidates=5000, fixed=None, ranges=None, use_dpp=True, use_annealing=True):
-        self.fixed = fixed  # armazena para uso interno
-        pool = self.generate_pool(n_candidates, fixed, ranges)
+    def optimize(self, n_games=5, n_candidates=5000, fixed=None, ranges=None,
+                 use_dpp=True, use_annealing=True,
+                 semifixed=None, min_semifixed=0, max_semifixed=None, excluded=None):
+        self.fixed = fixed
+        self.semifixed = semifixed
+        self.min_semifixed = min_semifixed
+        self.max_semifixed = max_semifixed
+        self.excluded = excluded
+
+        pool = self.generate_pool(n_candidates, fixed, semifixed,
+                                  min_semifixed, max_semifixed, excluded, ranges)
         if len(pool) < n_games:
             return pool
 
@@ -362,11 +430,12 @@ class PortfolioOptimizer:
             portfolio = self.select_pair_covering(pool, n_games)
 
         if use_annealing:
-            portfolio = self.simulated_annealing(portfolio, fixed)
+            portfolio = self.simulated_annealing(portfolio, fixed, semifixed,
+                                                 min_semifixed, max_semifixed, excluded)
 
-        # VALIDAÇÃO FINAL: garantir que todas as fixas estão presentes
-        if fixed:
-            portfolio = self._enforce_fixed(portfolio, fixed)
+        # VALIDAÇÃO FINAL
+        portfolio = self._enforce_constraints(portfolio, fixed, semifixed,
+                                              min_semifixed, max_semifixed, excluded)
 
         # Ordenar por Mahalanobis (menor distância = mais típico)
         if self.mahalanobis is not None:
@@ -393,7 +462,6 @@ class PortfolioOptimizer:
         theo_prob = 1 - (1-p_single)**len(portfolio)
         lift = prob/theo_prob if theo_prob>0 else 1.0
         roi = (total_premio-total_custo)/total_custo*100 if total_custo>0 else 0
-        # Score ponderado para evitar falsos campeões
         weighted_score = roi * np.sqrt(hit_counts.get(4,0) + hit_counts.get(5,0)*5 + hit_counts.get(6,0)*50)
         return {'lift': lift, 'roi': roi, 'hit_distribution': hit_counts, 'weighted_score': weighted_score}
 
@@ -437,7 +505,6 @@ class PredictiveRanking:
 
 # ============================================================
 # CONTROLE MONTE CARLO, TESTE CONCURSO, STRUCTURAL PREDICTOR, ETC.
-# (mantidos com pequenas correções de limites)
 # ============================================================
 def monte_carlo_control(contests, n_simulations=100, block_sizes=None):
     if block_sizes is None: block_sizes = [50, 100, 200]
@@ -551,7 +618,6 @@ def search_best_fixed_oos(contests, n_fixed=2, top_n=20, train_size=1500, premio
         portfolio = opt.optimize(5, 3000, fixed=list(fixed_tuple))
         bt = opt.backtest(portfolio, test_data)
         results.append({'fixed':fixed_tuple, 'freq':freq, 'roi':bt['roi'], 'weighted_score':bt['weighted_score']})
-    # Ordenar pelo score ponderado (não apenas ROI)
     results.sort(key=lambda x: x['weighted_score'], reverse=True)
     print(f"\n🏆 TOP {top_n} FIXAS POR SCORE PONDERADO:")
     for i, res in enumerate(results[:top_n], 1):
@@ -658,8 +724,8 @@ def monte_carlo_portfolio(contests, n_sim=500, premios=None):
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 MEGA‑SENA LAB v2.1")
-    print("   CORRIGIDO: FIXAS PRESERVADAS + LIMITES + SCORE PONDERADO")
+    print("🔬 MEGA‑SENA LAB v2.2")
+    print("   CORRIGIDO: FIXAS PRESERVADAS + LIMITES + SCORE PONDERADO + SEMIFIXAS/EXCLUÍDAS")
     print("="*70)
     contests = load_megasena('resultados_megasena.csv')
     if not contests:
@@ -689,14 +755,42 @@ def main():
         op = input("Escolha: ").strip()
 
         if op == '1':
-            fixed_str = input("\n   Dezenas fixas (ex: 10,25,45 ou ENTER): ").strip()
+            print("\n--- GERAÇÃO DE CARTEIRA OTIMIZADA ---")
+            fixed_str = input("   Dezenas fixas (ex: 10,25,45 ou ENTER): ").strip()
             fixed = [int(x) for x in fixed_str.split(',')] if fixed_str else []
+
+            semifixed_str = input("   Dezenas semifixas (ex: 3,17,28,39,52 ou ENTER): ").strip()
+            semifixed = [int(x) for x in semifixed_str.split(',')] if semifixed_str else []
+
+            if semifixed:
+                try:
+                    min_semifixed = int(input(f"   Mínimo de semifixas [0-{len(semifixed)}]: ").strip() or "0")
+                    max_semifixed = int(input(f"   Máximo de semifixas [0-{len(semifixed)}]: ").strip() or str(len(semifixed)))
+                except:
+                    min_semifixed = 0
+                    max_semifixed = len(semifixed)
+            else:
+                min_semifixed = 0
+                max_semifixed = None
+
+            excl_str = input("   Dezenas excluídas (ex: 7,13,27 ou ENTER): ").strip()
+            excluded = [int(x) for x in excl_str.split(',')] if excl_str else []
+
             opt = PortfolioOptimizer(contests, premios)
-            portfolio = opt.optimize(5, 5000, fixed=fixed if fixed else None, use_dpp=True, use_annealing=True)
+            portfolio = opt.optimize(5, 5000,
+                                     fixed=fixed if fixed else None,
+                                     semifixed=semifixed if semifixed else None,
+                                     min_semifixed=min_semifixed,
+                                     max_semifixed=max_semifixed,
+                                     excluded=excluded if excluded else None,
+                                     use_dpp=True, use_annealing=True)
             # Verificação rápida
             if fixed:
                 for i, g in enumerate(portfolio, 1):
                     assert set(fixed).issubset(set(g)), f"Jogo {i} não contém as fixas!"
+            if excluded:
+                for i, g in enumerate(portfolio, 1):
+                    assert not (set(excluded) & set(g)), f"Jogo {i} contém excluída!"
             for i, g in enumerate(portfolio, 1):
                 p = sum(1 for x in g if x%2==0)
                 pr = sum(1 for x in g if x in PRIMES)
