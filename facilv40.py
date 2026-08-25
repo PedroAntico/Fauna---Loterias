@@ -2,15 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v49.3
-+ ANÁLISE AVANÇADA DE FREQUÊNCIA + ATRASO COM MONTE CARLO OTIMIZADO
-
-EVOLUÇÃO DO v49.2:
-✅ Monte Carlo da opção 13 reescrito com pré-cálculo de características
-✅ Uso de NumPy vetorizado para acelerar drasticamente
-✅ Pré-cálculo de frequências acumuladas, recentes e atrasos por simulação
-✅ Avaliação de configurações em lote (argpartition em vez de sort)
-✅ Mantém todas as correções anteriores (backtest, rank_dezenas, freq_janela)
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v49.4
+CORREÇÃO CRÍTICA NO MONTE CARLO DA OPÇÃO 13:
+✅ Conversão correta entre índices (0-24) e dezenas (1-25) na comparação de acertos
+✅ Monte Carlo agora produz médias coerentes (~6,0) sob sorteios independentes
+✅ Mantém todas as demais funcionalidades da v49.3
 """
 
 import numpy as np
@@ -819,7 +815,7 @@ def analise_frequentes_atraso_v2(contests, top_n=10, janelas_recentes=[3,5,7,10,
     Inclui walk‑forward com separação treino‑validação‑teste OOS.
     Monte Carlo otimizado com pré-cálculo de features e NumPy vetorizado.
     """
-    print(f"\n🔬 ANÁLISE AVANÇADA DE FREQUÊNCIA + ATRASO (v49.3)")
+    print(f"\n🔬 ANÁLISE AVANÇADA DE FREQUÊNCIA + ATRASO (v49.4)")
     print(f"   Top {top_n} dezenas | Janelas recentes: {janelas_recentes} | Janela histórica: {janela_historica}")
     print(f"   Histórico mínimo para walk‑forward: {min_history}")
     print(f"   Simulações Monte Carlo: {n_sim_mc}")
@@ -957,7 +953,7 @@ def analise_frequentes_atraso_v2(contests, top_n=10, janelas_recentes=[3,5,7,10,
         w, p = wilcoxon(resultados_oos['frequencia'], resultados_oos['modelo_otimizado'])
         print(f"\n   Wilcoxon (frequência vs modelo otimizado): W={w}, p={p:.4f}")
 
-    # ---------------- 6. Monte Carlo OTIMIZADO ----------------
+    # ---------------- 6. Monte Carlo OTIMIZADO (CORRIGIDO) ----------------
     print(f"\n🎲 Monte Carlo OTIMIZADO ({n_sim_mc} simulações)")
     print("   Repetindo o processo completo de descoberta em sorteios independentes")
 
@@ -1031,9 +1027,11 @@ def analise_frequentes_atraso_v2(contests, top_n=10, janelas_recentes=[3,5,7,10,
             scores = w_rec * z_rec + w_hist * z_hist + w_atr * bonus_atr
 
             top_idx = np.argpartition(scores, -top_n, axis=1)[:, -top_n:]
+            # Converter índices 0-24 para dezenas 1-25
+            top_dezenas = top_idx + 1
 
             for j, alvo in enumerate(alvos):
-                acertos[ci, j] = np.isin(top_idx[j], alvo).sum()
+                acertos[ci, j] = np.isin(top_dezenas[j], list(alvo)).sum()
 
         medias = acertos.mean(axis=1)
         melhor_idx = np.argmax(medias)
@@ -1100,7 +1098,8 @@ def analise_frequentes_atraso_v2(contests, top_n=10, janelas_recentes=[3,5,7,10,
 
         scores = w_rec * z_rec + w_hist * z_hist + w_atr * bonus_atr
         top_idx = np.argpartition(scores, -top_n, axis=1)[:, -top_n:]
-        acertos_val = np.array([np.isin(top_idx[j], val_targets[j]).sum() for j in range(len(val_indices))])
+        top_dezenas = top_idx + 1
+        acertos_val = np.array([np.isin(top_dezenas[j], list(val_targets[j])).sum() for j in range(len(val_indices))])
         media_val_sim = acertos_val.mean()
 
         # Regra de rejeição
@@ -1129,7 +1128,8 @@ def analise_frequentes_atraso_v2(contests, top_n=10, janelas_recentes=[3,5,7,10,
 
         scores = w_rec * z_rec + w_hist * z_hist + w_atr * bonus_atr
         top_idx = np.argpartition(scores, -top_n, axis=1)[:, -top_n:]
-        acertos_oos = np.array([np.isin(top_idx[j], test_targets[j]).sum() for j in range(len(test_indices))])
+        top_dezenas = top_idx + 1
+        acertos_oos = np.array([np.isin(top_dezenas[j], list(test_targets[j])).sum() for j in range(len(test_indices))])
         medias_sim[sim] = acertos_oos.mean()
 
         if (sim + 1) % max(1, n_sim_mc // 10) == 0 or sim == 0:
@@ -1193,8 +1193,8 @@ def analise_frequentes_atraso_v2(contests, top_n=10, janelas_recentes=[3,5,7,10,
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v49.3")
-    print("   MONTE CARLO OTIMIZADO + WALK‑FORWARD ESTRUTURAL + EXCLUSÃO + ANÁLISE AVANÇADA DE ATRASO")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v49.4")
+    print("   MONTE CARLO OTIMIZADO CORRIGIDO + WALK‑FORWARD ESTRUTURAL + EXCLUSÃO + ANÁLISE AVANÇADA DE ATRASO")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
