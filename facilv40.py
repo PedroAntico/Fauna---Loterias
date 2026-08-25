@@ -2,22 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v49.1
-+ ANÁLISE AVANÇADA DE FREQUÊNCIA + ATRASO COM OOS E MONTE CARLO HONESTO
-
-EVOLUÇÃO DO v49:
-✅ Correção da normalização da frequência histórica (z-score binomial)
-✅ Atraso padronizado por z-score (não depende de min-max)
-✅ Monte Carlo com sorteios independentes (não embaralha série temporal)
-✅ Separação treino-validação-teste OOS
-✅ Busca automática de janelas, pesos e métodos (só no treino)
-✅ Avaliação única no teste OOS
-✅ Múltiplas janelas recentes e funções não lineares para atraso
-✅ Distribuição de acertos (≥7, ≥8, ≥9, ≥10)
-✅ Ranking detalhado das 25 dezenas
-✅ Geração de carteira com as dezenas selecionadas
-
-Mantém todas as funcionalidades anteriores (exclusão, Monte Carlo geral, etc.)
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v49.2
+CORREÇÕES CRÍTICAS:
+✅ Correção de índices negativos em freq_janela
+✅ Monte Carlo agora repete todo o processo de descoberta (treino/validação) a cada simulação
+✅ Validação usada para rejeitar configurações com degradação
+✅ rank_dezenas_individual agora armazena (dezena, acurácia) corretamente
+✅ Backtest corrigido: empirical agora é a frequência de concursos com pelo menos um sucesso
+✅ Lift documentado corretamente
+Mantém todas as funcionalidades anteriores.
 """
 
 import numpy as np
@@ -318,27 +311,46 @@ class PortfolioOptimizer:
         return portfolio
 
     def backtest(self, portfolio, test_draws):
-        n_success = total_premio = 0
-        total_custo = len(portfolio) * len(test_draws) * CUSTO_APOSTA
+        """
+        Backtest corrigido:
+        empirical = frequência de concursos onde PELO MENOS uma aposta acerta 11+.
+        theoretical = probabilidade de pelo menos uma aposta acertar 11+ em um único concurso.
+        """
+        n_draw_success = 0
+        total_premio = 0
+        n_apostas = len(portfolio)
+        n_test = len(test_draws)
+        total_custo = n_apostas * n_test * CUSTO_APOSTA
         portfolio_masks = np.array([BITMASK_CACHE.get_mask(g) for g in portfolio], dtype=np.uint32)
         hit_counts = {k:0 for k in range(11,16)}
+        
         for draw in test_draws:
             dm = BITMASK_CACHE.get_mask(draw['dezenas'])
+            draw_success = False
             for pm in portfolio_masks:
                 hits = mask_intersection(pm, dm)
                 if hits >= 11:
-                    n_success += 1
+                    draw_success = True
                     total_premio += PREMIO_VALORES.get(hits, 0)
                     hit_counts[hits] += 1
-        prob = n_success/(len(portfolio)*len(test_draws)) if test_draws else 0
+            if draw_success:
+                n_draw_success += 1
+        
+        empirical = n_draw_success / n_test if n_test > 0 else 0
         p_single = sum(HYPE_PROBS[k] for k in range(11,16))
-        theo_prob = 1 - (1-p_single)**len(portfolio)
-        return {'empirical': prob, 'theoretical': theo_prob,
-                'lift': prob/theo_prob if theo_prob>0 else 1.0,
-                'n_test': len(test_draws), 'n_success': n_success,
-                'total_premio': total_premio, 'total_custo': total_custo,
-                'roi': (total_premio-total_custo)/total_custo*100 if total_custo>0 else 0,
-                'hit_distribution': hit_counts}
+        theo_prob = 1 - (1 - p_single)**n_apostas
+        
+        return {
+            'empirical': empirical,
+            'theoretical': theo_prob,
+            'lift': empirical / theo_prob if theo_prob > 0 else 1.0,
+            'n_test': n_test,
+            'n_success': n_draw_success,
+            'total_premio': total_premio,
+            'total_custo': total_custo,
+            'roi': (total_premio - total_custo) / total_custo * 100 if total_custo > 0 else 0,
+            'hit_distribution': hit_counts
+        }
 
 # ============================================================
 # FUNÇÕES DE EXTRAÇÃO DE FILTROS
@@ -452,12 +464,16 @@ class PredictiveRanking:
                     elif freq_prev < freq_hist and freq_curr > freq_prev:
                         acertos += 1
                 if total > 0:
-                    accuracies.append(acertos / total * 100)
+                    acc = acertos / total * 100
+                    accuracies.append((dezena, acc))
             
             if accuracies:
-                print(f"\n   Bloco {block_size}: média={np.mean(accuracies):.1f}%, "
-                      f"melhor={np.argmax(accuracies)+1} ({max(accuracies):.1f}%), "
-                      f"pior={np.argmin(accuracies)+1} ({min(accuracies):.1f}%)")
+                best = max(accuracies, key=lambda x: x[1])
+                worst = min(accuracies, key=lambda x: x[1])
+                media = np.mean([a for _, a in accuracies])
+                print(f"\n   Bloco {block_size}: média={media:.1f}%, "
+                      f"melhor={best[0]} ({best[1]:.1f}%), "
+                      f"pior={worst[0]} ({worst[1]:.1f}%)")
         
         return None
 
@@ -743,11 +759,13 @@ def compare_trincas(contests, trinca1, trinca2, n_games=5, n_candidates=100000, 
         print(f"   Trinca {i} ({trinca}): Lift={bt['lift']:.2f}x | ROI={bt['roi']:+.1f}%")
 
 # ============================================================
-# NOVAS FUNÇÕES AUXILIARES PARA ANÁLISE AVANÇADA (opção 13)
+# FUNÇÕES AUXILIARES PARA ANÁLISE AVANÇADA (opção 13)
 # ============================================================
 def freq_janela(contests, inicio, fim, dezenas=range(1,26)):
     """Frequência de cada dezena no intervalo [inicio, fim)."""
     freq = Counter()
+    # Garantir que inicio >= 0
+    inicio = max(0, inicio)
     for c in contests[inicio:fim]:
         freq.update(c['dezenas'])
     return {d: freq.get(d, 0) for d in dezenas}
@@ -796,12 +814,13 @@ def score_dezena(freq_recente, freq_historica, atraso_z, janela_recente=10, jane
 
 def analise_frequentes_atraso_v2(contests, top_n=10, janelas_recentes=[3,5,7,10,15,20,30,50,100],
                                  janela_historica=100, min_history=500,
-                                 pesos_grid=None, n_sim_mc=500, alpha=0.05):
+                                 pesos_grid=None, n_sim_mc=100, alpha=0.05):
     """
     Análise robusta das dezenas mais frequentes com peso no atraso.
     Inclui walk‑forward com separação treino‑validação‑teste OOS.
+    Monte Carlo repete todo o processo de descoberta.
     """
-    print(f"\n🔬 ANÁLISE AVANÇADA DE FREQUÊNCIA + ATRASO (v49.1)")
+    print(f"\n🔬 ANÁLISE AVANÇADA DE FREQUÊNCIA + ATRASO (v49.2)")
     print(f"   Top {top_n} dezenas | Janelas recentes: {janelas_recentes} | Janela histórica: {janela_historica}")
     print(f"   Histórico mínimo para walk‑forward: {min_history}")
     print(f"   Simulações Monte Carlo: {n_sim_mc}")
@@ -838,7 +857,8 @@ def analise_frequentes_atraso_v2(contests, top_n=10, janelas_recentes=[3,5,7,10,
                 for i in range(min_history, len(treino)):
                     passado = treino[:i]
                     alvo = set(treino[i]['dezenas'])
-                    freq = freq_janela(passado, len(passado)-janela, len(passado))
+                    inicio_jan = max(0, len(passado)-janela)
+                    freq = freq_janela(passado, inicio_jan, len(passado))
                     hist = freq_janela(passado, 0, len(passado))
                     atr = calcular_atrasos(passado, indice=len(passado))
                     atr_vals = np.array(list(atr.values()))
@@ -854,14 +874,15 @@ def analise_frequentes_atraso_v2(contests, top_n=10, janelas_recentes=[3,5,7,10,
 
     print(f"   Melhor configuração no treino: janela={melhor_config[0]}, pesos={melhor_config[1]}, método={melhor_config[2]}")
 
-    # ---------------- 3. Avaliação na VALIDAÇÃO ----------------
+    # ---------------- 3. Avaliação na VALIDAÇÃO e possível rejeição ----------------
     print("\n📊 Avaliação na VALIDAÇÃO:")
     janela_opt, pesos_opt, metodo_opt = melhor_config
     acertos_val = []
     for i in range(len(validacao)):
         passado = treino + validacao[:i]
         alvo = set(validacao[i]['dezenas'])
-        freq = freq_janela(passado, len(passado)-janela_opt, len(passado))
+        inicio_jan = max(0, len(passado)-janela_opt)
+        freq = freq_janela(passado, inicio_jan, len(passado))
         hist = freq_janela(passado, 0, len(passado))
         atr = calcular_atrasos(passado, indice=len(passado))
         atr_vals = np.array(list(atr.values()))
@@ -873,6 +894,11 @@ def analise_frequentes_atraso_v2(contests, top_n=10, janelas_recentes=[3,5,7,10,
     media_val = np.mean(acertos_val) if acertos_val else 0
     print(f"   Média de acertos na validação: {media_val:.3f}")
 
+    # Se a validação for significativamente pior que o treino, rejeitar
+    if media_val < melhor_score_treino - 0.5:  # degradação > 0.5 acertos
+        print("   ⚠️ Degradação significativa na validação. Usando configuração padrão (janela=10, linear).")
+        janela_opt, pesos_opt, metodo_opt = 10, (0.5, 0.2, 0.3), 'linear'
+
     # ---------------- 4. Avaliação no TESTE OOS (somente uma vez) ----------------
     print("\n🎯 Resultado final no TESTE OOS:")
     estrategias = ['aleatorio', 'frequencia', 'atraso', 'freq+atraso_linear', 'freq+atraso_sqrt', 'freq+atraso_log', 'modelo_otimizado']
@@ -882,7 +908,8 @@ def analise_frequentes_atraso_v2(contests, top_n=10, janelas_recentes=[3,5,7,10,
         passado = treino + validacao + teste_oos[:i]
         alvo = set(teste_oos[i]['dezenas'])
 
-        freq10 = freq_janela(passado, len(passado)-10, len(passado))
+        inicio_jan10 = max(0, len(passado)-10)
+        freq10 = freq_janela(passado, inicio_jan10, len(passado))
         hist = freq_janela(passado, 0, len(passado))
         atr = calcular_atrasos(passado, indice=len(passado))
         atr_vals = np.array(list(atr.values()))
@@ -908,7 +935,8 @@ def analise_frequentes_atraso_v2(contests, top_n=10, janelas_recentes=[3,5,7,10,
             resultados_oos[nome].append(len(top & alvo))
 
         # Modelo otimizado (configuração escolhida)
-        freq_jan = freq_janela(passado, len(passado)-janela_opt, len(passado))
+        inicio_jan_opt = max(0, len(passado)-janela_opt)
+        freq_jan = freq_janela(passado, inicio_jan_opt, len(passado))
         scores = {d: score_dezena(freq_jan[d], hist[d], atr_z[d], janela_opt, janela_historica, pesos_opt, metodo_opt) for d in range(1,26)}
         top = set(sorted(range(1,26), key=lambda d: scores[d], reverse=True)[:top_n])
         resultados_oos['modelo_otimizado'].append(len(top & alvo))
@@ -930,29 +958,82 @@ def analise_frequentes_atraso_v2(contests, top_n=10, janelas_recentes=[3,5,7,10,
         w, p = wilcoxon(resultados_oos['frequencia'], resultados_oos['modelo_otimizado'])
         print(f"\n   Wilcoxon (frequência vs modelo otimizado): W={w}, p={p:.4f}")
 
-    # ---------------- 6. Monte Carlo honesto ----------------
-    print(f"\n🎲 Monte Carlo ({n_sim_mc} simulações) – modelo otimizado vs sorteios independentes")
+    # ---------------- 6. Monte Carlo honesto (repete descoberta) ----------------
+    print(f"\n🎲 Monte Carlo ({n_sim_mc} simulações) – processo completo de descoberta vs sorteios independentes")
     obs_media = np.mean(resultados_oos['modelo_otimizado'])
     medias_sim = []
     for _ in range(n_sim_mc):
+        # Gera concursos aleatórios com mesmo comprimento
         sim_contests = [
             {'dezenas': sorted(np.random.choice(range(1,26), 15, replace=False))}
-            for _ in range(len(teste_oos))
+            for _ in range(n)
         ]
-        acertos_sim = []
-        for i in range(len(sim_contests)):
-            passado = sim_contests[:i]
-            alvo = set(sim_contests[i]['dezenas'])
-            freq_jan = freq_janela(passado, len(passado)-janela_opt, len(passado))
+        # Divide treino/validação/teste
+        sim_treino = sim_contests[:train_end]
+        sim_validacao = sim_contests[train_end:val_end]
+        sim_teste = sim_contests[val_end:]
+
+        # Busca de configuração no treino simulado
+        best_score = -1
+        best_cfg = None
+        for janela in janelas_recentes:
+            for pesos in pesos_grid:
+                for metodo in metodos:
+                    acertos_sim = []
+                    for i in range(min_history, len(sim_treino)):
+                        passado = sim_treino[:i]
+                        alvo = set(sim_treino[i]['dezenas'])
+                        inicio_jan = max(0, len(passado)-janela)
+                        freq = freq_janela(passado, inicio_jan, len(passado))
+                        hist = freq_janela(passado, 0, len(passado))
+                        atr = calcular_atrasos(passado, indice=len(passado))
+                        atr_vals = np.array(list(atr.values()))
+                        atr_mean, atr_std = np.mean(atr_vals), np.std(atr_vals)
+                        atr_z = {d: (atr[d] - atr_mean) / (atr_std + 1e-9) for d in range(1,26)}
+                        scores = {d: score_dezena(freq[d], hist[d], atr_z[d], janela, janela_historica, pesos, metodo) for d in range(1,26)}
+                        top = set(sorted(range(1,26), key=lambda d: scores[d], reverse=True)[:top_n])
+                        acertos_sim.append(len(top & alvo))
+                    media_sim = np.mean(acertos_sim) if acertos_sim else 0
+                    if media_sim > best_score:
+                        best_score = media_sim
+                        best_cfg = (janela, pesos, metodo)
+
+        # Validação (se degradar muito, usar configuração padrão)
+        janela_sim, pesos_sim, metodo_sim = best_cfg
+        acertos_val_sim = []
+        for i in range(len(sim_validacao)):
+            passado = sim_treino + sim_validacao[:i]
+            alvo = set(sim_validacao[i]['dezenas'])
+            inicio_jan = max(0, len(passado)-janela_sim)
+            freq = freq_janela(passado, inicio_jan, len(passado))
             hist = freq_janela(passado, 0, len(passado))
             atr = calcular_atrasos(passado, indice=len(passado))
             atr_vals = np.array(list(atr.values()))
             atr_mean, atr_std = np.mean(atr_vals), np.std(atr_vals)
             atr_z = {d: (atr[d] - atr_mean) / (atr_std + 1e-9) for d in range(1,26)}
-            scores = {d: score_dezena(freq_jan[d], hist[d], atr_z[d], janela_opt, janela_historica, pesos_opt, metodo_opt) for d in range(1,26)}
+            scores = {d: score_dezena(freq[d], hist[d], atr_z[d], janela_sim, janela_historica, pesos_sim, metodo_sim) for d in range(1,26)}
             top = set(sorted(range(1,26), key=lambda d: scores[d], reverse=True)[:top_n])
-            acertos_sim.append(len(top & alvo))
-        medias_sim.append(np.mean(acertos_sim))
+            acertos_val_sim.append(len(top & alvo))
+        media_val_sim = np.mean(acertos_val_sim) if acertos_val_sim else 0
+        if media_val_sim < best_score - 0.5:
+            janela_sim, pesos_sim, metodo_sim = 10, (0.5,0.2,0.3), 'linear'
+
+        # Teste OOS simulado
+        acertos_oos_sim = []
+        for i in range(len(sim_teste)):
+            passado = sim_treino + sim_validacao + sim_teste[:i]
+            alvo = set(sim_teste[i]['dezenas'])
+            inicio_jan = max(0, len(passado)-janela_sim)
+            freq = freq_janela(passado, inicio_jan, len(passado))
+            hist = freq_janela(passado, 0, len(passado))
+            atr = calcular_atrasos(passado, indice=len(passado))
+            atr_vals = np.array(list(atr.values()))
+            atr_mean, atr_std = np.mean(atr_vals), np.std(atr_vals)
+            atr_z = {d: (atr[d] - atr_mean) / (atr_std + 1e-9) for d in range(1,26)}
+            scores = {d: score_dezena(freq[d], hist[d], atr_z[d], janela_sim, janela_historica, pesos_sim, metodo_sim) for d in range(1,26)}
+            top = set(sorted(range(1,26), key=lambda d: scores[d], reverse=True)[:top_n])
+            acertos_oos_sim.append(len(top & alvo))
+        medias_sim.append(np.mean(acertos_oos_sim))
     medias_sim = np.array(medias_sim)
     p_mc = np.mean(medias_sim >= obs_media)
     print(f"   Média observada (modelo otimizado): {obs_media:.3f}")
@@ -962,7 +1043,8 @@ def analise_frequentes_atraso_v2(contests, top_n=10, janelas_recentes=[3,5,7,10,
     # ---------------- 7. Ranking detalhado para o próximo concurso ----------------
     print(f"\n🏆 Ranking final das 25 dezenas (para o próximo concurso):")
     passado_total = contests
-    freq_jan = freq_janela(passado_total, len(passado_total)-janela_opt, len(passado_total))
+    inicio_jan_opt = max(0, len(passado_total)-janela_opt)
+    freq_jan = freq_janela(passado_total, inicio_jan_opt, len(passado_total))
     hist = freq_janela(passado_total, 0, len(passado_total))
     atr = calcular_atrasos(passado_total)
     atr_vals = np.array(list(atr.values()))
@@ -1002,7 +1084,7 @@ def analise_frequentes_atraso_v2(contests, top_n=10, janelas_recentes=[3,5,7,10,
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v49.1")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v49.2")
     print("   MONTE CARLO CORRIGIDO + WALK‑FORWARD ESTRUTURAL + EXCLUSÃO + ANÁLISE AVANÇADA DE ATRASO")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
@@ -1233,9 +1315,9 @@ def main():
             try:
                 top_n = int(input("\n   Quantas dezenas analisar [10]: ").strip() or "10")
                 min_history = int(input("   Histórico mínimo para walk‑forward [500]: ").strip() or "500")
-                n_sim = int(input("   Simulações Monte Carlo [500]: ").strip() or "500")
+                n_sim = int(input("   Simulações Monte Carlo [100]: ").strip() or "100")
             except:
-                top_n, min_history, n_sim = 10, 500, 500
+                top_n, min_history, n_sim = 10, 500, 100
             analise_frequentes_atraso_v2(contests, top_n=top_n, min_history=min_history, n_sim_mc=n_sim)
         
         elif op == '0':
