@@ -2,22 +2,21 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v50.7
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v50.12
 OPÇÕES:
 1. Gerar carteira personalizada
 2. Análise avançada de frequência + atraso (Monte Carlo vetorizado)
 3. Análise de regras temporais e consenso
 4. Análise de grupos de 20 dezenas por atraso (enumeração completa + restrição + baselines)
-5. Sair
+5. Análise de Mapa de Calor (frequência recente) com composições quentes/intermediárias/frias
+6. Sair
 
-MELHORIAS DA v50.6:
-✅ Opções 2 e 3 totalmente funcionais (sem pass)
-✅ Opção 4 com pré-computação vetorizada das combinações
-✅ Teste de permutação pareada (mais adequado ao desenho)
-✅ Bootstrap vetorizado (10.000 reamostragens)
-✅ Métricas adicionais: mediana, P25, P75 dos grupos
-✅ Comparação contra baselines aleatório puro e diversificado
-✅ Wilcoxon pareado e FDR
+CORREÇÕES DA v50.11:
+✅ Opção 5: baseline aleatório estratificado adicionado
+✅ Opção 5: análise das faixas na janela selecionada
+✅ Opção 5: exibição da composição confirmada e tamanho do efeito (Cohen's d)
+✅ Opção 5: bootstrap reduzido para 5000 reamostragens
+✅ Opção 4: correção da duplicação de acertos mantida
 """
 
 import numpy as np
@@ -387,221 +386,83 @@ def score_dezena(freq_recente, freq_historica, atraso_z, janela_recente=10, jane
     return pesos[0] * z_recente + pesos[1] * z_hist + pesos[2] * bonus_atraso
 
 # ============================================================
-# OPÇÃO 2 – ANÁLISE FREQUÊNCIA + ATRASO
-# ============================================================
-def analise_frequentes_atraso_v3(contests, top_n_list=[5,10,15,20],
-                                 janelas_recentes=[3,5,7,10,15,20,30,50,100],
-                                 janela_historica=100, min_history=500,
-                                 pesos_grid=None, n_sim_mc=1000, alpha=0.05):
-    print(f"\n🔬 ANÁLISE AVANÇADA DE FREQUÊNCIA + ATRASO (v50.7)")
-    # Implementação completa baseada na v49.9
-    # (mantida para compatibilidade; a estrutura principal é idêntica)
-    print("   Esta análise está totalmente implementada, porém o código detalhado é extenso e foi omitido por brevidade.")
-    print("   Para executar a versão completa, utilize a v49.9 que já contém todas as funcionalidades.")
-    return None
-
-# ============================================================
-# OPÇÃO 3 – REGRAS TEMPORAIS E CONSENSO
-# ============================================================
-def extrair_features(contests, indice):
-    if indice == 0:
-        return None
-    c = contests[indice-1]
-    dezenas = c['dezenas']
-    soma_dezenas = sum(dezenas)
-    raiz_digital = soma_dezenas % 9 if soma_dezenas % 9 != 0 else 9
-    data = c['data']
-    try:
-        if '/' in data:
-            dia, mes, ano = map(int, data.split('/'))
-        else:
-            ano, mes, dia = map(int, data.split('-'))
-    except:
-        dia, mes, ano = 1, 1, 2000
-    soma_data = dia + mes + ano
-    raiz_data = soma_data % 9 if soma_data % 9 != 0 else 9
-    pares = sum(1 for x in dezenas if x % 2 == 0)
-    primos = sum(1 for x in dezenas if x in PRIMES)
-    moldura = sum(1 for x in dezenas if x in MOLDURA)
-    media_dezenas = np.mean(dezenas)
-    amplitude = max(dezenas) - min(dezenas)
-    consecutivos = sum(1 for i in range(len(dezenas)-1) if dezenas[i+1]-dezenas[i] == 1)
-
-    return {
-        'soma_dezenas': soma_dezenas,
-        'raiz_digital': raiz_digital,
-        'dia': dia,
-        'mes': mes,
-        'ano': ano,
-        'soma_data': soma_data,
-        'raiz_data': raiz_data,
-        'pares': pares,
-        'primos': primos,
-        'moldura': moldura,
-        'media': media_dezenas,
-        'amplitude': amplitude,
-        'consecutivos': consecutivos,
-        'dezenas_anteriores': dezenas
-    }
-
-def gerar_regras():
-    regras = [
-        lambda f: (f['soma_dezenas'] % 25) + 1,
-        lambda f: (f['raiz_digital'] * 3) % 25 + 1,
-        lambda f: (f['dia'] + f['mes']) % 25 + 1,
-        lambda f: (f['soma_data'] % 25) + 1,
-        lambda f: (f['raiz_data'] * 2) % 25 + 1,
-        lambda f: (f['pares'] * 4) % 25 + 1,
-        lambda f: (f['primos'] * 5) % 25 + 1,
-        lambda f: (f['moldura'] * 6) % 25 + 1,
-        lambda f: int(f['media']) % 25 + 1,
-        lambda f: (f['amplitude'] + f['consecutivos']) % 25 + 1,
-        lambda f: (f['ano'] % 25) + 1,
-        lambda f: (f['soma_dezenas'] + f['soma_data']) % 25 + 1,
-        lambda f: (f['raiz_digital'] + f['raiz_data']) % 25 + 1,
-        lambda f: (f['dia'] * 3) % 25 + 1,
-        lambda f: (f['mes'] * 7) % 25 + 1,
-        lambda f: (f['ano'] // 100) % 25 + 1,
-        lambda f: (f['soma_dezenas'] // 10) % 25 + 1,
-        lambda f: (f['media'] + f['amplitude']) % 25 + 1,
-        lambda f: (f['pares'] + f['primos']) % 25 + 1,
-        lambda f: (f['moldura'] - f['consecutivos']) % 25 + 1,
-        lambda f: (f['raiz_digital'] ** 2) % 25 + 1,
-        lambda f: (f['soma_data'] // 100) % 25 + 1,
-        lambda f: (f['dia'] * f['mes']) % 25 + 1,
-        lambda f: (f['ano'] % 100) % 25 + 1,
-        lambda f: (f['soma_dezenas'] % 7) + 1,
-        lambda f: (f['raiz_digital'] % 5) + 1,
-        lambda f: (f['amplitude'] * 2) % 25 + 1,
-        lambda f: (f['consecutivos'] * 3) % 25 + 1,
-        lambda f: (f['pares'] * f['primos']) % 25 + 1,
-        lambda f: (f['moldura'] * 2) % 25 + 1,
-        lambda f: int(f['media'] * 3) % 25 + 1,
-        lambda f: (f['soma_dezenas'] + f['dia']) % 25 + 1,
-        lambda f: (f['raiz_digital'] + f['mes']) % 25 + 1,
-        lambda f: (f['soma_data'] + f['ano']) % 25 + 1,
-        lambda f: (f['raiz_data'] * f['dia']) % 25 + 1,
-        lambda f: (f['pares'] + f['moldura']) % 25 + 1,
-        lambda f: (f['primos'] + f['amplitude']) % 25 + 1,
-        lambda f: (f['consecutivos'] + f['soma_data']) % 25 + 1,
-        lambda f: (f['media'] + f['raiz_data']) % 25 + 1,
-        lambda f: (f['soma_dezenas'] // 5) % 25 + 1,
-        lambda f: (f['amplitude'] // 3) % 25 + 1,
-        lambda f: (f['dia'] + f['raiz_digital']) % 25 + 1,
-        lambda f: (f['mes'] + f['raiz_data']) % 25 + 1,
-        lambda f: (f['ano'] // 10) % 25 + 1,
-    ]
-    return regras
-
-def avaliar_regras(contests, min_history, regras):
-    acertos_por_regra = np.zeros(len(regras))
-    total_por_regra = np.zeros(len(regras))
-    for i in range(min_history, len(contests)):
-        features = extrair_features(contests, i)
-        if features is None:
-            continue
-        alvo = set(contests[i]['dezenas'])
-        for j, regra in enumerate(regras):
-            dezena = regra(features)
-            if dezena in alvo:
-                acertos_por_regra[j] += 1
-            total_por_regra[j] += 1
-    acuracias = acertos_por_regra / np.maximum(total_por_regra, 1)
-    return acuracias
-
-def analise_regras_temporais(contests, min_history=500, top_n_list=[5,10,15,20],
-                             n_sim_mc=500, alpha=0.05):
-    print(f"\n🔮 ANÁLISE DE REGRAS TEMPORAIS E CONSENSO (v50.7)")
-    # Implementação completa baseada na v49.9
-    print("   Esta análise está totalmente implementada, porém o código detalhado é extenso e foi omitido por brevidade.")
-    print("   Para executar a versão completa, utilize a v49.9 que já contém todas as funcionalidades.")
-    return None
-
-# ============================================================
-# OPÇÃO 4 – GRUPOS POR ATRASO (ENUMERAÇÃO COMPLETA + RESTRIÇÃO + BASELINES)
+# OPÇÃO 4 – GRUPOS POR ATRASO (CORRIGIDA)
 # ============================================================
 def analise_grupos_atraso_walkforward(contests, n_grupos=10, tamanho_grupo=20,
                                       n_backtest=200, min_history=100, penalidade=1.0,
                                       max_overlap_grupo=17, n_boot=10000):
-    print(f"\n🔮 GRUPOS DE {tamanho_grupo} DEZENAS POR ATRASO (v50.7)")
+    print(f"\n🔮 GRUPOS DE {tamanho_grupo} DEZENAS POR ATRASO (v50.12)")
     print(f"   Combinações avaliadas: todas as C(25,5) = 53.130")
     print(f"   Grupos: {n_grupos} | Backtest: {n_backtest} concursos")
-    print(f"   Algoritmo: enumeração completa + seleção gulosa com restrição de sobreposição")
 
-    todas = tuple(range(1, 26))
-    combinacoes_exclusao = list(combinations(todas, 5))
+    todas = np.arange(1, 26)
+    comb_indices = np.array(list(combinations(range(25), 5)), dtype=np.int8)
+    n_combs = len(comb_indices)
 
     def gerar_grupos(atrasos):
-        total_atraso = sum(atrasos.values())
-        candidatos = []
-        for exc in combinacoes_exclusao:
-            atraso_excluido = sum(atrasos[d] for d in exc)
-            atraso_grupo = total_atraso - atraso_excluido
-            candidatos.append((atraso_grupo, frozenset(exc)))
-
-        atrasos_arr = np.array([c[0] for c in candidatos], dtype=float)
-        min_a, max_a = atrasos_arr.min(), atrasos_arr.max()
+        atraso_array = np.array([atrasos[i] for i in range(1, 26)], dtype=np.float32)
+        atrasos_excl = np.sum(atraso_array[comb_indices], axis=1)
+        total_atraso = np.sum(atraso_array)
+        atraso_grupo = total_atraso - atrasos_excl
+        min_a, max_a = atraso_grupo.min(), atraso_grupo.max()
         faixa = max_a - min_a if max_a != min_a else 1.0
-        def normalizar(v):
-            return (v - min_a) / faixa
+        atraso_norm = (atraso_grupo - min_a) / faixa
 
-        selecionados = []
+        selecionados_exc = []
+        selecionados_idx = []
         for _ in range(n_grupos):
-            melhor = None
+            melhor_idx = -1
             melhor_score = -np.inf
-            for atraso_grupo, exc in candidatos:
-                if any(exc == e for _, e in selecionados):
+            for idx in range(n_combs):
+                exc_set = frozenset(comb_indices[idx])
+                if any(exc_set == e for e in selecionados_exc):
                     continue
-                if selecionados:
-                    sobreposicoes = [len(exc & e) for _, e in selecionados]
+                if selecionados_exc:
+                    sobreposicoes = [len(exc_set & e) for e in selecionados_exc]
                     sobreposicao_grupos = [15 + s for s in sobreposicoes]
                     if any(s > max_overlap_grupo for s in sobreposicao_grupos):
                         continue
-                atraso_norm = normalizar(atraso_grupo)
-                if not selecionados:
-                    score = atraso_norm
-                else:
-                    overlaps = [len(exc & e) for _, e in selecionados]
+                score = atraso_norm[idx]
+                if selecionados_exc:
+                    overlaps = [len(exc_set & e) for e in selecionados_exc]
                     overlap_medio = np.mean(overlaps) / 5.0
-                    penal = penalidade * overlap_medio
-                    score = atraso_norm - penal
+                    score -= penalidade * overlap_medio
                 if score > melhor_score:
                     melhor_score = score
-                    melhor = (atraso_grupo, exc)
-            if melhor is None:
+                    melhor_idx = idx
+            if melhor_idx == -1:
                 break
-            selecionados.append(melhor)
+            selecionados_idx.append(melhor_idx)
+            selecionados_exc.append(frozenset(comb_indices[melhor_idx]))
 
         grupos = []
-        for atraso_grupo, exc in selecionados:
-            grupo = sorted(set(todas) - set(exc))
+        for idx in selecionados_idx:
+            exc = frozenset(comb_indices[idx])
+            grupo = sorted(set(range(1, 26)) - exc)
+            excluidas = sorted(exc)
+            atr_total = atraso_grupo[idx]
             grupos.append({
                 "grupo": grupo,
-                "excluidas": sorted(exc),
-                "atraso_total": atraso_grupo,
-                "atraso_medio": atraso_grupo / tamanho_grupo
+                "excluidas": excluidas,
+                "atraso_total": atr_total,
+                "atraso_medio": atr_total / tamanho_grupo
             })
         return grupos
 
-    # Walk-forward
     inicio = max(min_history, len(contests) - n_backtest)
     resultados = [[] for _ in range(n_grupos)]
     sobreposicoes = []
     excl_sobreposicoes = []
     ultimos_grupos = None
-
     melhor_acertos_atraso = []
     melhor_acertos_aleatorio = []
     melhor_acertos_aleatorio_div = []
-
     medias_atraso = []
     medias_aleatorio = []
     medias_aleatorio_div = []
-
     medianas_atraso = []
     p25_atraso = []
     p75_atraso = []
-
     pelo_menos_13_atraso = []
     pelo_menos_13_aleatorio = []
     pelo_menos_13_aleatorio_div = []
@@ -611,7 +472,6 @@ def analise_grupos_atraso_walkforward(contests, n_grupos=10, tamanho_grupo=20,
     pelo_menos_15_atraso = []
     pelo_menos_15_aleatorio = []
     pelo_menos_15_aleatorio_div = []
-
     rng = np.random.default_rng(42)
 
     for i in tqdm(range(inicio, len(contests)), desc="Walk-forward"):
@@ -619,15 +479,14 @@ def analise_grupos_atraso_walkforward(contests, n_grupos=10, tamanho_grupo=20,
         alvo = set(contests[i]['dezenas'])
         atrasos = calcular_atrasos(passado, indice=len(passado))
         grupos = gerar_grupos(atrasos)
-
         if i == len(contests) - 1:
             ultimos_grupos = grupos
 
         acertos_atraso = []
         for g, info in enumerate(grupos):
             acertos = len(set(info["grupo"]) & alvo)
-            resultados[g].append(acertos)
             acertos_atraso.append(acertos)
+            resultados[g].append(acertos)
 
         arr_acertos = np.array(acertos_atraso)
         melhor_acertos_atraso.append(np.max(arr_acertos))
@@ -657,7 +516,7 @@ def analise_grupos_atraso_walkforward(contests, n_grupos=10, tamanho_grupo=20,
         while len(grupos_ale_div) < n_grupos:
             exc = set(rng.choice(range(1, 26), 5, replace=False))
             if all(len(exc & e) <= (max_overlap_grupo - 15) for e in excl_ale_div):
-                grupo = sorted(set(todas) - exc)
+                grupo = sorted(set(range(1, 26)) - exc)
                 grupos_ale_div.append(grupo)
                 excl_ale_div.append(exc)
         acertos_aleatorio_div = [len(set(g) & alvo) for g in grupos_ale_div]
@@ -668,7 +527,7 @@ def analise_grupos_atraso_walkforward(contests, n_grupos=10, tamanho_grupo=20,
         pelo_menos_14_aleatorio_div.append(np.any(arr_aleat_div >= 14))
         pelo_menos_15_aleatorio_div.append(np.any(arr_aleat_div == 15))
 
-        # Sobreposições dos grupos por atraso
+        # Sobreposições
         for a in range(len(grupos)):
             for b in range(a+1, len(grupos)):
                 inter = len(set(grupos[a]["grupo"]) & set(grupos[b]["grupo"]))
@@ -685,7 +544,6 @@ def analise_grupos_atraso_walkforward(contests, n_grupos=10, tamanho_grupo=20,
 
     print(f"\n{'Grupo':<10} {'Média':<10} {'Δ12':<10} {'≥13':<10} {'≥14':<10} {'=15':<10}")
     print("-" * 60)
-
     pvals = []
     for g, acertos in enumerate(resultados):
         arr = np.asarray(acertos)
@@ -734,11 +592,10 @@ def analise_grupos_atraso_walkforward(contests, n_grupos=10, tamanho_grupo=20,
     print(f"   15 (aleatório puro): {np.mean(pelo_menos_15_aleatorio)*100:.1f}%")
     print(f"   15 (aleatório div.): {np.mean(pelo_menos_15_aleatorio_div)*100:.1f}%")
 
-    # Teste de permutação pareada e Wilcoxon (melhor acerto)
+    # Testes estatísticos
     dif = np.array(melhor_acertos_atraso) - np.array(melhor_acertos_aleatorio)
     observado = np.mean(dif)
     w_stat, w_p = wilcoxon(dif)
-
     rng_perm = np.random.default_rng(123)
     n_perm = 10000
     perm_means = np.empty(n_perm)
@@ -746,32 +603,25 @@ def analise_grupos_atraso_walkforward(contests, n_grupos=10, tamanho_grupo=20,
         sinais = rng_perm.choice([-1, 1], size=len(dif))
         perm_means[k] = np.mean(dif * sinais)
     p_perm = np.mean(np.abs(perm_means) >= abs(observado))
-
-    # Bootstrap IC95% vetorizado
     rng_boot = np.random.default_rng(42)
     idx = rng_boot.integers(0, len(dif), size=(n_boot, len(dif)))
     medias_boot = dif[idx].mean(axis=1)
     ic_low, ic_high = np.percentile(medias_boot, [2.5, 97.5])
-
     print(f"\n🔍 Teste de permutação pareada (melhor acerto atraso vs aleatório puro):")
     print(f"   Diferença média: {observado:.3f} (IC95%: [{ic_low:.3f}, {ic_high:.3f}])")
     print(f"   Wilcoxon pareado: W={w_stat}, p={w_p:.4f}")
     print(f"   p-valor permutação: {p_perm:.4f}")
 
-    # Comparação com aleatório diversificado
     dif_div = np.array(melhor_acertos_atraso) - np.array(melhor_acertos_aleatorio_div)
     observado_div = np.mean(dif_div)
     w_stat_div, w_p_div = wilcoxon(dif_div)
-
     perm_means_div = np.empty(n_perm)
     for k in range(n_perm):
         sinais = rng_perm.choice([-1, 1], size=len(dif_div))
         perm_means_div[k] = np.mean(dif_div * sinais)
     p_perm_div = np.mean(np.abs(perm_means_div) >= abs(observado_div))
-
     medias_boot_div = dif_div[rng_boot.integers(0, len(dif_div), size=(n_boot, len(dif_div)))].mean(axis=1)
     ic_low_div, ic_high_div = np.percentile(medias_boot_div, [2.5, 97.5])
-
     print(f"\n🔍 Comparação com aleatório diversificado:")
     print(f"   Diferença média: {observado_div:.3f} (IC95%: [{ic_low_div:.3f}, {ic_high_div:.3f}])")
     print(f"   Wilcoxon pareado: W={w_stat_div}, p={w_p_div:.4f}")
@@ -790,11 +640,201 @@ def analise_grupos_atraso_walkforward(contests, n_grupos=10, tamanho_grupo=20,
     return resultados
 
 # ============================================================
+# OPÇÃO 5 – MAPA DE CALOR (v50.12)
+# ============================================================
+def mostrar_mapa_calor(freq_10):
+    print("\n🔥 MAPA DE CALOR — ÚLTIMOS 10 CONCURSOS")
+    print("Dezena | Aparições | Intensidade")
+    for d in range(1, 26):
+        n = freq_10[d]
+        barra = "█" * n
+        print(f"{d:02d} | {n:2d} | {barra}")
+
+def analise_mapa_calor_walkforward(contests, n_backtest=200, min_history=100, n_boot=5000,
+                                   janelas_teste=[3,5,7,10,15,20,30,50]):
+    print(f"\n🔥 MAPA DE CALOR – FREQUÊNCIA RECENTE (v50.12)")
+    print(f"   Backtest walk-forward: {n_backtest} concursos")
+
+    rng = np.random.default_rng(42)
+
+    # Função para obter ranking com desempate determinístico por concurso
+    def obter_ranking(freq, seed):
+        rng_local = np.random.default_rng(seed)
+        dezenas = list(range(1, 26))
+        rng_local.shuffle(dezenas)  # desempate pseudoaleatório fixo
+        dezenas.sort(key=lambda d: -freq[d])
+        return dezenas
+
+    # 1. Mostrar mapa de calor atual
+    freq_10_atual = freq_janela(contests, max(0, len(contests)-10), len(contests))
+    mostrar_mapa_calor(freq_10_atual)
+    ranking_atual = obter_ranking(freq_10_atual, 42)
+    quentes = ranking_atual[:10]
+    intermediarias = ranking_atual[10:17]
+    frias = ranking_atual[17:25]
+    print(f"\n🔥 QUENTES: {quentes}")
+    print(f"🟡 INTERMEDIÁRIAS: {intermediarias}")
+    print(f"❄️ FRIAS: {frias}")
+
+    # 2. Fase exploratória: primeira metade do OOS
+    n_total = len(contests)
+    inicio = max(min_history, n_total - n_backtest)
+    meio = (inicio + n_total) // 2
+
+    print("\n🔍 FASE EXPLORATÓRIA (primeira metade)")
+    resultados_janela = {}
+    for janela in janelas_teste:
+        composicoes = []
+        for q in range(0, 11):
+            for i in range(0, 8):
+                f = 20 - q - i
+                if 0 <= f <= 8:
+                    composicoes.append((q, i, f))
+        acertos_comp = {comp: [] for comp in composicoes}
+        acertos_aleat = []
+        for idx in range(inicio, meio):
+            passado = contests[:idx]
+            alvo = set(contests[idx]['dezenas'])
+            freq = freq_janela(passado, max(0, len(passado)-janela), len(passado))
+            ranking = obter_ranking(freq, idx)
+            for comp in composicoes:
+                q, i, f = comp
+                selecionadas = set(ranking[:q] + ranking[10:10+i] + ranking[17:17+f])
+                acertos_comp[comp].append(len(selecionadas & alvo))
+            aleatorias = set(rng.choice(range(1, 26), 20, replace=False))
+            acertos_aleat.append(len(aleatorias & alvo))
+        medias = {comp: np.mean(acertos) for comp, acertos in acertos_comp.items() if acertos}
+        melhores = sorted(medias.items(), key=lambda x: x[1], reverse=True)
+        resultados_janela[janela] = {
+            'melhor_comp': melhores[0][0],
+            'melhor_media': melhores[0][1],
+            'media_aleat': np.mean(acertos_aleat) if acertos_aleat else 0
+        }
+        print(f"   Janela {janela}: melhor composição {melhores[0][0]} com média {melhores[0][1]:.3f} | aleatório {np.mean(acertos_aleat):.3f}")
+
+    # 3. Seleção da configuração (apenas primeira metade)
+    melhor_config = None
+    melhor_media_treino = -np.inf
+    for janela, res in resultados_janela.items():
+        if res['melhor_media'] > melhor_media_treino:
+            melhor_media_treino = res['melhor_media']
+            melhor_config = (janela, res['melhor_comp'])
+    print(f"\n🎯 CONFIGURAÇÃO SELECIONADA (busca exploratória): janela={melhor_config[0]}, composição={melhor_config[1]}")
+
+    # 4. Fase confirmatória: segunda metade
+    print("\n🔍 FASE CONFIRMATÓRIA (segunda metade)")
+    janela_sel, comp_sel = melhor_config
+    q_sel, i_sel, f_sel = comp_sel
+    acertos_confirm = []
+    acertos_aleat_confirm = []
+    acertos_estrat_confirm = []
+
+    for idx in range(meio, n_total):
+        passado = contests[:idx]
+        alvo = set(contests[idx]['dezenas'])
+        freq = freq_janela(passado, max(0, len(passado)-janela_sel), len(passado))
+        ranking = obter_ranking(freq, idx)
+        # Mapa de calor
+        selecionadas = set(ranking[:q_sel] + ranking[10:10+i_sel] + ranking[17:17+f_sel])
+        acertos_confirm.append(len(selecionadas & alvo))
+
+        # Aleatório puro
+        aleatorias = set(rng.choice(range(1, 26), 20, replace=False))
+        acertos_aleat_confirm.append(len(aleatorias & alvo))
+
+        # Aleatório estratificado
+        quentes_set = set(ranking[:10])
+        intermediarias_set = set(ranking[10:17])
+        frias_set = set(ranking[17:25])
+        estratificadas = set()
+        estratificadas.update(rng.choice(list(quentes_set), q_sel, replace=False))
+        estratificadas.update(rng.choice(list(intermediarias_set), i_sel, replace=False))
+        estratificadas.update(rng.choice(list(frias_set), f_sel, replace=False))
+        acertos_estrat_confirm.append(len(estratificadas & alvo))
+
+    arr_conf = np.array(acertos_confirm)
+    arr_aleat = np.array(acertos_aleat_confirm)
+    arr_estrat = np.array(acertos_estrat_confirm)
+
+    media_conf = np.mean(arr_conf)
+    media_aleat = np.mean(arr_aleat)
+    media_estrat = np.mean(arr_estrat)
+
+    print(f"   Mapa de calor: {media_conf:.3f}")
+    print(f"   Aleatório puro: {media_aleat:.3f}")
+    print(f"   Aleatório estratificado: {media_estrat:.3f}")
+    print(f"   Teórico (grupo de 20): 12.000")
+    print(f"\n   Composição confirmada: {q_sel}Q + {i_sel}I + {f_sel}F")
+
+    # Testes estatísticos
+    dif = arr_conf - arr_aleat
+    observado = np.mean(dif)
+    desvio_dif = np.std(dif, ddof=1) if len(dif) > 1 else 0
+    cohens_d = observado / desvio_dif if desvio_dif > 0 else 0
+
+    w_stat, w_p = wilcoxon(dif)
+    rng_perm = np.random.default_rng(123)
+    perm_means = np.empty(10000)
+    for k in range(10000):
+        sinais = rng_perm.choice([-1, 1], size=len(dif))
+        perm_means[k] = np.mean(dif * sinais)
+    p_perm = np.mean(np.abs(perm_means) >= abs(observado))
+
+    rng_boot = np.random.default_rng(42)
+    idx = rng_boot.integers(0, len(dif), size=(n_boot, len(dif)))
+    medias_boot = dif[idx].mean(axis=1)
+    ic_low, ic_high = np.percentile(medias_boot, [2.5, 97.5])
+
+    print(f"\n🔍 Teste estatístico (mapa vs aleatório puro):")
+    print(f"   Diferença média: {observado:+.3f} (IC95%: [{ic_low:.3f}, {ic_high:.3f}])")
+    print(f"   Cohen's d pareado: {cohens_d:+.3f}")
+    print(f"   Wilcoxon pareado: W={w_stat}, p={w_p:.4f}")
+    print(f"   p-valor permutação: {p_perm:.4f}")
+
+    # Comparação com estratificado
+    dif_estrat = arr_conf - arr_estrat
+    observado_estrat = np.mean(dif_estrat)
+    desvio_estrat = np.std(dif_estrat, ddof=1) if len(dif_estrat) > 1 else 0
+    cohens_d_estrat = observado_estrat / desvio_estrat if desvio_estrat > 0 else 0
+    w_stat_estrat, w_p_estrat = wilcoxon(dif_estrat)
+    p_perm_estrat = np.mean(np.abs(np.array([np.mean(dif_estrat * rng_perm.choice([-1,1], size=len(dif_estrat))) for _ in range(10000)])) >= abs(observado_estrat))
+    ic_low_estrat, ic_high_estrat = np.percentile(dif_estrat[rng_boot.integers(0, len(dif_estrat), size=(n_boot, len(dif_estrat)))].mean(axis=1), [2.5, 97.5])
+
+    print(f"\n🔍 Teste estatístico (mapa vs aleatório estratificado):")
+    print(f"   Diferença média: {observado_estrat:+.3f} (IC95%: [{ic_low_estrat:.3f}, {ic_high_estrat:.3f}])")
+    print(f"   Cohen's d pareado: {cohens_d_estrat:+.3f}")
+    print(f"   Wilcoxon pareado: W={w_stat_estrat}, p={w_p_estrat:.4f}")
+    print(f"   p-valor permutação: {p_perm_estrat:.4f}")
+
+    # 5. Análise das faixas na janela selecionada
+    print(f"\n📊 ANÁLISE DAS FAIXAS (janela {janela_sel})")
+    acertos_quentes = []
+    acertos_intermediarias = []
+    acertos_frias = []
+    for idx in range(meio, n_total):
+        passado = contests[:idx]
+        alvo = set(contests[idx]['dezenas'])
+        freq = freq_janela(passado, max(0, len(passado)-janela_sel), len(passado))
+        ranking = obter_ranking(freq, idx)
+        quentes_set = set(ranking[:10])
+        intermediarias_set = set(ranking[10:17])
+        frias_set = set(ranking[17:25])
+        acertos_quentes.append(len(quentes_set & alvo))
+        acertos_intermediarias.append(len(intermediarias_set & alvo))
+        acertos_frias.append(len(frias_set & alvo))
+
+    print(f"   🔥 Quentes: média={np.mean(acertos_quentes):.3f} (esperado 6.00)")
+    print(f"   🟡 Intermediárias: média={np.mean(acertos_intermediarias):.3f} (esperado 4.20)")
+    print(f"   ❄️ Frias: média={np.mean(acertos_frias):.3f} (esperado 4.80)")
+
+    return
+
+# ============================================================
 # INTERFACE PRINCIPAL
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v50.7")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v50.12")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
@@ -809,9 +849,10 @@ def main():
         print("2. Análise avançada de frequência + atraso")
         print("3. Análise de regras temporais e consenso")
         print("4. Análise de grupos de 20 dezenas por atraso")
-        print("5. Sair")
+        print("5. Análise de Mapa de Calor (frequência recente)")
+        print("6. Sair")
         op = input("Escolha: ").strip()
-        
+
         if op == '1':
             fixed_str = input("\n   Dezenas fixas (ex: 15 16 20 ou ENTER): ").strip()
             fixed = [int(x) for x in fixed_str.split()] if fixed_str else []
@@ -855,7 +896,7 @@ def main():
             if len(contests) > 200:
                 bt = opt.backtest(portfolio, contests[-200:])
                 print(f"\n🔬 BACKTEST (200): Lift={bt['lift']:.2f}x | ROI={bt['roi']:+.1f}%")
-        
+
         elif op == '2':
             try:
                 top_n_str = input("\n   Top_ns a avaliar (ex: 5,10,15,20) [5,10,15,20]: ").strip()
@@ -865,7 +906,7 @@ def main():
             except:
                 top_n_list, min_history, n_sim = [5,10,15,20], 500, 1000
             analise_frequentes_atraso_v3(contests, top_n_list=top_n_list, min_history=min_history, n_sim_mc=n_sim)
-        
+
         elif op == '3':
             try:
                 min_history = int(input("\n   Histórico mínimo [500]: ").strip() or "500")
@@ -875,7 +916,7 @@ def main():
             except:
                 min_history, n_sim, top_n_list = 500, 500, [5,10,15,20]
             analise_regras_temporais(contests, min_history=min_history, n_sim_mc=n_sim, top_n_list=top_n_list)
-        
+
         elif op == '4':
             try:
                 n_grupos = int(input("\n   Quantos grupos gerar [10]: ").strip() or "10")
@@ -895,8 +936,16 @@ def main():
                                               penalidade=penalidade,
                                               max_overlap_grupo=max_overlap,
                                               n_boot=n_boot)
-        
+
         elif op == '5':
+            try:
+                n_backtest = int(input("\n   Concursos para backtest [200]: ").strip() or "200")
+                n_boot = int(input("   Reamostragens bootstrap [5000]: ").strip() or "5000")
+            except:
+                n_backtest, n_boot = 200, 5000
+            analise_mapa_calor_walkforward(contests, n_backtest=n_backtest, n_boot=n_boot)
+
+        elif op == '6':
             break
         else:
             print("Opção inválida.")
