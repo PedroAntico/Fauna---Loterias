@@ -2,19 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-AUDITORIA TEMPORAL – Teste de existência de dependência temporal
-Independente de arquitetura de IA.
+AUDITORIA TEMPORAL v2 – Confirmação de sinais de dependência temporal
 
 Correções:
-  - Exclui diagonal da matriz 25×25
-  - Teste bilateral para autocorrelação (valores negativos também)
-  - FDR sobre 250 testes individuais (25 dezenas × 10 lags)
-  - Nomenclatura: autocorrelacao() para qualquer série
-  - RNG mestre para placebos reproduzíveis
-  - Mostra distribuição completa dos 600 pares off-diagonal
-
-Pergunta: Existe informação no passado que distingue a sequência real
-de uma sequência temporalmente embaralhada?
+  - FDR sobre os p-values da confirmação
+  - Camadas de confirmação: nominal, FDR, consistência de sinal
+  - Odds ratio adicionado
+  - Saída como "sinais candidatos" e "desempenho na confirmação"
+  - Separação descoberta/confirmação preservada
 """
 
 import numpy as np
@@ -23,13 +18,6 @@ import os, time, warnings
 from tqdm import tqdm
 
 warnings.filterwarnings('ignore')
-
-# ============================================================
-# CONSTANTES
-# ============================================================
-PRIMES = {2,3,5,7,11,13,17,19,23}
-MOLDURA = {1,2,3,4,5,6,10,11,15,16,20,21,22,23,24,25}
-FIBONACCI = {1,2,3,5,8,13,21}
 
 # ============================================================
 # CARREGAMENTO DE DADOS
@@ -58,7 +46,6 @@ def load_all_contests(csv_file='resultados_lotofacil.csv'):
 # FUNÇÕES AUXILIARES
 # ============================================================
 def matriz_presenca(contests):
-    """Converte lista de concursos em matriz binária (n_concursos x 25)."""
     n = len(contests)
     X = np.zeros((n, 25), dtype=np.int8)
     for i, c in enumerate(contests):
@@ -66,20 +53,7 @@ def matriz_presenca(contests):
             X[i, d-1] = 1
     return X
 
-def extrair_estrutura(dezenas):
-    d = sorted(dezenas)
-    return {
-        'pares': sum(1 for x in d if x % 2 == 0),
-        'primos': sum(1 for x in d if x in PRIMES),
-        'moldura': sum(1 for x in d if x in MOLDURA),
-        'fibonacci': sum(1 for x in d if x in FIBONACCI),
-        'soma': sum(d),
-        'amplitude': max(d) - min(d),
-        'consecutivos': sum(1 for i in range(len(d)-1) if d[i+1]-d[i] == 1)
-    }
-
 def autocorrelacao(serie, lag):
-    """Autocorrelação de qualquer série (binária ou contínua)."""
     if len(serie) <= lag:
         return 0.0
     x = np.asarray(serie[:-lag], dtype=float)
@@ -89,7 +63,6 @@ def autocorrelacao(serie, lag):
     return np.corrcoef(x, y)[0, 1]
 
 def informacao_mutua_binaria(serie, lag):
-    """Informação mútua entre série binária e ela mesma deslocada de lag."""
     if len(serie) <= lag:
         return 0.0
     x = serie[:-lag]
@@ -113,26 +86,11 @@ def informacao_mutua_binaria(serie, lag):
     if p11 > 0: mi += p11 * np.log2(p11 / (px1*py1))
     return mi
 
-def dependencia_cruzada(X, i, j, lag=1):
-    """Retorna P(i em t) e P(i em t | j em t-lag)."""
-    n = X.shape[0]
-    if n <= lag:
-        return 0.0, 0.0
-    cond = X[lag:, i]
-    pred = X[:-lag, j]
-    p_base = np.mean(X[:, i])
-    if np.sum(pred) == 0:
-        p_cond = p_base
-    else:
-        p_cond = np.mean(cond[pred == 1])
-    return p_base, p_cond
-
 def fdr_bh(p_values, alpha=0.05):
-    """Benjamini-Hochberg FDR."""
     p = np.array(p_values)
     n = len(p)
     if n == 0:
-        return []
+        return [], []
     ordem = np.argsort(p)
     p_sorted = p[ordem]
     q = np.ones(n)
@@ -140,195 +98,218 @@ def fdr_bh(p_values, alpha=0.05):
     for i in range(n-2, -1, -1):
         q[i] = min(p_sorted[i], q[i+1] * (n) / (i+1))
     rejeitados = []
+    q_vals = np.ones(n)
     for i in range(n):
+        q_vals[ordem[i]] = q[i]
         if q[i] < alpha:
             rejeitados.append(ordem[i])
-    return rejeitados
+    return rejeitados, q_vals
+
+def odds_ratio(p1, p0):
+    if p1 >= 1.0 or p0 >= 1.0 or p1 <= 0.0 or p0 <= 0.0:
+        return np.inf
+    return (p1/(1-p1)) / (p0/(1-p0))
 
 # ============================================================
-# AUDITORIA PRINCIPAL
+# FUNÇÃO PRINCIPAL DA AUDITORIA
 # ============================================================
-def auditoria_temporal(contests, n_placebos=100, lag_max=10, alpha=0.05):
-    print("\n🔍 AUDITORIA TEMPORAL")
-    print(f"   Testando dependência temporal com {n_placebos} placebos")
+def auditoria_temporal_v2(contests, frac_descoberta=0.6, n_placebos_descoberta=5000,
+                          n_placebos_confirmacao=5000, lag_max=10, alpha=0.05):
+    print("\n🔍 AUDITORIA TEMPORAL v2 – Confirmação de sinais")
+    print(f"   Divisão: {frac_descoberta:.0%} descoberta / {1-frac_descoberta:.0%} confirmação")
+    print(f"   Placebos (descoberta): {n_placebos_descoberta}")
+    print(f"   Placebos (confirmação): {n_placebos_confirmacao}")
     print(f"   Lags: 1..{lag_max}\n")
 
-    X = matriz_presenca(contests)
-    n_concursos = X.shape[0]
+    n = len(contests)
+    split = int(n * frac_descoberta)
+    contests_desc = contests[:split]
+    contests_conf = contests[split:]
 
-    # Estruturas dos concursos
-    estruturas = [extrair_estrutura(c['dezenas']) for c in contests]
+    X_desc = matriz_presenca(contests_desc)
+    X_conf = matriz_presenca(contests_conf)
 
-    # ---------- 1. Estatísticas reais ----------
-    print("Computando estatísticas reais...")
+    rng_desc = np.random.default_rng(20260908)
+    rng_conf = np.random.default_rng(20260909)
 
-    # Matrizes para armazenar p-values individuais
-    p_autocorr = []  # (dezena, lag, p_value)
-    p_mi = []
+    # =====================================================
+    # FASE DE DESCOBERTA
+    # =====================================================
+    print("Fase de DESCOBERTA...")
+    n_desc = X_desc.shape[0]
 
-    # Autocorrelação e MI por dezena e lag
+    real_acf = np.zeros((25, lag_max))
+    real_mi = np.zeros((25, lag_max))
     for d in range(25):
-        serie = X[:, d]
+        serie = X_desc[:, d]
         for lag in range(1, lag_max+1):
-            ac = autocorrelacao(serie, lag)
-            mi = informacao_mutua_binaria(serie, lag)
-            # Guardamos os valores reais para comparação posterior
-            # (p-values serão calculados após gerar os placebos)
-            p_autocorr.append((d, lag, ac))
-            p_mi.append((d, lag, mi))
+            real_acf[d, lag-1] = autocorrelacao(serie, lag)
+            real_mi[d, lag-1] = informacao_mutua_binaria(serie, lag)
 
-    # Dependência cruzada lag-1 (matriz 25×25)
-    p_base_mat = np.zeros((25, 25))
-    p_cond_mat = np.zeros((25, 25))
-    for i in range(25):
-        for j in range(25):
-            p_base, p_cond = dependencia_cruzada(X, i, j, lag=1)
-            p_base_mat[i, j] = p_base
-            p_cond_mat[i, j] = p_cond
-
-    # Dependência estrutural lag-1
-    chaves_estruturais = ['pares', 'primos', 'moldura', 'fibonacci', 'soma', 'amplitude', 'consecutivos']
-    corr_estruturais = {}
-    for chave in chaves_estruturais:
-        serie = np.array([e[chave] for e in estruturas], dtype=float)
-        corr_estruturais[chave] = autocorrelacao(serie, 1)
-
-    # ---------- 2. Distribuições nulas via placebo ----------
-    print(f"\nGerando {n_placebos} placebos...")
-    rng_master = np.random.default_rng(20260908)
-
-    # Estruturas para armazenar placebos
-    autocorr_placebo = {d: {lag: [] for lag in range(1, lag_max+1)} for d in range(25)}
+    print(f"Gerando {n_placebos_descoberta} placebos (descoberta)...")
+    acf_placebo = {d: {lag: [] for lag in range(1, lag_max+1)} for d in range(25)}
     mi_placebo = {d: {lag: [] for lag in range(1, lag_max+1)} for d in range(25)}
-    cruzada_placebo = []
-    estrutural_placebo = {chave: [] for chave in chaves_estruturais}
 
-    for _ in tqdm(range(n_placebos), desc="Placebos"):
-        indices = rng_master.permutation(n_concursos)
-        X_p = X[indices]
-        estruturas_p = [estruturas[i] for i in indices]
-
-        # Autocorrelação e MI por dezena e lag
+    for _ in tqdm(range(n_placebos_descoberta), desc="Placebos desc."):
+        indices = rng_desc.permutation(n_desc)
+        X_p = X_desc[indices]
         for d in range(25):
             serie = X_p[:, d]
             for lag in range(1, lag_max+1):
                 ac = autocorrelacao(serie, lag)
                 mi = informacao_mutua_binaria(serie, lag)
-                autocorr_placebo[d][lag].append(ac)
+                acf_placebo[d][lag].append(ac)
                 mi_placebo[d][lag].append(mi)
 
-        # Dependência cruzada máxima off-diagonal lag-1
-        p_base_p = np.zeros((25, 25))
-        p_cond_p = np.zeros((25, 25))
-        mask_offdiag = ~np.eye(25, dtype=bool)
-        for i in range(25):
-            for j in range(25):
-                p_base, p_cond = dependencia_cruzada(X_p, i, j, lag=1)
-                p_base_p[i, j] = p_base
-                p_cond_p[i, j] = p_cond
-        diff_p = np.abs(p_cond_p - p_base_p)
-        cruzada_placebo.append(np.max(diff_p[mask_offdiag]))
+    p_acf = np.zeros((25, lag_max))
+    p_mi = np.zeros((25, lag_max))
+    for d in range(25):
+        for lag_idx in range(lag_max):
+            lag = lag_idx + 1
+            nula_acf = np.array(acf_placebo[d][lag])
+            p_acf[d, lag_idx] = np.mean(np.abs(nula_acf) >= abs(real_acf[d, lag_idx]))
+            nula_mi = np.array(mi_placebo[d][lag])
+            p_mi[d, lag_idx] = np.mean(nula_mi >= real_mi[d, lag_idx])
 
-        # Estrutural lag-1
-        for chave in chaves_estruturais:
-            serie = np.array([e[chave] for e in estruturas_p], dtype=float)
-            corr_estruturais_p = autocorrelacao(serie, 1)
-            estrutural_placebo[chave].append(corr_estruturais_p)
+    p_acf_flat = p_acf.flatten()
+    p_mi_flat = p_mi.flatten()
+    rej_acf, q_acf = fdr_bh(p_acf_flat, alpha)
+    rej_mi, q_mi = fdr_bh(p_mi_flat, alpha)
 
-    # ---------- 3. Cálculo de p-values individuais e FDR ----------
-    print("\nCalculando p-values e correção FDR...")
+    sinais_selecionados = set(rej_acf) | set(rej_mi)
+    sinais_selecionados = sorted(sinais_selecionados)
+    print(f"\nSinais selecionados na descoberta: {len(sinais_selecionados)}")
+    for idx in sinais_selecionados:
+        d = idx // lag_max
+        lag = idx % lag_max + 1
+        qa = q_acf[idx]
+        qm = q_mi[idx]
+        print(f"   dezena {d+1:2d}, lag {lag:2d}: ACF={real_acf[d,lag-1]:+.4f} (q={qa:.4f}), "
+              f"MI={real_mi[d,lag-1]:.4f} (q={qm:.4f})")
 
-    # Autocorrelação (teste bilateral)
-    pvals_autocorr = []
-    for d, lag, real in p_autocorr:
-        nula = np.array(autocorr_placebo[d][lag])
-        p = np.mean(np.abs(nula) >= abs(real))
-        pvals_autocorr.append(p)
+    # =====================================================
+    # FASE DE CONFIRMAÇÃO
+    # =====================================================
+    print("\nFase de CONFIRMAÇÃO...")
+    n_conf = X_conf.shape[0]
+    confirmados = []
 
-    # Informação mútua (teste unilateral, MI ≥ 0)
-    pvals_mi = []
-    for d, lag, real in p_mi:
-        nula = np.array(mi_placebo[d][lag])
-        p = np.mean(nula >= real)
-        pvals_mi.append(p)
+    for idx in sinais_selecionados:
+        d = idx // lag_max
+        lag = idx % lag_max + 1
 
-    # FDR
-    rejeitados_autocorr = fdr_bh(pvals_autocorr, alpha)
-    rejeitados_mi = fdr_bh(pvals_mi, alpha)
+        serie = X_conf[:, d]
+        real_acf_conf = autocorrelacao(serie, lag)
+        real_mi_conf = informacao_mutua_binaria(serie, lag)
 
-    # ---------- 4. Exibição dos resultados ----------
-    print("\n📊 RESULTADOS")
-    print("="*70)
+        acf_conf_nula = []
+        mi_conf_nula = []
+        for _ in range(n_placebos_confirmacao):
+            indices = rng_conf.permutation(n_conf)
+            serie_p = serie[indices]
+            acf_conf_nula.append(autocorrelacao(serie_p, lag))
+            mi_conf_nula.append(informacao_mutua_binaria(serie_p, lag))
+        acf_conf_nula = np.array(acf_conf_nula)
+        mi_conf_nula = np.array(mi_conf_nula)
+        p_acf_conf = np.mean(np.abs(acf_conf_nula) >= abs(real_acf_conf))
+        p_mi_conf = np.mean(mi_conf_nula >= real_mi_conf)
 
-    # (a) Autocorrelação
-    print("\nAUTOCORRELAÇÃO (teste bilateral, FDR sobre 250 testes)")
-    print(f"   Total de testes: {len(pvals_autocorr)}")
-    print(f"   Rejeitados após FDR: {len(rejeitados_autocorr)}")
-    if rejeitados_autocorr:
-        for idx in rejeitados_autocorr:
-            d = idx // lag_max
-            lag = idx % lag_max + 1
-            real = p_autocorr[idx][2]
-            nula = np.array(autocorr_placebo[d][lag])
-            p = pvals_autocorr[idx]
-            print(f"      dezena {d+1:2d}, lag {lag:2d}: real={real:+.4f}, p={p:.4f}")
+        # Probabilidades condicionais
+        x = serie[:-lag]
+        y = serie[lag:]
+        mask1 = x == 1
+        p_base = np.mean(serie)
+        if np.sum(mask1) > 0:
+            p_cond1 = np.mean(y[mask1])
+        else:
+            p_cond1 = p_base
+        if np.sum(~mask1) > 0:
+            p_cond0 = np.mean(y[~mask1])
+        else:
+            p_cond0 = p_base
+        diff_abs = p_cond1 - p_cond0
+        rr = (p_cond1 / p_cond0) if p_cond0 > 0 else np.inf
+        or_ = odds_ratio(p_cond1, p_cond0)
 
-    # (b) Informação mútua
-    print("\nINFORMAÇÃO MÚTUA (teste unilateral, FDR sobre 250 testes)")
-    print(f"   Total de testes: {len(pvals_mi)}")
-    print(f"   Rejeitados após FDR: {len(rejeitados_mi)}")
-    if rejeitados_mi:
-        for idx in rejeitados_mi:
-            d = idx // lag_max
-            lag = idx % lag_max + 1
-            real = p_mi[idx][2]
-            nula = np.array(mi_placebo[d][lag])
-            p = pvals_mi[idx]
-            print(f"      dezena {d+1:2d}, lag {lag:2d}: real={real:.4f}, p={p:.4f}")
+        # Persistência em 3 blocos
+        blocos = np.array_split(serie, 3)
+        acf_blocos = [autocorrelacao(bloco, lag) for bloco in blocos]
+        sinal_real = 1 if real_acf_conf >= 0 else -1
+        blocos_mesmo_sinal = sum(1 for a in acf_blocos if (a >= 0 and sinal_real == 1) or (a < 0 and sinal_real == -1))
 
-    # (c) Dependência cruzada máxima off-diagonal
-    mask_offdiag = ~np.eye(25, dtype=bool)
-    real_diff = np.abs(p_cond_mat - p_base_mat)
-    real_max_cruzada = np.max(real_diff[mask_offdiag])
-    nula_cruzada = np.array(cruzada_placebo)
-    p_cruzada = np.mean(nula_cruzada >= real_max_cruzada)
-    print(f"\nDEPENDÊNCIA CRUZADA MÁXIMA OFF-DIAGONAL (lag 1)")
-    print(f"   real={real_max_cruzada:.4f}  placebo={np.mean(nula_cruzada):.4f}  p={p_cruzada:.4f}")
+        confirmados.append({
+            'dezena': d+1,
+            'lag': lag,
+            'ACF_desc': real_acf[d, lag-1],
+            'MI_desc': real_mi[d, lag-1],
+            'q_ACF_desc': q_acf[idx],
+            'q_MI_desc': q_mi[idx],
+            'ACF_conf': real_acf_conf,
+            'MI_conf': real_mi_conf,
+            'p_ACF_conf': p_acf_conf,
+            'p_MI_conf': p_mi_conf,
+            'p_base': p_base,
+            'p_cond1': p_cond1,
+            'p_cond0': p_cond0,
+            'diff_abs': diff_abs,
+            'rr': rr,
+            'odds_ratio': or_,
+            'blocos_mesmo_sinal': blocos_mesmo_sinal,
+            'acf_blocos': acf_blocos
+        })
 
-    # Distribuição das 600 relações
-    print(f"\nDISTRIBUIÇÃO DAS 600 RELAÇÕES OFF-DIAGONAL")
-    diffs = real_diff[mask_offdiag]
-    print(f"   média={np.mean(diffs):.4f}, mediana={np.median(diffs):.4f}")
-    print(f"   P5={np.percentile(diffs,5):.4f}, P95={np.percentile(diffs,95):.4f}")
-    print(f"   máximo={np.max(diffs):.4f}")
+    # Aplicar FDR na confirmação
+    p_conf_acf = [s['p_ACF_conf'] for s in confirmados]
+    p_conf_mi = [s['p_MI_conf'] for s in confirmados]
+    rej_conf_acf, q_conf_acf = fdr_bh(p_conf_acf, alpha)
+    rej_conf_mi, q_conf_mi = fdr_bh(p_conf_mi, alpha)
 
-    # (d) Dependência estrutural lag-1 (teste bilateral)
-    print("\nDEPENDÊNCIA ESTRUTURAL (lag 1, teste bilateral)")
-    for chave in chaves_estruturais:
-        real = corr_estruturais[chave]
-        nula = np.array(estrutural_placebo[chave])
-        p_emp = np.mean(np.abs(nula) >= abs(real))
-        print(f"   {chave:<15}: real={real:+.4f}  placebo={np.mean(nula):+.4f}  p={p_emp:.4f}")
+    for i, s in enumerate(confirmados):
+        s['q_ACF_conf'] = q_conf_acf[i]
+        s['q_MI_conf'] = q_conf_mi[i]
+        s['nominal'] = s['p_ACF_conf'] < 0.05 or s['p_MI_conf'] < 0.05
+        s['confirmado_fdr'] = s['q_ACF_conf'] < 0.05 or s['q_MI_conf'] < 0.05
 
-    # ---------- 5. Resumo final ----------
-    print("\n🔍 RESUMO FINAL")
-    n_total_testes = len(pvals_autocorr) + len(pvals_mi) + 7 + 1  # +1 para matriz
-    n_rejeitados = len(rejeitados_autocorr) + len(rejeitados_mi)
-    print(f"   Total de testes independentes: {n_total_testes}")
-    print(f"   Rejeitados após FDR: {n_rejeitados}")
-    if n_rejeitados == 0:
-        print("   ✅ Nenhuma evidência de dependência temporal significativa.")
+    # =====================================================
+    # EXIBIÇÃO FINAL
+    # =====================================================
+    print("\n📊 DESEMPENHO NA CONFIRMAÇÃO")
+    print(f"{'Dez':<4} {'Lag':<4} {'ACF desc':<10} {'ACF conf':<10} {'p_ACF':<8} {'q_ACF':<8} "
+          f"{'MI conf':<10} {'p_MI':<8} {'q_MI':<8} {'P(1|1)':<8} {'P(1|0)':<8} {'Δ':<8} {'RR':<8} {'OR':<8} {'Blocos':<8}")
+    print("-" * 130)
+    for s in confirmados:
+        print(f"{s['dezena']:<4} {s['lag']:<4} {s['ACF_desc']:+.4f}     {s['ACF_conf']:+.4f}     "
+              f"{s['p_ACF_conf']:.4f}   {s['q_ACF_conf']:.4f}   {s['MI_conf']:.4f}   {s['p_MI_conf']:.4f}   {s['q_MI_conf']:.4f}   "
+              f"{s['p_cond1']:.4f} {s['p_cond0']:.4f} {s['diff_abs']:+.4f} {s['rr']:.3f} {s['odds_ratio']:.3f} "
+              f"{s['blocos_mesmo_sinal']}/3")
+
+    # Resumo em camadas
+    n_total = len(confirmados)
+    n_nominal = sum(1 for s in confirmados if s['nominal'])
+    n_fdr = sum(1 for s in confirmados if s['confirmado_fdr'])
+    n_blocos2 = sum(1 for s in confirmados if s['blocos_mesmo_sinal'] >= 2)
+    n_blocos3 = sum(1 for s in confirmados if s['blocos_mesmo_sinal'] == 3)
+
+    print(f"\n🔍 RESUMO")
+    print(f"   Sinais candidatos (descoberta): {n_total}")
+    print(f"   Confirmação nominal (p<0,05): {n_nominal}")
+    print(f"   Confirmação FDR (q<0,05): {n_fdr}")
+    print(f"   Mesmo sinal em ≥2/3 blocos: {n_blocos2}")
+    print(f"   Mesmo sinal em 3/3 blocos: {n_blocos3}")
+
+    if n_fdr == 0:
+        print("   ✅ Nenhum sinal sobreviveu à confirmação com correção múltipla.")
     else:
-        print("   ⚠️ Existem testes rejeitados; investigar.")
+        print("   ⚠️ Existem sinais com confirmação FDR; investigar em bloco OOS separado.")
 
-    return None
+    return confirmados
 
 # ============================================================
 # INTERFACE PRINCIPAL
 # ============================================================
 def main():
     print("="*70)
-    print("🔍 AUDITORIA TEMPORAL – Teste de dependência temporal")
+    print("🔍 AUDITORIA TEMPORAL v2 – Confirmação de sinais")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
@@ -339,16 +320,21 @@ def main():
 
     while True:
         print("\nOpções:")
-        print("1. Executar auditoria temporal completa")
+        print("1. Executar auditoria temporal v2 (descoberta + confirmação)")
         print("0. Sair")
         op = input("Escolha: ").strip()
         if op == '1':
             try:
-                n_placebos = int(input("   Número de placebos [100]: ").strip() or "100")
+                frac_desc = float(input("   Fração de descoberta [0.6]: ").strip() or "0.6")
+                n_placebos_desc = int(input("   Placebos descoberta [5000]: ").strip() or "5000")
+                n_placebos_conf = int(input("   Placebos confirmação [5000]: ").strip() or "5000")
                 lag_max = int(input("   Lag máximo [10]: ").strip() or "10")
             except:
-                n_placebos, lag_max = 100, 10
-            auditoria_temporal(contests, n_placebos=n_placebos, lag_max=lag_max)
+                frac_desc, n_placebos_desc, n_placebos_conf, lag_max = 0.6, 5000, 5000, 10
+            auditoria_temporal_v2(contests, frac_descoberta=frac_desc,
+                                  n_placebos_descoberta=n_placebos_desc,
+                                  n_placebos_confirmacao=n_placebos_conf,
+                                  lag_max=lag_max)
         elif op == '0':
             break
         else:
