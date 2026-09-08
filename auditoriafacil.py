@@ -2,14 +2,19 @@
 # -*- coding: utf-8 -*-
 
 """
-AUDITORIA TEMPORAL v2 – Confirmação de sinais de dependência temporal
+AUDITORIA TEMPORAL v2.2 – Protocolo de três fases
+Descoberta → Confirmação → Holdout Final
 
-Correções:
-  - FDR sobre os p-values da confirmação
-  - Camadas de confirmação: nominal, FDR, consistência de sinal
-  - Odds ratio adicionado
-  - Saída como "sinais candidatos" e "desempenho na confirmação"
-  - Separação descoberta/confirmação preservada
+Métricas:
+  - Autocorrelação (ACF) e Informação Mútua (MI) para cada dezena e lag (1..10)
+  - p‑valores empíricos com correção +1
+  - FDR (Benjamini‑Hochberg) conjunto
+  - Δ = P(X_t=1 | X_{t-lag}=1) - P(X_t=1 | X_{t-lag}=0)
+  - RR, OR, IC95% (bootstrap)
+  - Teste direcional e bilateral no holdout
+  - Estabilidade em 3 blocos temporais
+
+Saída: candidatos selecionados na descoberta, desempenho na confirmação e holdout.
 """
 
 import numpy as np
@@ -110,27 +115,57 @@ def odds_ratio(p1, p0):
         return np.inf
     return (p1/(1-p1)) / (p0/(1-p0))
 
+def bootstrap_delta(serie, lag, n_boot=2000, seed=123):
+    """Calcula Δ = P(1|1) - P(1|0) com IC95% via bootstrap."""
+    if len(serie) <= lag:
+        return np.nan, np.nan, np.nan
+    x = serie[:-lag]
+    y = serie[lag:]
+    mask1 = x == 1
+    mask0 = x == 0
+    y1 = y[mask1]
+    y0 = y[mask0]
+    if len(y1) == 0 or len(y0) == 0:
+        return np.nan, np.nan, np.nan
+
+    delta_obs = np.mean(y1) - np.mean(y0)
+    rng = np.random.default_rng(seed)
+    deltas_boot = []
+    for _ in range(n_boot):
+        b1 = rng.choice(y1, size=len(y1), replace=True)
+        b0 = rng.choice(y0, size=len(y0), replace=True)
+        deltas_boot.append(np.mean(b1) - np.mean(b0))
+    ic_low = np.percentile(deltas_boot, 2.5)
+    ic_high = np.percentile(deltas_boot, 97.5)
+    return delta_obs, ic_low, ic_high
+
 # ============================================================
 # FUNÇÃO PRINCIPAL DA AUDITORIA
 # ============================================================
-def auditoria_temporal_v2(contests, frac_descoberta=0.6, n_placebos_descoberta=5000,
-                          n_placebos_confirmacao=5000, lag_max=10, alpha=0.05):
-    print("\n🔍 AUDITORIA TEMPORAL v2 – Confirmação de sinais")
-    print(f"   Divisão: {frac_descoberta:.0%} descoberta / {1-frac_descoberta:.0%} confirmação")
-    print(f"   Placebos (descoberta): {n_placebos_descoberta}")
-    print(f"   Placebos (confirmação): {n_placebos_confirmacao}")
+def auditoria_temporal_v2(contests, frac_descoberta=0.6, frac_confirmacao=0.2,
+                          n_placebos_descoberta=5000, n_placebos_confirmacao=5000,
+                          n_placebos_holdout=5000, lag_max=10, alpha=0.05):
+    print("\n🔍 AUDITORIA TEMPORAL v2.2 – Protocolo de três fases")
+    print(f"   Divisão: {frac_descoberta:.0%} descoberta / {frac_confirmacao:.0%} confirmação / "
+          f"{1-frac_descoberta-frac_confirmacao:.0%} holdout")
+    print(f"   Placebos: descoberta={n_placebos_descoberta}, confirmação={n_placebos_confirmacao}, "
+          f"holdout={n_placebos_holdout}")
     print(f"   Lags: 1..{lag_max}\n")
 
     n = len(contests)
-    split = int(n * frac_descoberta)
-    contests_desc = contests[:split]
-    contests_conf = contests[split:]
+    split_desc = int(n * frac_descoberta)
+    split_conf = int(n * (frac_descoberta + frac_confirmacao))
+    contests_desc = contests[:split_desc]
+    contests_conf = contests[split_desc:split_conf]
+    contests_holdout = contests[split_conf:]
 
     X_desc = matriz_presenca(contests_desc)
     X_conf = matriz_presenca(contests_conf)
+    X_holdout = matriz_presenca(contests_holdout)
 
     rng_desc = np.random.default_rng(20260908)
     rng_conf = np.random.default_rng(20260909)
+    rng_holdout = np.random.default_rng(20260910)
 
     # =====================================================
     # FASE DE DESCOBERTA
@@ -167,9 +202,9 @@ def auditoria_temporal_v2(contests, frac_descoberta=0.6, n_placebos_descoberta=5
         for lag_idx in range(lag_max):
             lag = lag_idx + 1
             nula_acf = np.array(acf_placebo[d][lag])
-            p_acf[d, lag_idx] = np.mean(np.abs(nula_acf) >= abs(real_acf[d, lag_idx]))
+            p_acf[d, lag_idx] = (1 + np.sum(np.abs(nula_acf) >= abs(real_acf[d, lag_idx]))) / (len(nula_acf) + 1)
             nula_mi = np.array(mi_placebo[d][lag])
-            p_mi[d, lag_idx] = np.mean(nula_mi >= real_mi[d, lag_idx])
+            p_mi[d, lag_idx] = (1 + np.sum(nula_mi >= real_mi[d, lag_idx])) / (len(nula_mi) + 1)
 
     p_acf_flat = p_acf.flatten()
     p_mi_flat = p_mi.flatten()
@@ -187,12 +222,16 @@ def auditoria_temporal_v2(contests, frac_descoberta=0.6, n_placebos_descoberta=5
         print(f"   dezena {d+1:2d}, lag {lag:2d}: ACF={real_acf[d,lag-1]:+.4f} (q={qa:.4f}), "
               f"MI={real_mi[d,lag-1]:.4f} (q={qm:.4f})")
 
+    if not sinais_selecionados:
+        print("   Nenhum sinal selecionado.")
+        return None
+
     # =====================================================
     # FASE DE CONFIRMAÇÃO
     # =====================================================
     print("\nFase de CONFIRMAÇÃO...")
     n_conf = X_conf.shape[0]
-    confirmados = []
+    resultados_conf = []
 
     for idx in sinais_selecionados:
         d = idx // lag_max
@@ -201,6 +240,7 @@ def auditoria_temporal_v2(contests, frac_descoberta=0.6, n_placebos_descoberta=5
         serie = X_conf[:, d]
         real_acf_conf = autocorrelacao(serie, lag)
         real_mi_conf = informacao_mutua_binaria(serie, lag)
+        delta_conf, ic_low_conf, ic_high_conf = bootstrap_delta(serie, lag, n_boot=2000, seed=1000+idx)
 
         acf_conf_nula = []
         mi_conf_nula = []
@@ -211,22 +251,16 @@ def auditoria_temporal_v2(contests, frac_descoberta=0.6, n_placebos_descoberta=5
             mi_conf_nula.append(informacao_mutua_binaria(serie_p, lag))
         acf_conf_nula = np.array(acf_conf_nula)
         mi_conf_nula = np.array(mi_conf_nula)
-        p_acf_conf = np.mean(np.abs(acf_conf_nula) >= abs(real_acf_conf))
-        p_mi_conf = np.mean(mi_conf_nula >= real_mi_conf)
+        p_acf_conf = (1 + np.sum(np.abs(acf_conf_nula) >= abs(real_acf_conf))) / (len(acf_conf_nula) + 1)
+        p_mi_conf = (1 + np.sum(mi_conf_nula >= real_mi_conf)) / (len(mi_conf_nula) + 1)
 
         # Probabilidades condicionais
         x = serie[:-lag]
         y = serie[lag:]
         mask1 = x == 1
         p_base = np.mean(serie)
-        if np.sum(mask1) > 0:
-            p_cond1 = np.mean(y[mask1])
-        else:
-            p_cond1 = p_base
-        if np.sum(~mask1) > 0:
-            p_cond0 = np.mean(y[~mask1])
-        else:
-            p_cond0 = p_base
+        p_cond1 = np.mean(y[mask1]) if np.sum(mask1) > 0 else p_base
+        p_cond0 = np.mean(y[~mask1]) if np.sum(~mask1) > 0 else p_base
         diff_abs = p_cond1 - p_cond0
         rr = (p_cond1 / p_cond0) if p_cond0 > 0 else np.inf
         or_ = odds_ratio(p_cond1, p_cond0)
@@ -237,7 +271,7 @@ def auditoria_temporal_v2(contests, frac_descoberta=0.6, n_placebos_descoberta=5
         sinal_real = 1 if real_acf_conf >= 0 else -1
         blocos_mesmo_sinal = sum(1 for a in acf_blocos if (a >= 0 and sinal_real == 1) or (a < 0 and sinal_real == -1))
 
-        confirmados.append({
+        resultados_conf.append({
             'dezena': d+1,
             'lag': lag,
             'ACF_desc': real_acf[d, lag-1],
@@ -248,6 +282,9 @@ def auditoria_temporal_v2(contests, frac_descoberta=0.6, n_placebos_descoberta=5
             'MI_conf': real_mi_conf,
             'p_ACF_conf': p_acf_conf,
             'p_MI_conf': p_mi_conf,
+            'delta_conf': delta_conf,
+            'ic_low_conf': ic_low_conf,
+            'ic_high_conf': ic_high_conf,
             'p_base': p_base,
             'p_cond1': p_cond1,
             'p_cond0': p_cond0,
@@ -258,58 +295,145 @@ def auditoria_temporal_v2(contests, frac_descoberta=0.6, n_placebos_descoberta=5
             'acf_blocos': acf_blocos
         })
 
-    # Aplicar FDR na confirmação
-    p_conf_acf = [s['p_ACF_conf'] for s in confirmados]
-    p_conf_mi = [s['p_MI_conf'] for s in confirmados]
-    rej_conf_acf, q_conf_acf = fdr_bh(p_conf_acf, alpha)
-    rej_conf_mi, q_conf_mi = fdr_bh(p_conf_mi, alpha)
+    # FDR conjunto na confirmação
+    p_conf_todos = []
+    for s in resultados_conf:
+        p_conf_todos.append(s['p_ACF_conf'])
+        p_conf_todos.append(s['p_MI_conf'])
+    rej_conf, q_conf_todos = fdr_bh(p_conf_todos, alpha)
 
-    for i, s in enumerate(confirmados):
-        s['q_ACF_conf'] = q_conf_acf[i]
-        s['q_MI_conf'] = q_conf_mi[i]
-        s['nominal'] = s['p_ACF_conf'] < 0.05 or s['p_MI_conf'] < 0.05
-        s['confirmado_fdr'] = s['q_ACF_conf'] < 0.05 or s['q_MI_conf'] < 0.05
+    for i, s in enumerate(resultados_conf):
+        s['q_ACF_conf'] = q_conf_todos[2*i]
+        s['q_MI_conf'] = q_conf_todos[2*i+1]
+        s['nominal'] = (s['p_ACF_conf'] < alpha or s['p_MI_conf'] < alpha)
+        s['confirmado_fdr'] = (s['q_ACF_conf'] < alpha or s['q_MI_conf'] < alpha)
+
+    # =====================================================
+    # FASE DE HOLDOUT FINAL
+    # =====================================================
+    print("\nFase de HOLDOUT FINAL...")
+    n_holdout = X_holdout.shape[0]
+    resultados_holdout = []
+
+    for s in resultados_conf:
+        d = s['dezena'] - 1
+        lag = s['lag']
+        serie = X_holdout[:, d]
+        real_acf_holdout = autocorrelacao(serie, lag)
+        real_mi_holdout = informacao_mutua_binaria(serie, lag)
+        delta_hold, ic_low_hold, ic_high_hold = bootstrap_delta(serie, lag, n_boot=2000, seed=2000+s['dezena']*100+lag)
+
+        acf_holdout_nula = []
+        mi_holdout_nula = []
+        for _ in range(n_placebos_holdout):
+            indices = rng_holdout.permutation(n_holdout)
+            serie_p = serie[indices]
+            acf_holdout_nula.append(autocorrelacao(serie_p, lag))
+            mi_holdout_nula.append(informacao_mutua_binaria(serie_p, lag))
+        acf_holdout_nula = np.array(acf_holdout_nula)
+        mi_holdout_nula = np.array(mi_holdout_nula)
+
+        # p bilateral
+        p_acf_holdout_bilat = (1 + np.sum(np.abs(acf_holdout_nula) >= abs(real_acf_holdout))) / (len(acf_holdout_nula) + 1)
+        p_mi_holdout = (1 + np.sum(mi_holdout_nula >= real_mi_holdout)) / (len(mi_holdout_nula) + 1)
+
+        # p direcional conforme sinal descoberto
+        sinal_desc = 1 if s['ACF_desc'] >= 0 else -1
+        if sinal_desc >= 0:
+            p_acf_holdout_dir = (1 + np.sum(acf_holdout_nula >= real_acf_holdout)) / (len(acf_holdout_nula) + 1)
+        else:
+            p_acf_holdout_dir = (1 + np.sum(acf_holdout_nula <= real_acf_holdout)) / (len(acf_holdout_nula) + 1)
+
+        # Probabilidades condicionais
+        x = serie[:-lag]
+        y = serie[lag:]
+        mask1 = x == 1
+        p_base = np.mean(serie)
+        p_cond1 = np.mean(y[mask1]) if np.sum(mask1) > 0 else p_base
+        p_cond0 = np.mean(y[~mask1]) if np.sum(~mask1) > 0 else p_base
+        diff_abs = p_cond1 - p_cond0
+        rr = (p_cond1 / p_cond0) if p_cond0 > 0 else np.inf
+        or_ = odds_ratio(p_cond1, p_cond0)
+
+        resultados_holdout.append({
+            'dezena': s['dezena'],
+            'lag': s['lag'],
+            'ACF_conf': s['ACF_conf'],
+            'ACF_holdout': real_acf_holdout,
+            'MI_holdout': real_mi_holdout,
+            'p_ACF_holdout_bilat': p_acf_holdout_bilat,
+            'p_ACF_holdout_dir': p_acf_holdout_dir,
+            'p_MI_holdout': p_mi_holdout,
+            'delta_hold': delta_hold,
+            'ic_low_hold': ic_low_hold,
+            'ic_high_hold': ic_high_hold,
+            'p_base': p_base,
+            'p_cond1': p_cond1,
+            'p_cond0': p_cond0,
+            'diff_abs': diff_abs,
+            'rr': rr,
+            'odds_ratio': or_,
+        })
+
+    # FDR conjunto no holdout (usando p bilateral para ACF e p unilateral para MI)
+    p_holdout_todos = []
+    for s in resultados_holdout:
+        p_holdout_todos.append(s['p_ACF_holdout_bilat'])
+        p_holdout_todos.append(s['p_MI_holdout'])
+    rej_holdout, q_holdout_todos = fdr_bh(p_holdout_todos, alpha)
+
+    for i, s in enumerate(resultados_holdout):
+        s['q_ACF_holdout'] = q_holdout_todos[2*i]
+        s['q_MI_holdout'] = q_holdout_todos[2*i+1]
+        s['nominal_holdout'] = (s['p_ACF_holdout_bilat'] < alpha or s['p_MI_holdout'] < alpha)
+        s['confirmado_holdout'] = (s['q_ACF_holdout'] < alpha or s['q_MI_holdout'] < alpha)
 
     # =====================================================
     # EXIBIÇÃO FINAL
     # =====================================================
-    print("\n📊 DESEMPENHO NA CONFIRMAÇÃO")
-    print(f"{'Dez':<4} {'Lag':<4} {'ACF desc':<10} {'ACF conf':<10} {'p_ACF':<8} {'q_ACF':<8} "
-          f"{'MI conf':<10} {'p_MI':<8} {'q_MI':<8} {'P(1|1)':<8} {'P(1|0)':<8} {'Δ':<8} {'RR':<8} {'OR':<8} {'Blocos':<8}")
+    print("\n📊 RESULTADOS")
+    print(f"{'Dez':<4} {'Lag':<4} {'ACF desc':<10} {'ACF conf':<10} {'ACF hold':<10} "
+          f"{'p bilat':<8} {'p dir':<8} {'q hold':<8} {'Δ conf [IC95%]':<20} {'Δ hold [IC95%]':<20} "
+          f"{'RR':<6} {'OR':<6}")
     print("-" * 130)
-    for s in confirmados:
-        print(f"{s['dezena']:<4} {s['lag']:<4} {s['ACF_desc']:+.4f}     {s['ACF_conf']:+.4f}     "
-              f"{s['p_ACF_conf']:.4f}   {s['q_ACF_conf']:.4f}   {s['MI_conf']:.4f}   {s['p_MI_conf']:.4f}   {s['q_MI_conf']:.4f}   "
-              f"{s['p_cond1']:.4f} {s['p_cond0']:.4f} {s['diff_abs']:+.4f} {s['rr']:.3f} {s['odds_ratio']:.3f} "
-              f"{s['blocos_mesmo_sinal']}/3")
+    for i, s in enumerate(resultados_conf):
+        h = resultados_holdout[i]
+        conf_ic = f"{s['delta_conf']:+.3f} [{s['ic_low_conf']:+.3f}, {s['ic_high_conf']:+.3f}]"
+        hold_ic = f"{h['delta_hold']:+.3f} [{h['ic_low_hold']:+.3f}, {h['ic_high_hold']:+.3f}]"
+        print(f"{s['dezena']:<4} {s['lag']:<4} {s['ACF_desc']:+.4f}     {s['ACF_conf']:+.4f}     {h['ACF_holdout']:+.4f}     "
+              f"{h['p_ACF_holdout_bilat']:.4f}   {h['p_ACF_holdout_dir']:.4f}   {min(h['q_ACF_holdout'],h['q_MI_holdout']):.4f}   "
+              f"{conf_ic:<20} {hold_ic:<20} {h['rr']:.3f} {h['odds_ratio']:.3f}")
 
-    # Resumo em camadas
-    n_total = len(confirmados)
-    n_nominal = sum(1 for s in confirmados if s['nominal'])
-    n_fdr = sum(1 for s in confirmados if s['confirmado_fdr'])
-    n_blocos2 = sum(1 for s in confirmados if s['blocos_mesmo_sinal'] >= 2)
-    n_blocos3 = sum(1 for s in confirmados if s['blocos_mesmo_sinal'] == 3)
+    # Resumo
+    n_total = len(resultados_conf)
+    n_conf_nominal = sum(1 for s in resultados_conf if s['nominal'])
+    n_conf_fdr = sum(1 for s in resultados_conf if s['confirmado_fdr'])
+    n_holdout_nominal = sum(1 for s in resultados_holdout if s['nominal_holdout'])
+    n_holdout_fdr = sum(1 for s in resultados_holdout if s['confirmado_holdout'])
 
     print(f"\n🔍 RESUMO")
-    print(f"   Sinais candidatos (descoberta): {n_total}")
-    print(f"   Confirmação nominal (p<0,05): {n_nominal}")
-    print(f"   Confirmação FDR (q<0,05): {n_fdr}")
-    print(f"   Mesmo sinal em ≥2/3 blocos: {n_blocos2}")
-    print(f"   Mesmo sinal em 3/3 blocos: {n_blocos3}")
+    print(f"   Candidatos (descoberta): {n_total}")
+    print(f"   Confirmação nominal: {n_conf_nominal}")
+    print(f"   Confirmação FDR: {n_conf_fdr}")
+    print(f"   Holdout nominal: {n_holdout_nominal}")
+    print(f"   Holdout FDR: {n_holdout_fdr}")
 
-    if n_fdr == 0:
-        print("   ✅ Nenhum sinal sobreviveu à confirmação com correção múltipla.")
+    if n_holdout_fdr == 0:
+        print("\n✅ Nenhum candidato apresentou dependência temporal estatisticamente significativa")
+        print("   no holdout após FDR. Não há evidência de persistência temporal estável")
+        print("   nos sinais previamente selecionados.")
     else:
-        print("   ⚠️ Existem sinais com confirmação FDR; investigar em bloco OOS separado.")
+        print("\n⚠️ Há candidato(s) com evidência no holdout; não concluir causalidade.")
+        print("   Esses sinais merecem investigação com modelo específico.")
 
-    return confirmados
+    return resultados_conf, resultados_holdout
 
 # ============================================================
 # INTERFACE PRINCIPAL
 # ============================================================
 def main():
     print("="*70)
-    print("🔍 AUDITORIA TEMPORAL v2 – Confirmação de sinais")
+    print("🔍 AUDITORIA TEMPORAL v2.2 – Descoberta, Confirmação e Holdout")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
@@ -320,20 +444,25 @@ def main():
 
     while True:
         print("\nOpções:")
-        print("1. Executar auditoria temporal v2 (descoberta + confirmação)")
+        print("1. Executar auditoria temporal v2.2")
         print("0. Sair")
         op = input("Escolha: ").strip()
         if op == '1':
             try:
                 frac_desc = float(input("   Fração de descoberta [0.6]: ").strip() or "0.6")
+                frac_conf = float(input("   Fração de confirmação [0.2]: ").strip() or "0.2")
                 n_placebos_desc = int(input("   Placebos descoberta [5000]: ").strip() or "5000")
                 n_placebos_conf = int(input("   Placebos confirmação [5000]: ").strip() or "5000")
+                n_placebos_hold = int(input("   Placebos holdout [5000]: ").strip() or "5000")
                 lag_max = int(input("   Lag máximo [10]: ").strip() or "10")
             except:
-                frac_desc, n_placebos_desc, n_placebos_conf, lag_max = 0.6, 5000, 5000, 10
-            auditoria_temporal_v2(contests, frac_descoberta=frac_desc,
+                frac_desc, frac_conf = 0.6, 0.2
+                n_placebos_desc = n_placebos_conf = n_placebos_hold = 5000
+                lag_max = 10
+            auditoria_temporal_v2(contests, frac_descoberta=frac_desc, frac_confirmacao=frac_conf,
                                   n_placebos_descoberta=n_placebos_desc,
                                   n_placebos_confirmacao=n_placebos_conf,
+                                  n_placebos_holdout=n_placebos_hold,
                                   lag_max=lag_max)
         elif op == '0':
             break
