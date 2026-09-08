@@ -2,15 +2,16 @@
 # -*- coding: utf-8 -*-
 
 """
-IAFACIL v1.3 – Laboratório independente de IA Estrutural
+IAFACIL v1.3‑final – Laboratório independente de IA Estrutural
 
-Correções:
-- AUC com ranks médios (tratamento de empates)
-- Padronização de features dentro dos modelos
-- mapear_classes estrita (levanta erro se classe desconhecida)
-- Remoção de import sklearn
-- Seleção de janela pela AUC média (documentada)
-- Modelo individual v1.3; baseline agregado v1.2.2
+Inclui:
+  - AUC corrigida (ranks médios, ordenação crescente)
+  - Seleção de janela com vantagem sobre acaso explícita
+  - Modelo agregado v1.2.2 como baseline
+  - Modelo individual v1.3 (25 regressões logísticas)
+  - Placebo temporal com re-treinamento
+  - Pré-computação de estruturas
+  - Testes diretos: 7-7-7, quentes ímpares, sequências de pares
 """
 
 import numpy as np
@@ -232,33 +233,28 @@ class LogisticRegressionBinary:
 # AUC com ranks médios
 # ============================================================
 def auc_roc(y_true, y_score):
-    """Calcula AUC ROC usando ranks médios (tratamento de empates)."""
     y_true = np.asarray(y_true)
     y_score = np.asarray(y_score)
     n = len(y_true)
     if n == 0:
         return 0.5
-    # Ordena por score decrescente
-    order = np.argsort(-y_score)
+    order = np.argsort(y_score)                # ordena crescente
     y_sorted = y_true[order]
-    ranks = np.arange(1, n+1)
-    # Empates: atribui rank médio para scores iguais
     scores_sorted = y_score[order]
+    ranks = np.arange(1, n + 1, dtype=float)   # ranks como float
     i = 0
     while i < n:
-        j = i
+        j = i + 1
         while j < n and scores_sorted[j] == scores_sorted[i]:
             j += 1
-        avg_rank = np.mean(ranks[i:j])
-        ranks[i:j] = avg_rank
+        ranks[i:j] = np.mean(ranks[i:j])
         i = j
     n_pos = np.sum(y_sorted)
     n_neg = n - n_pos
     if n_pos == 0 or n_neg == 0:
         return 0.5
     sum_pos_ranks = np.sum(ranks[y_sorted == 1])
-    auc = (sum_pos_ranks - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
-    return auc
+    return (sum_pos_ranks - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
 
 # ============================================================
 # MAPEAMENTO DE CLASSES ESTRITO
@@ -433,7 +429,6 @@ def analise_ia_estrutural_v2(contests, min_history=500, n_backtest=500, n_placeb
 
     estruturas = [extrair_estrutura(c['dezenas']) for c in contests]
 
-    # Seleção de janela na validação usando AUC média
     print("Selecionando janela...")
     janelas = [3, 5, 10, 20]
     melhor_janela = 10
@@ -468,10 +463,11 @@ def analise_ia_estrutural_v2(contests, min_history=500, n_backtest=500, n_placeb
         if auc_media > melhor_auc:
             melhor_auc = auc_media
             melhor_janela = janela
-        print(f"   janela={janela}: AUC média (pares) = {auc_media:.3f}")
-    print(f"   Melhor janela: {melhor_janela}")
+        print(f"   janela={janela}: AUC média = {auc_media:.4f} "
+              f"(vantagem sobre acaso={auc_media-0.5:+.4f})")
+    print(f"   Melhor janela: {melhor_janela} "
+          f"(AUC={melhor_auc:.4f}, vantagem={melhor_auc-0.5:+.4f})")
 
-    # Dataset final
     X, y_pares, y_rep, y_quentes, y_atr, idx_list = preparar_alvos_v2(
         contests, min_history=min_history, janela=melhor_janela, estruturas=estruturas
     )
@@ -512,7 +508,6 @@ def analise_ia_estrutural_v2(contests, min_history=500, n_backtest=500, n_placeb
             preds[alvo] = modelo.predict_proba(estado.reshape(1, -1))[0]
         return preds
 
-    # Avaliação OOS
     acertos_ia = []
     acertos_estrut = []
     acertos_aleat = []
@@ -549,7 +544,6 @@ def analise_ia_estrutural_v2(contests, min_history=500, n_backtest=500, n_placeb
         acertos_freq.append(len(top20_freq & alvo))
         acertos_persist.append(len(top20_persist & alvo))
 
-    # Resultados resumidos
     arr_ia = np.array(acertos_ia)
     arr_estrut = np.array(acertos_estrut)
     arr_aleat = np.array(acertos_aleat)
@@ -681,8 +675,10 @@ def analise_ia_individual(contests, min_history=500, n_backtest=500, n_placebos=
         if auc_media > melhor_auc:
             melhor_auc = auc_media
             melhor_janela = janela
-        print(f"   janela={janela}: AUC média = {auc_media:.3f}")
-    print(f"   Melhor janela: {melhor_janela}")
+        print(f"   janela={janela}: AUC média = {auc_media:.4f} "
+              f"(vantagem sobre acaso={auc_media-0.5:+.4f})")
+    print(f"   Melhor janela: {melhor_janela} "
+          f"(AUC={melhor_auc:.4f}, vantagem={melhor_auc-0.5:+.4f})")
 
     X, y, idx_list = preparar_dataset_individual(contests, min_history=min_history, janela=melhor_janela, estruturas=estruturas)
     train_mask = [i for i, iv in enumerate(idx_list) if iv < train_end]
@@ -814,7 +810,7 @@ def analise_ia_individual(contests, min_history=500, n_backtest=500, n_placebos=
     return arr_ia, arr_aleat, arr_freq, arr_persist
 
 # ============================================================
-# FUNÇÕES DE TESTE (mantidas)
+# TESTES DIRETOS
 # ============================================================
 def teste_previsibilidade_pares(contests, min_history=500):
     print("\n📊 TESTE 1 – Previsibilidade da estrutura de pares")
@@ -900,7 +896,7 @@ def teste_todas_sequencias_pares(contests, min_history=500):
 # ============================================================
 def main():
     print("="*70)
-    print("🧠 IAFACIL v1.3 – Laboratório independente de IA Estrutural")
+    print("🧠 IAFACIL v1.3‑final – Laboratório independente de IA Estrutural")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
