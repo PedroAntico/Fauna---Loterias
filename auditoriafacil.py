@@ -2,19 +2,24 @@
 # -*- coding: utf-8 -*-
 
 """
-AUDITORIA TEMPORAL v2.2 – Protocolo de três fases
-Descoberta → Confirmação → Holdout Final
+AUDITORIA SOMA → DEZENAS v1.1 (corrigida)
+
+Correções:
+- Transição temporal correta: soma do concurso t prediz dezenas do concurso t+1
+- AUC calculada com a soma contínua (não discretizada)
+- Limiares de discretização e Δ fixados na descoberta
+- Contagem de observações por bin para diagnóstico
+- Adicionada análise S_t → S_{t+1}
 
 Métricas:
-  - Autocorrelação (ACF) e Informação Mútua (MI) para cada dezena e lag (1..10)
-  - p‑valores empíricos com correção +1
-  - FDR (Benjamini‑Hochberg) conjunto
-  - Δ = P(X_t=1 | X_{t-lag}=1) - P(X_t=1 | X_{t-lag}=0)
-  - RR, OR, IC95% (bootstrap)
-  - Teste direcional e bilateral no holdout
-  - Estabilidade em 3 blocos temporais
+  - MI entre soma discretizada (5 quantis) e indicador da dezena no próximo concurso
+  - AUC (soma contínua) para prever a dezena
+  - Δ = P(dezena | soma ≥ percentil 70) - P(dezena | soma ≤ percentil 30)
+  - RR, OR correspondentes
 
-Saída: candidatos selecionados na descoberta, desempenho na confirmação e holdout.
+Protocolo:
+  60% descoberta → FDR/BH → 20% confirmação → FDR/BH → 20% holdout final.
+Placebo: permutação da ordem das somas (destrói relação soma→próximo).
 """
 
 import numpy as np
@@ -50,6 +55,9 @@ def load_all_contests(csv_file='resultados_lotofacil.csv'):
 # ============================================================
 # FUNÇÕES AUXILIARES
 # ============================================================
+def soma_concurso(dezenas):
+    return sum(dezenas)
+
 def matriz_presenca(contests):
     n = len(contests)
     X = np.zeros((n, 25), dtype=np.int8)
@@ -58,38 +66,47 @@ def matriz_presenca(contests):
             X[i, d-1] = 1
     return X
 
-def autocorrelacao(serie, lag):
-    if len(serie) <= lag:
+def informacao_mutua_discreta(x, y, n_bins_x=5):
+    """MI entre x discreto (já discretizado) e y binário."""
+    if len(x) < 10:
         return 0.0
-    x = np.asarray(serie[:-lag], dtype=float)
-    y = np.asarray(serie[lag:], dtype=float)
-    if np.std(x) == 0 or np.std(y) == 0:
-        return 0.0
-    return np.corrcoef(x, y)[0, 1]
-
-def informacao_mutua_binaria(serie, lag):
-    if len(serie) <= lag:
-        return 0.0
-    x = serie[:-lag]
-    y = serie[lag:]
-    n00 = np.sum((x == 0) & (y == 0))
-    n01 = np.sum((x == 0) & (y == 1))
-    n10 = np.sum((x == 1) & (y == 0))
-    n11 = np.sum((x == 1) & (y == 1))
+    cont = Counter(zip(x, y))
     total = len(x)
-    if total == 0:
-        return 0.0
-    p00, p01, p10, p11 = n00/total, n01/total, n10/total, n11/total
-    px0 = (n00+n01)/total
-    px1 = (n10+n11)/total
-    py0 = (n00+n10)/total
-    py1 = (n01+n11)/total
+    px = Counter(x)
+    py = Counter(y)
     mi = 0.0
-    if p00 > 0: mi += p00 * np.log2(p00 / (px0*py0))
-    if p01 > 0: mi += p01 * np.log2(p01 / (px0*py1))
-    if p10 > 0: mi += p10 * np.log2(p10 / (px1*py0))
-    if p11 > 0: mi += p11 * np.log2(p11 / (px1*py1))
+    for (xi, yi), count in cont.items():
+        pxy = count / total
+        px_ = px[xi] / total
+        py_ = py[yi] / total
+        if pxy > 0 and px_ > 0 and py_ > 0:
+            mi += pxy * np.log2(pxy / (px_ * py_))
     return mi
+
+def auc_roc(y_true, y_score):
+    """AUC ROC com ranks médios (ordenação crescente)."""
+    y_true = np.asarray(y_true)
+    y_score = np.asarray(y_score)
+    n = len(y_true)
+    if n == 0:
+        return 0.5
+    order = np.argsort(y_score)
+    y_sorted = y_true[order]
+    scores_sorted = y_score[order]
+    ranks = np.arange(1, n + 1, dtype=float)
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n and scores_sorted[j] == scores_sorted[i]:
+            j += 1
+        ranks[i:j] = np.mean(ranks[i:j])
+        i = j
+    n_pos = np.sum(y_sorted)
+    n_neg = n - n_pos
+    if n_pos == 0 or n_neg == 0:
+        return 0.5
+    sum_pos_ranks = np.sum(ranks[y_sorted == 1])
+    return (sum_pos_ranks - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
 
 def fdr_bh(p_values, alpha=0.05):
     p = np.array(p_values)
@@ -115,325 +132,384 @@ def odds_ratio(p1, p0):
         return np.inf
     return (p1/(1-p1)) / (p0/(1-p0))
 
-def bootstrap_delta(serie, lag, n_boot=2000, seed=123):
-    """Calcula Δ = P(1|1) - P(1|0) com IC95% via bootstrap."""
-    if len(serie) <= lag:
-        return np.nan, np.nan, np.nan
-    x = serie[:-lag]
-    y = serie[lag:]
-    mask1 = x == 1
-    mask0 = x == 0
-    y1 = y[mask1]
-    y0 = y[mask0]
-    if len(y1) == 0 or len(y0) == 0:
-        return np.nan, np.nan, np.nan
-
-    delta_obs = np.mean(y1) - np.mean(y0)
-    rng = np.random.default_rng(seed)
-    deltas_boot = []
-    for _ in range(n_boot):
-        b1 = rng.choice(y1, size=len(y1), replace=True)
-        b0 = rng.choice(y0, size=len(y0), replace=True)
-        deltas_boot.append(np.mean(b1) - np.mean(b0))
-    ic_low = np.percentile(deltas_boot, 2.5)
-    ic_high = np.percentile(deltas_boot, 97.5)
-    return delta_obs, ic_low, ic_high
-
 # ============================================================
-# FUNÇÃO PRINCIPAL DA AUDITORIA
+# FUNÇÃO PRINCIPAL
 # ============================================================
-def auditoria_temporal_v2(contests, frac_descoberta=0.6, frac_confirmacao=0.2,
-                          n_placebos_descoberta=5000, n_placebos_confirmacao=5000,
-                          n_placebos_holdout=5000, lag_max=10, alpha=0.05):
-    print("\n🔍 AUDITORIA TEMPORAL v2.2 – Protocolo de três fases")
+def auditoria_soma_dezenas(contests, frac_descoberta=0.6, frac_confirmacao=0.2,
+                           n_placebos_descoberta=5000, n_placebos_confirmacao=5000,
+                           n_placebos_holdout=5000, alpha=0.05, n_bins=5):
+    print("\n🔍 AUDITORIA SOMA → DEZENAS v1.1")
     print(f"   Divisão: {frac_descoberta:.0%} descoberta / {frac_confirmacao:.0%} confirmação / "
           f"{1-frac_descoberta-frac_confirmacao:.0%} holdout")
+    print(f"   Discretização da soma: {n_bins} quantis")
     print(f"   Placebos: descoberta={n_placebos_descoberta}, confirmação={n_placebos_confirmacao}, "
-          f"holdout={n_placebos_holdout}")
-    print(f"   Lags: 1..{lag_max}\n")
+          f"holdout={n_placebos_holdout}\n")
 
+    # Construir transições S_t -> X_{t+1}
     n = len(contests)
-    split_desc = int(n * frac_descoberta)
-    split_conf = int(n * (frac_descoberta + frac_confirmacao))
-    contests_desc = contests[:split_desc]
-    contests_conf = contests[split_desc:split_conf]
-    contests_holdout = contests[split_conf:]
+    somas = np.array([soma_concurso(c['dezenas']) for c in contests])
+    presencas = matriz_presenca(contests)
+    X_soma = somas[:-1]          # soma no tempo t
+    Y_next = presencas[1:]       # presença no tempo t+1
 
-    X_desc = matriz_presenca(contests_desc)
-    X_conf = matriz_presenca(contests_conf)
-    X_holdout = matriz_presenca(contests_holdout)
+    # Dividir em três blocos temporais
+    n_trans = len(X_soma)
+    split_desc = int(n_trans * frac_descoberta)
+    split_conf = int(n_trans * (frac_descoberta + frac_confirmacao))
 
-    rng_desc = np.random.default_rng(20260908)
-    rng_conf = np.random.default_rng(20260909)
-    rng_holdout = np.random.default_rng(20260910)
+    somas_desc = X_soma[:split_desc]
+    pres_desc = Y_next[:split_desc]
+    somas_conf = X_soma[split_desc:split_conf]
+    pres_conf = Y_next[split_desc:split_conf]
+    somas_hold = X_soma[split_conf:]
+    pres_hold = Y_next[split_conf:]
+
+    # Definir limites de discretização e Δ usando apenas descoberta
+    limites = np.percentile(somas_desc, np.linspace(0, 100, n_bins+1))
+    limite_alto = np.percentile(somas_desc, 70)
+    limite_baixo = np.percentile(somas_desc, 30)
+
+    def discretizar(somas):
+        return np.digitize(somas, limites[1:-1])
+
+    somas_desc_disc = discretizar(somas_desc)
+    somas_conf_disc = discretizar(somas_conf)
+    somas_hold_disc = discretizar(somas_hold)
+
+    # Contagens de bins (diagnóstico)
+    print("Bins descoberta:", np.bincount(somas_desc_disc))
+    print("Bins confirmação:", np.bincount(somas_conf_disc, minlength=n_bins))
+    print("Bins holdout:", np.bincount(somas_hold_disc, minlength=n_bins))
+    print()
+
+    rng_desc = np.random.default_rng(20260911)
+    rng_conf = np.random.default_rng(20260912)
+    rng_hold = np.random.default_rng(20260913)
 
     # =====================================================
     # FASE DE DESCOBERTA
     # =====================================================
     print("Fase de DESCOBERTA...")
-    n_desc = X_desc.shape[0]
+    resultados_desc = []
 
-    real_acf = np.zeros((25, lag_max))
-    real_mi = np.zeros((25, lag_max))
     for d in range(25):
-        serie = X_desc[:, d]
-        for lag in range(1, lag_max+1):
-            real_acf[d, lag-1] = autocorrelacao(serie, lag)
-            real_mi[d, lag-1] = informacao_mutua_binaria(serie, lag)
+        y = pres_desc[:, d]
+        # MI real (usando soma discretizada)
+        mi_real = informacao_mutua_discreta(somas_desc_disc, y)
+        # AUC real (usando soma contínua)
+        auc_real = auc_roc(y, somas_desc)
+        # Δ real (tercis 30/70 fixos)
+        mask_alto = somas_desc >= limite_alto
+        mask_baixo = somas_desc <= limite_baixo
+        p_alto = np.mean(y[mask_alto]) if np.sum(mask_alto) > 0 else 0.0
+        p_baixo = np.mean(y[mask_baixo]) if np.sum(mask_baixo) > 0 else 0.0
+        delta = p_alto - p_baixo
 
-    print(f"Gerando {n_placebos_descoberta} placebos (descoberta)...")
-    acf_placebo = {d: {lag: [] for lag in range(1, lag_max+1)} for d in range(25)}
-    mi_placebo = {d: {lag: [] for lag in range(1, lag_max+1)} for d in range(25)}
+        # Placebos: permutar somas, manter y
+        mi_placebo = []
+        auc_placebo = []
+        delta_placebo = []
+        for _ in range(n_placebos_descoberta):
+            idx = rng_desc.permutation(len(somas_desc))
+            somas_p = somas_desc[idx]
+            somas_p_disc = discretizar(somas_p)
+            mi_placebo.append(informacao_mutua_discreta(somas_p_disc, y))
+            auc_placebo.append(auc_roc(y, somas_p))
+            mask_alto_p = somas_p >= limite_alto
+            mask_baixo_p = somas_p <= limite_baixo
+            p_alto_p = np.mean(y[mask_alto_p]) if np.sum(mask_alto_p) > 0 else 0.0
+            p_baixo_p = np.mean(y[mask_baixo_p]) if np.sum(mask_baixo_p) > 0 else 0.0
+            delta_placebo.append(p_alto_p - p_baixo_p)
 
-    for _ in tqdm(range(n_placebos_descoberta), desc="Placebos desc."):
-        indices = rng_desc.permutation(n_desc)
-        X_p = X_desc[indices]
-        for d in range(25):
-            serie = X_p[:, d]
-            for lag in range(1, lag_max+1):
-                ac = autocorrelacao(serie, lag)
-                mi = informacao_mutua_binaria(serie, lag)
-                acf_placebo[d][lag].append(ac)
-                mi_placebo[d][lag].append(mi)
+        mi_placebo = np.array(mi_placebo)
+        auc_placebo = np.array(auc_placebo)
+        delta_placebo = np.array(delta_placebo)
 
-    p_acf = np.zeros((25, lag_max))
-    p_mi = np.zeros((25, lag_max))
-    for d in range(25):
-        for lag_idx in range(lag_max):
-            lag = lag_idx + 1
-            nula_acf = np.array(acf_placebo[d][lag])
-            p_acf[d, lag_idx] = (1 + np.sum(np.abs(nula_acf) >= abs(real_acf[d, lag_idx]))) / (len(nula_acf) + 1)
-            nula_mi = np.array(mi_placebo[d][lag])
-            p_mi[d, lag_idx] = (1 + np.sum(nula_mi >= real_mi[d, lag_idx])) / (len(nula_mi) + 1)
+        p_mi = (1 + np.sum(mi_placebo >= mi_real)) / (len(mi_placebo) + 1)
+        auc_dev = abs(auc_real - 0.5)
+        auc_dev_placebo = np.abs(auc_placebo - 0.5)
+        p_auc = (1 + np.sum(auc_dev_placebo >= auc_dev)) / (len(auc_placebo) + 1)
+        p_delta = (1 + np.sum(np.abs(delta_placebo) >= abs(delta))) / (len(delta_placebo) + 1)
 
-    p_acf_flat = p_acf.flatten()
-    p_mi_flat = p_mi.flatten()
-    rej_acf, q_acf = fdr_bh(p_acf_flat, alpha)
-    rej_mi, q_mi = fdr_bh(p_mi_flat, alpha)
+        resultados_desc.append({
+            'dezena': d+1,
+            'mi_real': mi_real,
+            'p_mi': p_mi,
+            'auc_real': auc_real,
+            'p_auc': p_auc,
+            'delta': delta,
+            'p_delta': p_delta,
+        })
 
-    sinais_selecionados = set(rej_acf) | set(rej_mi)
-    sinais_selecionados = sorted(sinais_selecionados)
-    print(f"\nSinais selecionados na descoberta: {len(sinais_selecionados)}")
-    for idx in sinais_selecionados:
-        d = idx // lag_max
-        lag = idx % lag_max + 1
-        qa = q_acf[idx]
-        qm = q_mi[idx]
-        print(f"   dezena {d+1:2d}, lag {lag:2d}: ACF={real_acf[d,lag-1]:+.4f} (q={qa:.4f}), "
-              f"MI={real_mi[d,lag-1]:.4f} (q={qm:.4f})")
+    # FDR sobre p-values de MI e AUC (conjunto)
+    p_todos = []
+    for r in resultados_desc:
+        p_todos.append(r['p_mi'])
+        p_todos.append(r['p_auc'])
+    rej_desc, q_todos = fdr_bh(p_todos, alpha)
 
-    if not sinais_selecionados:
-        print("   Nenhum sinal selecionado.")
+    selecionadas = set()
+    for i, r in enumerate(resultados_desc):
+        r['q_mi'] = q_todos[2*i]
+        r['q_auc'] = q_todos[2*i+1]
+        if r['q_mi'] < alpha or r['q_auc'] < alpha:
+            selecionadas.add(r['dezena'])
+
+    selecionadas = sorted(selecionadas)
+    print(f"\nDezenas selecionadas na descoberta: {len(selecionadas)}")
+    for d in selecionadas:
+        r = resultados_desc[d-1]
+        print(f"   Dezena {r['dezena']:2d}: MI={r['mi_real']:.4f} (q={r['q_mi']:.4f}), "
+              f"AUC={r['auc_real']:.4f} (q={r['q_auc']:.4f}), Δ={r['delta']:+.4f} (p={r['p_delta']:.4f})")
+
+    if not selecionadas:
+        print("   Nenhuma dezena selecionada.")
         return None
 
     # =====================================================
     # FASE DE CONFIRMAÇÃO
     # =====================================================
     print("\nFase de CONFIRMAÇÃO...")
-    n_conf = X_conf.shape[0]
     resultados_conf = []
 
-    for idx in sinais_selecionados:
-        d = idx // lag_max
-        lag = idx % lag_max + 1
+    for d in selecionadas:
+        y = pres_conf[:, d-1]
+        mi_real = informacao_mutua_discreta(somas_conf_disc, y)
+        auc_real = auc_roc(y, somas_conf)
+        mask_alto = somas_conf >= limite_alto
+        mask_baixo = somas_conf <= limite_baixo
+        p_alto = np.mean(y[mask_alto]) if np.sum(mask_alto) > 0 else 0.0
+        p_baixo = np.mean(y[mask_baixo]) if np.sum(mask_baixo) > 0 else 0.0
+        delta = p_alto - p_baixo
 
-        serie = X_conf[:, d]
-        real_acf_conf = autocorrelacao(serie, lag)
-        real_mi_conf = informacao_mutua_binaria(serie, lag)
-        delta_conf, ic_low_conf, ic_high_conf = bootstrap_delta(serie, lag, n_boot=2000, seed=1000+idx)
-
-        acf_conf_nula = []
-        mi_conf_nula = []
+        mi_placebo = []
+        auc_placebo = []
+        delta_placebo = []
         for _ in range(n_placebos_confirmacao):
-            indices = rng_conf.permutation(n_conf)
-            serie_p = serie[indices]
-            acf_conf_nula.append(autocorrelacao(serie_p, lag))
-            mi_conf_nula.append(informacao_mutua_binaria(serie_p, lag))
-        acf_conf_nula = np.array(acf_conf_nula)
-        mi_conf_nula = np.array(mi_conf_nula)
-        p_acf_conf = (1 + np.sum(np.abs(acf_conf_nula) >= abs(real_acf_conf))) / (len(acf_conf_nula) + 1)
-        p_mi_conf = (1 + np.sum(mi_conf_nula >= real_mi_conf)) / (len(mi_conf_nula) + 1)
+            idx = rng_conf.permutation(len(somas_conf))
+            somas_p = somas_conf[idx]
+            somas_p_disc = discretizar(somas_p)
+            mi_placebo.append(informacao_mutua_discreta(somas_p_disc, y))
+            auc_placebo.append(auc_roc(y, somas_p))
+            mask_alto_p = somas_p >= limite_alto
+            mask_baixo_p = somas_p <= limite_baixo
+            p_alto_p = np.mean(y[mask_alto_p]) if np.sum(mask_alto_p) > 0 else 0.0
+            p_baixo_p = np.mean(y[mask_baixo_p]) if np.sum(mask_baixo_p) > 0 else 0.0
+            delta_placebo.append(p_alto_p - p_baixo_p)
 
-        # Probabilidades condicionais
-        x = serie[:-lag]
-        y = serie[lag:]
-        mask1 = x == 1
-        p_base = np.mean(serie)
-        p_cond1 = np.mean(y[mask1]) if np.sum(mask1) > 0 else p_base
-        p_cond0 = np.mean(y[~mask1]) if np.sum(~mask1) > 0 else p_base
-        diff_abs = p_cond1 - p_cond0
-        rr = (p_cond1 / p_cond0) if p_cond0 > 0 else np.inf
-        or_ = odds_ratio(p_cond1, p_cond0)
+        mi_placebo = np.array(mi_placebo)
+        auc_placebo = np.array(auc_placebo)
+        delta_placebo = np.array(delta_placebo)
 
-        # Persistência em 3 blocos
-        blocos = np.array_split(serie, 3)
-        acf_blocos = [autocorrelacao(bloco, lag) for bloco in blocos]
-        sinal_real = 1 if real_acf_conf >= 0 else -1
-        blocos_mesmo_sinal = sum(1 for a in acf_blocos if (a >= 0 and sinal_real == 1) or (a < 0 and sinal_real == -1))
+        p_mi = (1 + np.sum(mi_placebo >= mi_real)) / (len(mi_placebo) + 1)
+        auc_dev = abs(auc_real - 0.5)
+        auc_dev_placebo = np.abs(auc_placebo - 0.5)
+        p_auc = (1 + np.sum(auc_dev_placebo >= auc_dev)) / (len(auc_placebo) + 1)
+        p_delta = (1 + np.sum(np.abs(delta_placebo) >= abs(delta))) / (len(delta_placebo) + 1)
 
         resultados_conf.append({
-            'dezena': d+1,
-            'lag': lag,
-            'ACF_desc': real_acf[d, lag-1],
-            'MI_desc': real_mi[d, lag-1],
-            'q_ACF_desc': q_acf[idx],
-            'q_MI_desc': q_mi[idx],
-            'ACF_conf': real_acf_conf,
-            'MI_conf': real_mi_conf,
-            'p_ACF_conf': p_acf_conf,
-            'p_MI_conf': p_mi_conf,
-            'delta_conf': delta_conf,
-            'ic_low_conf': ic_low_conf,
-            'ic_high_conf': ic_high_conf,
-            'p_base': p_base,
-            'p_cond1': p_cond1,
-            'p_cond0': p_cond0,
-            'diff_abs': diff_abs,
-            'rr': rr,
-            'odds_ratio': or_,
-            'blocos_mesmo_sinal': blocos_mesmo_sinal,
-            'acf_blocos': acf_blocos
+            'dezena': d,
+            'mi_real': mi_real,
+            'p_mi': p_mi,
+            'auc_real': auc_real,
+            'p_auc': p_auc,
+            'delta': delta,
+            'p_delta': p_delta,
+            'p_cond_alto': p_alto,
+            'p_cond_baixo': p_baixo,
         })
 
-    # FDR conjunto na confirmação
+    # FDR conjunto
     p_conf_todos = []
-    for s in resultados_conf:
-        p_conf_todos.append(s['p_ACF_conf'])
-        p_conf_todos.append(s['p_MI_conf'])
+    for r in resultados_conf:
+        p_conf_todos.append(r['p_mi'])
+        p_conf_todos.append(r['p_auc'])
     rej_conf, q_conf_todos = fdr_bh(p_conf_todos, alpha)
 
-    for i, s in enumerate(resultados_conf):
-        s['q_ACF_conf'] = q_conf_todos[2*i]
-        s['q_MI_conf'] = q_conf_todos[2*i+1]
-        s['nominal'] = (s['p_ACF_conf'] < alpha or s['p_MI_conf'] < alpha)
-        s['confirmado_fdr'] = (s['q_ACF_conf'] < alpha or s['q_MI_conf'] < alpha)
+    for i, r in enumerate(resultados_conf):
+        r['q_mi'] = q_conf_todos[2*i]
+        r['q_auc'] = q_conf_todos[2*i+1]
+        r['nominal'] = r['p_mi'] < alpha or r['p_auc'] < alpha
+        r['confirmado_fdr'] = r['q_mi'] < alpha or r['q_auc'] < alpha
 
     # =====================================================
     # FASE DE HOLDOUT FINAL
     # =====================================================
     print("\nFase de HOLDOUT FINAL...")
-    n_holdout = X_holdout.shape[0]
-    resultados_holdout = []
+    resultados_hold = []
 
-    for s in resultados_conf:
-        d = s['dezena'] - 1
-        lag = s['lag']
-        serie = X_holdout[:, d]
-        real_acf_holdout = autocorrelacao(serie, lag)
-        real_mi_holdout = informacao_mutua_binaria(serie, lag)
-        delta_hold, ic_low_hold, ic_high_hold = bootstrap_delta(serie, lag, n_boot=2000, seed=2000+s['dezena']*100+lag)
+    for r in resultados_conf:
+        d = r['dezena']
+        y = pres_hold[:, d-1]
+        mi_real = informacao_mutua_discreta(somas_hold_disc, y)
+        auc_real = auc_roc(y, somas_hold)
+        mask_alto = somas_hold >= limite_alto
+        mask_baixo = somas_hold <= limite_baixo
+        p_alto = np.mean(y[mask_alto]) if np.sum(mask_alto) > 0 else 0.0
+        p_baixo = np.mean(y[mask_baixo]) if np.sum(mask_baixo) > 0 else 0.0
+        delta = p_alto - p_baixo
 
-        acf_holdout_nula = []
-        mi_holdout_nula = []
+        mi_placebo = []
+        auc_placebo = []
+        delta_placebo = []
         for _ in range(n_placebos_holdout):
-            indices = rng_holdout.permutation(n_holdout)
-            serie_p = serie[indices]
-            acf_holdout_nula.append(autocorrelacao(serie_p, lag))
-            mi_holdout_nula.append(informacao_mutua_binaria(serie_p, lag))
-        acf_holdout_nula = np.array(acf_holdout_nula)
-        mi_holdout_nula = np.array(mi_holdout_nula)
+            idx = rng_hold.permutation(len(somas_hold))
+            somas_p = somas_hold[idx]
+            somas_p_disc = discretizar(somas_p)
+            mi_placebo.append(informacao_mutua_discreta(somas_p_disc, y))
+            auc_placebo.append(auc_roc(y, somas_p))
+            mask_alto_p = somas_p >= limite_alto
+            mask_baixo_p = somas_p <= limite_baixo
+            p_alto_p = np.mean(y[mask_alto_p]) if np.sum(mask_alto_p) > 0 else 0.0
+            p_baixo_p = np.mean(y[mask_baixo_p]) if np.sum(mask_baixo_p) > 0 else 0.0
+            delta_placebo.append(p_alto_p - p_baixo_p)
 
-        # p bilateral
-        p_acf_holdout_bilat = (1 + np.sum(np.abs(acf_holdout_nula) >= abs(real_acf_holdout))) / (len(acf_holdout_nula) + 1)
-        p_mi_holdout = (1 + np.sum(mi_holdout_nula >= real_mi_holdout)) / (len(mi_holdout_nula) + 1)
+        mi_placebo = np.array(mi_placebo)
+        auc_placebo = np.array(auc_placebo)
+        delta_placebo = np.array(delta_placebo)
 
-        # p direcional conforme sinal descoberto
-        sinal_desc = 1 if s['ACF_desc'] >= 0 else -1
-        if sinal_desc >= 0:
-            p_acf_holdout_dir = (1 + np.sum(acf_holdout_nula >= real_acf_holdout)) / (len(acf_holdout_nula) + 1)
-        else:
-            p_acf_holdout_dir = (1 + np.sum(acf_holdout_nula <= real_acf_holdout)) / (len(acf_holdout_nula) + 1)
+        p_mi = (1 + np.sum(mi_placebo >= mi_real)) / (len(mi_placebo) + 1)
+        auc_dev = abs(auc_real - 0.5)
+        auc_dev_placebo = np.abs(auc_placebo - 0.5)
+        p_auc = (1 + np.sum(auc_dev_placebo >= auc_dev)) / (len(auc_placebo) + 1)
+        p_delta = (1 + np.sum(np.abs(delta_placebo) >= abs(delta))) / (len(delta_placebo) + 1)
 
-        # Probabilidades condicionais
-        x = serie[:-lag]
-        y = serie[lag:]
-        mask1 = x == 1
-        p_base = np.mean(serie)
-        p_cond1 = np.mean(y[mask1]) if np.sum(mask1) > 0 else p_base
-        p_cond0 = np.mean(y[~mask1]) if np.sum(~mask1) > 0 else p_base
-        diff_abs = p_cond1 - p_cond0
-        rr = (p_cond1 / p_cond0) if p_cond0 > 0 else np.inf
-        or_ = odds_ratio(p_cond1, p_cond0)
-
-        resultados_holdout.append({
-            'dezena': s['dezena'],
-            'lag': s['lag'],
-            'ACF_conf': s['ACF_conf'],
-            'ACF_holdout': real_acf_holdout,
-            'MI_holdout': real_mi_holdout,
-            'p_ACF_holdout_bilat': p_acf_holdout_bilat,
-            'p_ACF_holdout_dir': p_acf_holdout_dir,
-            'p_MI_holdout': p_mi_holdout,
-            'delta_hold': delta_hold,
-            'ic_low_hold': ic_low_hold,
-            'ic_high_hold': ic_high_hold,
-            'p_base': p_base,
-            'p_cond1': p_cond1,
-            'p_cond0': p_cond0,
-            'diff_abs': diff_abs,
-            'rr': rr,
-            'odds_ratio': or_,
+        resultados_hold.append({
+            'dezena': d,
+            'mi_real': mi_real,
+            'p_mi': p_mi,
+            'auc_real': auc_real,
+            'p_auc': p_auc,
+            'delta': delta,
+            'p_delta': p_delta,
+            'p_cond_alto': p_alto,
+            'p_cond_baixo': p_baixo,
         })
 
-    # FDR conjunto no holdout (usando p bilateral para ACF e p unilateral para MI)
-    p_holdout_todos = []
-    for s in resultados_holdout:
-        p_holdout_todos.append(s['p_ACF_holdout_bilat'])
-        p_holdout_todos.append(s['p_MI_holdout'])
-    rej_holdout, q_holdout_todos = fdr_bh(p_holdout_todos, alpha)
+    # FDR conjunto no holdout
+    p_hold_todos = []
+    for r in resultados_hold:
+        p_hold_todos.append(r['p_mi'])
+        p_hold_todos.append(r['p_auc'])
+    rej_hold, q_hold_todos = fdr_bh(p_hold_todos, alpha)
 
-    for i, s in enumerate(resultados_holdout):
-        s['q_ACF_holdout'] = q_holdout_todos[2*i]
-        s['q_MI_holdout'] = q_holdout_todos[2*i+1]
-        s['nominal_holdout'] = (s['p_ACF_holdout_bilat'] < alpha or s['p_MI_holdout'] < alpha)
-        s['confirmado_holdout'] = (s['q_ACF_holdout'] < alpha or s['q_MI_holdout'] < alpha)
+    for i, r in enumerate(resultados_hold):
+        r['q_mi'] = q_hold_todos[2*i]
+        r['q_auc'] = q_hold_todos[2*i+1]
+        r['nominal_hold'] = r['p_mi'] < alpha or r['p_auc'] < alpha
+        r['confirmado_hold'] = r['q_mi'] < alpha or r['q_auc'] < alpha
 
     # =====================================================
     # EXIBIÇÃO FINAL
     # =====================================================
     print("\n📊 RESULTADOS")
-    print(f"{'Dez':<4} {'Lag':<4} {'ACF desc':<10} {'ACF conf':<10} {'ACF hold':<10} "
-          f"{'p bilat':<8} {'p dir':<8} {'q hold':<8} {'Δ conf [IC95%]':<20} {'Δ hold [IC95%]':<20} "
-          f"{'RR':<6} {'OR':<6}")
-    print("-" * 130)
-    for i, s in enumerate(resultados_conf):
-        h = resultados_holdout[i]
-        conf_ic = f"{s['delta_conf']:+.3f} [{s['ic_low_conf']:+.3f}, {s['ic_high_conf']:+.3f}]"
-        hold_ic = f"{h['delta_hold']:+.3f} [{h['ic_low_hold']:+.3f}, {h['ic_high_hold']:+.3f}]"
-        print(f"{s['dezena']:<4} {s['lag']:<4} {s['ACF_desc']:+.4f}     {s['ACF_conf']:+.4f}     {h['ACF_holdout']:+.4f}     "
-              f"{h['p_ACF_holdout_bilat']:.4f}   {h['p_ACF_holdout_dir']:.4f}   {min(h['q_ACF_holdout'],h['q_MI_holdout']):.4f}   "
-              f"{conf_ic:<20} {hold_ic:<20} {h['rr']:.3f} {h['odds_ratio']:.3f}")
+    print(f"{'Dez':<4} {'MI desc':<8} {'AUC desc':<8} {'MI conf':<8} {'AUC conf':<8} "
+          f"{'MI hold':<8} {'AUC hold':<8} {'Δ hold':<8} {'p MI hold':<10} {'q hold':<8}")
+    print("-" * 90)
+    for i, r_conf in enumerate(resultados_conf):
+        r_hold = resultados_hold[i]
+        print(f"{r_conf['dezena']:<4} "
+              f"{resultados_desc[r_conf['dezena']-1]['mi_real']:.4f}   "
+              f"{resultados_desc[r_conf['dezena']-1]['auc_real']:.4f}   "
+              f"{r_conf['mi_real']:.4f}   {r_conf['auc_real']:.4f}   "
+              f"{r_hold['mi_real']:.4f}   {r_hold['auc_real']:.4f}   "
+              f"{r_hold['delta']:+.4f}   {r_hold['p_mi']:.4f}   "
+              f"{min(r_hold['q_mi'], r_hold['q_auc']):.4f}")
 
-    # Resumo
-    n_total = len(resultados_conf)
-    n_conf_nominal = sum(1 for s in resultados_conf if s['nominal'])
-    n_conf_fdr = sum(1 for s in resultados_conf if s['confirmado_fdr'])
-    n_holdout_nominal = sum(1 for s in resultados_holdout if s['nominal_holdout'])
-    n_holdout_fdr = sum(1 for s in resultados_holdout if s['confirmado_holdout'])
+    n_total = len(selecionadas)
+    n_conf_nominal = sum(1 for r in resultados_conf if r['nominal'])
+    n_conf_fdr = sum(1 for r in resultados_conf if r['confirmado_fdr'])
+    n_hold_nominal = sum(1 for r in resultados_hold if r['nominal_hold'])
+    n_hold_fdr = sum(1 for r in resultados_hold if r['confirmado_hold'])
 
     print(f"\n🔍 RESUMO")
-    print(f"   Candidatos (descoberta): {n_total}")
+    print(f"   Dezenas selecionadas: {n_total}")
     print(f"   Confirmação nominal: {n_conf_nominal}")
     print(f"   Confirmação FDR: {n_conf_fdr}")
-    print(f"   Holdout nominal: {n_holdout_nominal}")
-    print(f"   Holdout FDR: {n_holdout_fdr}")
+    print(f"   Holdout nominal: {n_hold_nominal}")
+    print(f"   Holdout FDR: {n_hold_fdr}")
 
-    if n_holdout_fdr == 0:
-        print("\n✅ Nenhum candidato apresentou dependência temporal estatisticamente significativa")
-        print("   no holdout após FDR. Não há evidência de persistência temporal estável")
-        print("   nos sinais previamente selecionados.")
+    if n_hold_fdr == 0:
+        print("\n✅ Nenhuma dezena apresentou dependência significativa com a soma anterior")
+        print("   no holdout após FDR. Não há evidência de que a soma do concurso passado")
+        print("   contenha informação estável sobre a presença das dezenas no próximo.")
     else:
-        print("\n⚠️ Há candidato(s) com evidência no holdout; não concluir causalidade.")
-        print("   Esses sinais merecem investigação com modelo específico.")
+        print("\n⚠️ Há dezenas com evidência no holdout; investigar com modelos específicos.")
 
-    return resultados_conf, resultados_holdout
+    # =====================================================
+    # ANÁLISE ADICIONAL: S_t -> S_{t+1}
+    # =====================================================
+    print("\n📊 ANÁLISE SOMA → PRÓXIMA SOMA")
+    soma_t = X_soma[:-1]   # S_t
+    soma_t1 = X_soma[1:]   # S_{t+1}
+
+    # Correlação
+    corr = np.corrcoef(soma_t, soma_t1)[0,1]
+    # MI (discretizando ambas em 5 quantis)
+    lim_soma = np.percentile(soma_t, np.linspace(0,100,6))
+    disc_t = np.digitize(soma_t, lim_soma[1:-1])
+    disc_t1 = np.digitize(soma_t1, lim_soma[1:-1])
+    mi_ss = informacao_mutua_discreta(disc_t, disc_t1)  # isso não é apropriado; vamos usar MI entre discretos
+    # Vamos calcular MI entre discretizações de S_t e S_{t+1} manualmente
+    cont = Counter(zip(disc_t, disc_t1))
+    total = len(disc_t)
+    px = Counter(disc_t)
+    py = Counter(disc_t1)
+    mi_ss = 0.0
+    for (a,b), n in cont.items():
+        pxy = n / total
+        px_ = px[a] / total
+        py_ = py[b] / total
+        if pxy > 0:
+            mi_ss += pxy * np.log2(pxy / (px_ * py_))
+    print(f"   Correlação(S_t, S_{t+1}) = {corr:+.4f}")
+    print(f"   Informação Mútua(S_t, S_{t+1}) = {mi_ss:.4f}")
+
+    # Reversão à média: compara média de S_{t+1} condicionada a S_t em tercis
+    tercil_baixo = np.percentile(soma_t, 33.33)
+    tercil_alto = np.percentile(soma_t, 66.67)
+    mask_baixo = soma_t <= tercil_baixo
+    mask_alto = soma_t >= tercil_alto
+    media_baixo = np.mean(soma_t1[mask_baixo]) if np.sum(mask_baixo)>0 else np.nan
+    media_alto = np.mean(soma_t1[mask_alto]) if np.sum(mask_alto)>0 else np.nan
+    print(f"   Média S_{t+1} quando S_t baixo: {media_baixo:.2f}")
+    print(f"   Média S_{t+1} quando S_t alto: {media_alto:.2f}")
+    print(f"   Diferença (alto - baixo): {media_alto - media_baixo:+.2f}")
+
+    # Placebo para correlação e MI
+    rng_soma = np.random.default_rng(20260914)
+    corr_placebo = []
+    mi_placebo_ss = []
+    for _ in range(1000):
+        idx = rng_soma.permutation(len(soma_t))
+        soma_p = soma_t[idx]
+        corr_p = np.corrcoef(soma_p, soma_t1)[0,1]
+        corr_placebo.append(corr_p)
+        disc_p = np.digitize(soma_p, lim_soma[1:-1])
+        cont_p = Counter(zip(disc_p, disc_t1))
+        mi_p = 0.0
+        for (a,b), n in cont_p.items():
+            pxy = n / total
+            px_ = px[a] / total
+            py_ = py[b] / total
+            if pxy > 0:
+                mi_p += pxy * np.log2(pxy / (px_ * py_))
+        mi_placebo_ss.append(mi_p)
+    corr_placebo = np.array(corr_placebo)
+    mi_placebo_ss = np.array(mi_placebo_ss)
+    p_corr = (1 + np.sum(np.abs(corr_placebo) >= abs(corr))) / (len(corr_placebo)+1)
+    p_mi_ss = (1 + np.sum(mi_placebo_ss >= mi_ss)) / (len(mi_placebo_ss)+1)
+    print(f"   p-valor correlação: {p_corr:.4f}")
+    print(f"   p-valor MI: {p_mi_ss:.4f}")
+
+    return resultados_desc, resultados_conf, resultados_hold
 
 # ============================================================
 # INTERFACE PRINCIPAL
 # ============================================================
 def main():
     print("="*70)
-    print("🔍 AUDITORIA TEMPORAL v2.2 – Descoberta, Confirmação e Holdout")
+    print("🔍 AUDITORIA SOMA → DEZENAS v1.1")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
@@ -444,7 +520,7 @@ def main():
 
     while True:
         print("\nOpções:")
-        print("1. Executar auditoria temporal v2.2")
+        print("1. Executar auditoria soma → dezenas")
         print("0. Sair")
         op = input("Escolha: ").strip()
         if op == '1':
@@ -454,16 +530,16 @@ def main():
                 n_placebos_desc = int(input("   Placebos descoberta [5000]: ").strip() or "5000")
                 n_placebos_conf = int(input("   Placebos confirmação [5000]: ").strip() or "5000")
                 n_placebos_hold = int(input("   Placebos holdout [5000]: ").strip() or "5000")
-                lag_max = int(input("   Lag máximo [10]: ").strip() or "10")
+                n_bins = int(input("   Número de quantis da soma [5]: ").strip() or "5")
             except:
                 frac_desc, frac_conf = 0.6, 0.2
                 n_placebos_desc = n_placebos_conf = n_placebos_hold = 5000
-                lag_max = 10
-            auditoria_temporal_v2(contests, frac_descoberta=frac_desc, frac_confirmacao=frac_conf,
-                                  n_placebos_descoberta=n_placebos_desc,
-                                  n_placebos_confirmacao=n_placebos_conf,
-                                  n_placebos_holdout=n_placebos_hold,
-                                  lag_max=lag_max)
+                n_bins = 5
+            auditoria_soma_dezenas(contests, frac_descoberta=frac_desc, frac_confirmacao=frac_conf,
+                                   n_placebos_descoberta=n_placebos_desc,
+                                   n_placebos_confirmacao=n_placebos_conf,
+                                   n_placebos_holdout=n_placebos_hold,
+                                   n_bins=n_bins)
         elif op == '0':
             break
         else:
