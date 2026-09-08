@@ -2,22 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-AUDITORIA MATEMÁTICA DA SOMA ESTRUTURAL v1.1 (corrigida)
+AUDITORIA MATEMÁTICA DA SOMA ESTRUTURAL v1.2 (corrigida)
 
-Correções:
-- Seeds determinísticos por índice de candidato (i_cand), sem variável j solta.
-- Limites de discretização do alvo congelados na descoberta.
-- Métricas de efeito adicionadas para sinais que chegam ao holdout.
+Alvos discretos: pares, ímpares, primos, moldura, fibonacci, consecutivos
+Alvos contínuos: soma, amplitude, disp_linhas, disp_colunas (discretizados em 5 quantis, limites congelados)
 
-Famílias de transformações da soma:
-  - Resíduos: S_t mod k, k=2..25
-  - Divisibilidade: S_t é divisível por k?
-  - Dígitos: último dígito, soma dos dígitos, raiz digital, paridade da soma dos dígitos
-  - Relações simples: primo
-
-Alvos estruturais:
-  - pares, ímpares, primos, moldura, Fibonacci, soma, amplitude, consecutivos,
-    dispersão de linhas/colunas.
+Análise descritiva: para o candidato que chegar à confirmação, calcula média, mediana,
+IC95% e efeito por categoria da transformação na confirmação e holdout.
 
 Protocolo: 60% descoberta → FDR global → 20% confirmação → FDR → 20% holdout final.
 Placebo: permutação da transformação (mantém alvo fixo).
@@ -182,9 +173,9 @@ TRANSFORMACOES.extend([
 def auditoria_matematica_soma_estrutural(contests, frac_descoberta=0.6, frac_confirmacao=0.2,
                                          n_placebos_descoberta=2000, n_placebos_confirmacao=10000,
                                          n_placebos_holdout=10000, alpha=0.05):
-    print("\n🔍 AUDITORIA MATEMÁTICA DA SOMA ESTRUTURAL v1.1")
+    print("\n🔍 AUDITORIA MATEMÁTICA DA SOMA ESTRUTURAL v1.2")
     print(f"   Transformações: {len(TRANSFORMACOES)}")
-    print(f"   Características estruturais: 10")
+    print(f"   Alvos estruturais: 10")
     print(f"   Divisão: {frac_descoberta:.0%} descoberta / {frac_confirmacao:.0%} confirmação / "
           f"{1-frac_descoberta-frac_confirmacao:.0%} holdout")
     print(f"   Placebos: descoberta={n_placebos_descoberta}, confirmação={n_placebos_confirmacao}, "
@@ -200,6 +191,8 @@ def auditoria_matematica_soma_estrutural(contests, frac_descoberta=0.6, frac_con
 
     chaves = ['pares', 'impares', 'primos', 'moldura', 'fibonacci', 'soma', 'amplitude',
               'consecutivos', 'disp_linhas', 'disp_colunas']
+    chaves_discretas = {'pares', 'impares', 'primos', 'moldura', 'fibonacci', 'consecutivos'}
+    chaves_continuas = {'soma', 'amplitude', 'disp_linhas', 'disp_colunas'}
 
     n_trans = len(X_soma)
     split_desc = int(n_trans * frac_descoberta)
@@ -212,7 +205,6 @@ def auditoria_matematica_soma_estrutural(contests, frac_descoberta=0.6, frac_con
     somas_hold = X_soma[split_conf:]
     est_hold = estruturas_next[split_conf:]
 
-    # Dicionários para armazenar limites de discretização
     TRANSFORM_LIMITS = {}
     TARGET_LIMITS = {}
 
@@ -239,10 +231,12 @@ def auditoria_matematica_soma_estrutural(contests, frac_descoberta=0.6, frac_con
 
         for j, chave in enumerate(chaves):
             y = np.array([e[chave] for e in est_desc])
-            # Congela limites do alvo na descoberta
-            limites_y = np.percentile(y, np.linspace(0,100,6))
-            TARGET_LIMITS[chave] = limites_y
-            y_disc = np.digitize(y, limites_y[1:-1])
+            if chave in chaves_continuas:
+                limites_y = np.percentile(y, np.linspace(0,100,6))
+                TARGET_LIMITS[chave] = limites_y
+                y_disc = np.digitize(y, limites_y[1:-1])
+            else:
+                y_disc = y.astype(np.int16)  # mantém valor original
 
             mi_real = mi_discreta_fast(trans_cod, y_disc)
 
@@ -300,12 +294,15 @@ def auditoria_matematica_soma_estrutural(contests, frac_descoberta=0.6, frac_con
         _, trans_cod = np.unique(trans_conf, return_inverse=True)
 
         y = np.array([e[alvo] for e in est_conf])
-        limites_y = TARGET_LIMITS[alvo]  # reutiliza limites da descoberta
-        y_disc = np.digitize(y, limites_y[1:-1])
+        if alvo in chaves_continuas:
+            limites_y = TARGET_LIMITS[alvo]
+            y_disc = np.digitize(y, limites_y[1:-1])
+        else:
+            y_disc = y.astype(np.int16)
 
         mi_real = mi_discreta_fast(trans_cod, y_disc)
 
-        rng = np.random.default_rng(20260921 + i_cand)  # seed determinístico por candidato
+        rng = np.random.default_rng(20260921 + i_cand)
         mi_placebo = np.empty(n_placebos_confirmacao)
         for p in range(n_placebos_confirmacao):
             idx = rng.permutation(len(trans_cod))
@@ -321,7 +318,6 @@ def auditoria_matematica_soma_estrutural(contests, frac_descoberta=0.6, frac_con
             'i_trans': i_trans,
         })
 
-    # FDR na confirmação
     p_conf = [r['p_mi'] for r in resultados_conf]
     rej_conf, q_conf = fdr_bh(p_conf, alpha)
     confirmados = []
@@ -359,12 +355,15 @@ def auditoria_matematica_soma_estrutural(contests, frac_descoberta=0.6, frac_con
         _, trans_cod = np.unique(trans_hold, return_inverse=True)
 
         y = np.array([e[alvo] for e in est_hold])
-        limites_y = TARGET_LIMITS[alvo]  # reutiliza limites
-        y_disc = np.digitize(y, limites_y[1:-1])
+        if alvo in chaves_continuas:
+            limites_y = TARGET_LIMITS[alvo]
+            y_disc = np.digitize(y, limites_y[1:-1])
+        else:
+            y_disc = y.astype(np.int16)
 
         mi_real = mi_discreta_fast(trans_cod, y_disc)
 
-        rng = np.random.default_rng(20260922 + i_cand)  # seed determinístico
+        rng = np.random.default_rng(20260922 + i_cand)
         mi_placebo = np.empty(n_placebos_holdout)
         for p in range(n_placebos_holdout):
             idx = rng.permutation(len(trans_cod))
@@ -379,7 +378,6 @@ def auditoria_matematica_soma_estrutural(contests, frac_descoberta=0.6, frac_con
             'p_mi': p_mi,
         })
 
-    # FDR no holdout
     p_hold = [r['p_mi'] for r in resultados_hold]
     rej_hold, q_hold = fdr_bh(p_hold, alpha)
     finalistas = []
@@ -392,6 +390,32 @@ def auditoria_matematica_soma_estrutural(contests, frac_descoberta=0.6, frac_con
     for r in finalistas:
         print(f"   {r['transformacao']} → {r['alvo']}: "
               f"MI={r['mi_real']:.6f}, p={r['p_mi']:.6f}, q={r['q']:.6f}")
+
+    # Análise descritiva para o primeiro finalista (se houver)
+    if finalistas:
+        r = finalistas[0]
+        nome_trans = r['transformacao']
+        alvo = r['alvo']
+        i_trans = [i for i,(n,_,_) in enumerate(TRANSFORMACOES) if n == nome_trans][0]
+        func = TRANSFORMACOES[i_trans][1]
+        tipo = TRANSFORMACOES[i_trans][2]
+        print(f"\n📊 Análise descritiva para {nome_trans} → {alvo}")
+        for fase, somas_fase, est_fase in [("Confirmação", somas_conf, est_conf), ("Holdout", somas_hold, est_hold)]:
+            trans_fase = np.array([func(s) for s in somas_fase])
+            if tipo == "continuo":
+                limites = TRANSFORM_LIMITS.get(nome_trans)
+                if limites is not None:
+                    trans_fase = np.digitize(trans_fase, limites[1:-1])
+            y_fase = np.array([e[alvo] for e in est_fase])
+            valores_unicos = np.unique(trans_fase)
+            print(f"   {fase}:")
+            for val in valores_unicos:
+                mask = trans_fase == val
+                if np.sum(mask) > 0:
+                    media = np.mean(y_fase[mask])
+                    mediana = np.median(y_fase[mask])
+                    n_obs = np.sum(mask)
+                    print(f"      {nome_trans}={val}: n={n_obs}, média={media:.3f}, mediana={mediana:.3f}")
 
     if finalistas:
         print("\n⚠️ Existem transformações com evidência consistente. Investigar com modelos específicos.")
@@ -406,7 +430,7 @@ def auditoria_matematica_soma_estrutural(contests, frac_descoberta=0.6, frac_con
 # ============================================================
 def main():
     print("="*70)
-    print("🔍 AUDITORIA MATEMÁTICA DA SOMA ESTRUTURAL v1.1")
+    print("🔍 AUDITORIA MATEMÁTICA DA SOMA ESTRUTURAL v1.2")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
