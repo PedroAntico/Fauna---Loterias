@@ -2,27 +2,29 @@
 # -*- coding: utf-8 -*-
 
 """
-AUDITORIA MATEMÁTICA DA SOMA v1.2 (otimizada)
+AUDITORIA MATEMÁTICA DA SOMA ESTRUTURAL v1.1 (corrigida)
 
-Otimizações:
-- Descoberta: 2000 placebos; confirmação/holdout: 10000 placebos.
-- MI vetorizada com numpy (mi_discreta_fast).
-- Reutilização de permutações por transformação (matriz de índices).
-- Sementes determinísticas sem hash.
+Correções:
+- Seeds determinísticos por índice de candidato (i_cand), sem variável j solta.
+- Limites de discretização do alvo congelados na descoberta.
+- Métricas de efeito adicionadas para sinais que chegam ao holdout.
 
-Famílias:
-  A - Resíduos: S_t mod k, k=2..25 (24)
-  B - Divisibilidade: S_t é divisível por k? (24)
-  C - Dígitos: último dígito, soma dos dígitos, raiz digital, paridade da soma dos dígitos (4)
-  D - Relações simples: primo (1)
-  Total = 53 transformações.
+Famílias de transformações da soma:
+  - Resíduos: S_t mod k, k=2..25
+  - Divisibilidade: S_t é divisível por k?
+  - Dígitos: último dígito, soma dos dígitos, raiz digital, paridade da soma dos dígitos
+  - Relações simples: primo
+
+Alvos estruturais:
+  - pares, ímpares, primos, moldura, Fibonacci, soma, amplitude, consecutivos,
+    dispersão de linhas/colunas.
 
 Protocolo: 60% descoberta → FDR global → 20% confirmação → FDR → 20% holdout final.
 Placebo: permutação da transformação (mantém alvo fixo).
-Métrica: Informação Mútua (MI) entre transformação e indicador da dezena.
 """
 
 import numpy as np
+from scipy.stats import spearmanr
 from collections import Counter
 import os, time, warnings
 from tqdm import tqdm
@@ -58,28 +60,54 @@ def load_all_contests(csv_file='resultados_lotofacil.csv'):
 def soma_concurso(dezenas):
     return sum(dezenas)
 
-def matriz_presenca(contests):
-    n = len(contests)
-    X = np.zeros((n, 25), dtype=np.int8)
-    for i, c in enumerate(contests):
-        for d in c['dezenas']:
-            X[i, d-1] = 1
-    return X
+def extrair_estrutura(dezenas):
+    d = sorted(dezenas)
+    pares = sum(1 for x in d if x % 2 == 0)
+    impares = 15 - pares
+    primos = sum(1 for x in d if x in PRIMES)
+    moldura = sum(1 for x in d if x in MOLDURA)
+    fibonacci = sum(1 for x in d if x in FIBONACCI)
+    soma = sum(d)
+    amplitude = max(d) - min(d)
+    consecutivos = sum(1 for i in range(len(d)-1) if d[i+1]-d[i] == 1)
+    linhas = Counter((x-1)//5 for x in d)
+    colunas = Counter((x-1)%5 for x in d)
+    disp_linhas = np.std([linhas.get(i,0) for i in range(5)])
+    disp_colunas = np.std([colunas.get(i,0) for i in range(5)])
+    return {
+        'pares': pares,
+        'impares': impares,
+        'primos': primos,
+        'moldura': moldura,
+        'fibonacci': fibonacci,
+        'soma': soma,
+        'amplitude': amplitude,
+        'consecutivos': consecutivos,
+        'disp_linhas': disp_linhas,
+        'disp_colunas': disp_colunas,
+    }
 
+PRIMES = {2,3,5,7,11,13,17,19,23}
+MOLDURA = {1,2,3,4,5,6,10,11,15,16,20,21,22,23,24,25}
+FIBONACCI = {1,2,3,5,8,13,21}
+
+# ============================================================
+# FUNÇÕES DE MI E FDR
+# ============================================================
 def mi_discreta_fast(x, y):
-    """Informação mútua entre x (categórico) e y (binário) via numpy."""
     x = np.asarray(x, dtype=np.int16)
-    y = np.asarray(y, dtype=np.int8)
+    y = np.asarray(y, dtype=np.int16)
     if len(x) < 10:
         return 0.0
 
-    # Codificar x para códigos 0..k-1
     _, x_codes = np.unique(x, return_inverse=True)
-    k = x_codes.max() + 1
+    _, y_codes = np.unique(y, return_inverse=True)
 
-    # Tabela de contingência k x 2
-    pair = x_codes * 2 + y
-    tabela = np.bincount(pair, minlength=k*2).reshape(k, 2)
+    kx = x_codes.max() + 1
+    ky = y_codes.max() + 1
+
+    pair = x_codes * ky + y_codes
+    tabela = np.bincount(pair, minlength=kx*ky).reshape(kx, ky)
 
     total = len(x)
     px = tabela.sum(axis=1) / total
@@ -87,8 +115,8 @@ def mi_discreta_fast(x, y):
     pxy = tabela / total
 
     mi = 0.0
-    for i in range(k):
-        for j in range(2):
+    for i in range(kx):
+        for j in range(ky):
             if pxy[i, j] > 0:
                 mi += pxy[i, j] * np.log2(pxy[i, j] / (px[i] * py[j]))
     return mi
@@ -121,7 +149,7 @@ def is_prime(num):
     return True
 
 # ============================================================
-# DEFINIÇÃO DAS TRANSFORMAÇÕES (sem duplicatas)
+# DEFINIÇÃO DAS TRANSFORMAÇÕES
 # ============================================================
 def raiz_digital(n):
     return (n - 1) % 9 + 1 if n > 0 else 0
@@ -136,95 +164,98 @@ def paridade_soma_digitos(n):
     return soma_digitos(n) % 2
 
 TRANSFORMACOES = []
-# A - Resíduos
 for k in range(2, 26):
     TRANSFORMACOES.append((f"mod_{k}", lambda s, k=k: s % k, "categorico"))
-# B - Divisibilidade
 for k in range(2, 26):
     TRANSFORMACOES.append((f"div_{k}", lambda s, k=k: int(s % k == 0), "binario"))
-# C - Dígitos
 TRANSFORMACOES.extend([
     ("ultimo_digito", ultimo_digito, "categorico"),
     ("soma_digitos", soma_digitos, "continuo"),
     ("raiz_digital", raiz_digital, "categorico"),
     ("paridade_soma_digitos", paridade_soma_digitos, "binario"),
+    ("primo", lambda s: int(is_prime(s)), "binario"),
 ])
-# D - Relações simples (apenas primo)
-TRANSFORMACOES.append(("primo", lambda s: int(is_prime(s)), "binario"))
-
-TRANSFORM_DICT = {nome: (func, tipo) for nome, func, tipo in TRANSFORMACOES}
 
 # ============================================================
-# FUNÇÃO PRINCIPAL OTIMIZADA
+# FUNÇÃO PRINCIPAL
 # ============================================================
-def auditoria_matematica_soma(contests, frac_descoberta=0.6, frac_confirmacao=0.2,
-                              n_placebos_descoberta=2000, n_placebos_confirmacao=10000,
-                              n_placebos_holdout=10000, alpha=0.05):
-    print("\n🔍 AUDITORIA MATEMÁTICA DA SOMA v1.2 (otimizada)")
+def auditoria_matematica_soma_estrutural(contests, frac_descoberta=0.6, frac_confirmacao=0.2,
+                                         n_placebos_descoberta=2000, n_placebos_confirmacao=10000,
+                                         n_placebos_holdout=10000, alpha=0.05):
+    print("\n🔍 AUDITORIA MATEMÁTICA DA SOMA ESTRUTURAL v1.1")
+    print(f"   Transformações: {len(TRANSFORMACOES)}")
+    print(f"   Características estruturais: 10")
     print(f"   Divisão: {frac_descoberta:.0%} descoberta / {frac_confirmacao:.0%} confirmação / "
           f"{1-frac_descoberta-frac_confirmacao:.0%} holdout")
-    print(f"   Total de transformações: {len(TRANSFORMACOES)}")
     print(f"   Placebos: descoberta={n_placebos_descoberta}, confirmação={n_placebos_confirmacao}, "
           f"holdout={n_placebos_holdout}\n")
 
-    # Construir transições S_t -> X_{t+1}
+    # Preparar dados
     n = len(contests)
     somas = np.array([soma_concurso(c['dezenas']) for c in contests])
-    presencas = matriz_presenca(contests)
+    estruturas = [extrair_estrutura(c['dezenas']) for c in contests]
+
     X_soma = somas[:-1]
-    Y_next = presencas[1:]
+    estruturas_next = estruturas[1:]
+
+    chaves = ['pares', 'impares', 'primos', 'moldura', 'fibonacci', 'soma', 'amplitude',
+              'consecutivos', 'disp_linhas', 'disp_colunas']
 
     n_trans = len(X_soma)
     split_desc = int(n_trans * frac_descoberta)
     split_conf = int(n_trans * (frac_descoberta + frac_confirmacao))
 
     somas_desc = X_soma[:split_desc]
-    pres_desc = Y_next[:split_desc]
+    est_desc = estruturas_next[:split_desc]
     somas_conf = X_soma[split_desc:split_conf]
-    pres_conf = Y_next[split_desc:split_conf]
+    est_conf = estruturas_next[split_desc:split_conf]
     somas_hold = X_soma[split_conf:]
-    pres_hold = Y_next[split_conf:]
+    est_hold = estruturas_next[split_conf:]
+
+    # Dicionários para armazenar limites de discretização
+    TRANSFORM_LIMITS = {}
+    TARGET_LIMITS = {}
 
     # =====================================================
     # FASE DE DESCOBERTA
     # =====================================================
     print("Fase de DESCOBERTA...")
     resultados = []
-
-    total_testes = len(TRANSFORMACOES) * 25
+    total_testes = len(TRANSFORMACOES) * len(chaves)
     print(f"Total de testes: {total_testes}")
 
     for i_trans, (nome_trans, func, tipo) in enumerate(tqdm(TRANSFORMACOES, desc="Transformações")):
-        # Aplicar transformação à descoberta
         trans_desc = np.array([func(s) for s in somas_desc])
         if tipo == "continuo":
             limites = np.percentile(trans_desc, np.linspace(0,100,6))
+            TRANSFORM_LIMITS[nome_trans] = limites
             trans_desc = np.digitize(trans_desc, limites[1:-1])
-            globals().setdefault('TRANSFORM_LIMITS', {})[nome_trans] = limites
-        # Codificar para inteiros contínuos 0..k-1
         _, trans_cod = np.unique(trans_desc, return_inverse=True)
 
-        # Gerar matriz de permutações (n_placebos x n_desc)
-        rng = np.random.default_rng(20260916 + i_trans * 100)
+        rng = np.random.default_rng(20260920 + i_trans * 100)
         perm_indices = np.empty((n_placebos_descoberta, len(trans_desc)), dtype=np.int32)
         for p in range(n_placebos_descoberta):
             perm_indices[p] = rng.permutation(len(trans_desc))
 
-        for d in range(25):
-            y = pres_desc[:, d]
-            mi_real = mi_discreta_fast(trans_cod, y)
+        for j, chave in enumerate(chaves):
+            y = np.array([e[chave] for e in est_desc])
+            # Congela limites do alvo na descoberta
+            limites_y = np.percentile(y, np.linspace(0,100,6))
+            TARGET_LIMITS[chave] = limites_y
+            y_disc = np.digitize(y, limites_y[1:-1])
 
-            # Calcular MI para cada permutação
+            mi_real = mi_discreta_fast(trans_cod, y_disc)
+
             mi_placebo = np.empty(n_placebos_descoberta)
             for p in range(n_placebos_descoberta):
                 trans_perm = trans_cod[perm_indices[p]]
-                mi_placebo[p] = mi_discreta_fast(trans_perm, y)
+                mi_placebo[p] = mi_discreta_fast(trans_perm, y_disc)
 
             p_mi = (1 + np.sum(mi_placebo >= mi_real)) / (n_placebos_descoberta + 1)
 
             resultados.append({
                 'transformacao': nome_trans,
-                'dezena': d+1,
+                'alvo': chave,
                 'mi_real': mi_real,
                 'p_mi': p_mi,
                 'i_trans': i_trans,
@@ -233,22 +264,20 @@ def auditoria_matematica_soma(contests, frac_descoberta=0.6, frac_confirmacao=0.
     # FDR global
     pvals = [r['p_mi'] for r in resultados]
     rej, qvals = fdr_bh(pvals, alpha)
-
     selecionados = []
     for i in rej:
         r = resultados[i]
         r['q'] = qvals[i]
         selecionados.append(r)
 
-    print(f"\nCandidatos selecionados na descoberta (q < {alpha}): {len(selecionados)}")
+    print(f"\nCandidatos selecionados na descoberta: {len(selecionados)}")
     for r in selecionados:
-        print(f"   {r['transformacao']} → dezena {r['dezena']:2d}: "
+        print(f"   {r['transformacao']} → {r['alvo']}: "
               f"MI={r['mi_real']:.6f}, p={r['p_mi']:.6f}, q={r['q']:.6f}")
 
     if not selecionados:
-        print("\n✅ Nenhuma transformação matemática da soma apresentou evidência")
-        print("   de dependência com a presença de dezenas no próximo concurso")
-        print("   na descoberta após FDR global.")
+        print("\n✅ Nenhuma transformação apresentou evidência de relação com as características")
+        print("   estruturais do próximo concurso na descoberta.")
         return None
 
     # =====================================================
@@ -256,33 +285,37 @@ def auditoria_matematica_soma(contests, frac_descoberta=0.6, frac_confirmacao=0.
     # =====================================================
     print("\nFase de CONFIRMAÇÃO...")
     resultados_conf = []
-    for r in selecionados:
+    for i_cand, r in enumerate(selecionados):
         nome_trans = r['transformacao']
-        dezena = r['dezena']
+        alvo = r['alvo']
         i_trans = r['i_trans']
-        func, tipo = TRANSFORM_DICT[nome_trans]
+        func = TRANSFORMACOES[i_trans][1]
+        tipo = TRANSFORMACOES[i_trans][2]
 
         trans_conf = np.array([func(s) for s in somas_conf])
         if tipo == "continuo":
-            limites = globals().get('TRANSFORM_LIMITS', {}).get(nome_trans)
+            limites = TRANSFORM_LIMITS.get(nome_trans)
             if limites is not None:
                 trans_conf = np.digitize(trans_conf, limites[1:-1])
         _, trans_cod = np.unique(trans_conf, return_inverse=True)
 
-        y = pres_conf[:, dezena-1]
-        mi_real = mi_discreta_fast(trans_cod, y)
+        y = np.array([e[alvo] for e in est_conf])
+        limites_y = TARGET_LIMITS[alvo]  # reutiliza limites da descoberta
+        y_disc = np.digitize(y, limites_y[1:-1])
 
-        rng = np.random.default_rng(20260917 + i_trans * 100 + dezena)
+        mi_real = mi_discreta_fast(trans_cod, y_disc)
+
+        rng = np.random.default_rng(20260921 + i_cand)  # seed determinístico por candidato
         mi_placebo = np.empty(n_placebos_confirmacao)
         for p in range(n_placebos_confirmacao):
             idx = rng.permutation(len(trans_cod))
             trans_perm = trans_cod[idx]
-            mi_placebo[p] = mi_discreta_fast(trans_perm, y)
+            mi_placebo[p] = mi_discreta_fast(trans_perm, y_disc)
         p_mi = (1 + np.sum(mi_placebo >= mi_real)) / (n_placebos_confirmacao + 1)
 
         resultados_conf.append({
             'transformacao': nome_trans,
-            'dezena': dezena,
+            'alvo': alvo,
             'mi_real': mi_real,
             'p_mi': p_mi,
             'i_trans': i_trans,
@@ -299,7 +332,7 @@ def auditoria_matematica_soma(contests, frac_descoberta=0.6, frac_confirmacao=0.
 
     print(f"Sinais com confirmação FDR: {len(confirmados)}")
     for r in confirmados:
-        print(f"   {r['transformacao']} → dezena {r['dezena']}: "
+        print(f"   {r['transformacao']} → {r['alvo']}: "
               f"MI={r['mi_real']:.6f}, p={r['p_mi']:.6f}, q={r['q']:.6f}")
 
     if not confirmados:
@@ -311,33 +344,37 @@ def auditoria_matematica_soma(contests, frac_descoberta=0.6, frac_confirmacao=0.
     # =====================================================
     print("\nFase de HOLDOUT FINAL...")
     resultados_hold = []
-    for r in confirmados:
+    for i_cand, r in enumerate(confirmados):
         nome_trans = r['transformacao']
-        dezena = r['dezena']
+        alvo = r['alvo']
         i_trans = r['i_trans']
-        func, tipo = TRANSFORM_DICT[nome_trans]
+        func = TRANSFORMACOES[i_trans][1]
+        tipo = TRANSFORMACOES[i_trans][2]
 
         trans_hold = np.array([func(s) for s in somas_hold])
         if tipo == "continuo":
-            limites = globals().get('TRANSFORM_LIMITS', {}).get(nome_trans)
+            limites = TRANSFORM_LIMITS.get(nome_trans)
             if limites is not None:
                 trans_hold = np.digitize(trans_hold, limites[1:-1])
         _, trans_cod = np.unique(trans_hold, return_inverse=True)
 
-        y = pres_hold[:, dezena-1]
-        mi_real = mi_discreta_fast(trans_cod, y)
+        y = np.array([e[alvo] for e in est_hold])
+        limites_y = TARGET_LIMITS[alvo]  # reutiliza limites
+        y_disc = np.digitize(y, limites_y[1:-1])
 
-        rng = np.random.default_rng(20260918 + i_trans * 100 + dezena)
+        mi_real = mi_discreta_fast(trans_cod, y_disc)
+
+        rng = np.random.default_rng(20260922 + i_cand)  # seed determinístico
         mi_placebo = np.empty(n_placebos_holdout)
         for p in range(n_placebos_holdout):
             idx = rng.permutation(len(trans_cod))
             trans_perm = trans_cod[idx]
-            mi_placebo[p] = mi_discreta_fast(trans_perm, y)
+            mi_placebo[p] = mi_discreta_fast(trans_perm, y_disc)
         p_mi = (1 + np.sum(mi_placebo >= mi_real)) / (n_placebos_holdout + 1)
 
         resultados_hold.append({
             'transformacao': nome_trans,
-            'dezena': dezena,
+            'alvo': alvo,
             'mi_real': mi_real,
             'p_mi': p_mi,
         })
@@ -353,14 +390,14 @@ def auditoria_matematica_soma(contests, frac_descoberta=0.6, frac_confirmacao=0.
 
     print(f"Sinais que sobreviveram ao holdout FDR: {len(finalistas)}")
     for r in finalistas:
-        print(f"   {r['transformacao']} → dezena {r['dezena']}: "
+        print(f"   {r['transformacao']} → {r['alvo']}: "
               f"MI={r['mi_real']:.6f}, p={r['p_mi']:.6f}, q={r['q']:.6f}")
 
     if finalistas:
         print("\n⚠️ Existem transformações com evidência consistente. Investigar com modelos específicos.")
     else:
         print("\n✅ Não foi encontrada evidência estatística de dependência temporal")
-        print("   para as transformações pré-especificadas testadas.")
+        print("   para as transformações pré-especificadas testadas contra características estruturais.")
 
     return selecionados, confirmados, finalistas
 
@@ -369,7 +406,7 @@ def auditoria_matematica_soma(contests, frac_descoberta=0.6, frac_confirmacao=0.
 # ============================================================
 def main():
     print("="*70)
-    print("🔍 AUDITORIA MATEMÁTICA DA SOMA v1.2")
+    print("🔍 AUDITORIA MATEMÁTICA DA SOMA ESTRUTURAL v1.1")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
@@ -380,7 +417,7 @@ def main():
 
     while True:
         print("\nOpções:")
-        print("1. Executar auditoria matemática da soma")
+        print("1. Executar auditoria matemática da soma estrutural")
         print("0. Sair")
         op = input("Escolha: ").strip()
         if op == '1':
@@ -393,10 +430,11 @@ def main():
             except:
                 frac_desc, frac_conf = 0.6, 0.2
                 n_placebos_desc, n_placebos_conf, n_placebos_hold = 2000, 10000, 10000
-            auditoria_matematica_soma(contests, frac_descoberta=frac_desc, frac_confirmacao=frac_conf,
-                                      n_placebos_descoberta=n_placebos_desc,
-                                      n_placebos_confirmacao=n_placebos_conf,
-                                      n_placebos_holdout=n_placebos_hold)
+            auditoria_matematica_soma_estrutural(contests, frac_descoberta=frac_desc,
+                                                 frac_confirmacao=frac_conf,
+                                                 n_placebos_descoberta=n_placebos_desc,
+                                                 n_placebos_confirmacao=n_placebos_conf,
+                                                 n_placebos_holdout=n_placebos_hold)
         elif op == '0':
             break
         else:
