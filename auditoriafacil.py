@@ -2,26 +2,24 @@
 # -*- coding: utf-8 -*-
 
 """
-AUDITORIA MATEMÁTICA DA SOMA v1.1 (corrigida)
+AUDITORIA MATEMÁTICA DA SOMA v1.2 (otimizada)
 
-Correções:
-- Placebos reprodutíveis (índice determinístico, sem hash())
-- n_placebos_descoberta = 5000
-- Remoção de transformações duplicadas (par, mult_3, mult_5, mult_7)
-- Exibição correta dos q-values
-- Conclusão cautelosa: ausência de evidência, não prova de independência
+Otimizações:
+- Descoberta: 2000 placebos; confirmação/holdout: 10000 placebos.
+- MI vetorizada com numpy (mi_discreta_fast).
+- Reutilização de permutações por transformação (matriz de índices).
+- Sementes determinísticas sem hash.
 
 Famílias:
-  A - Resíduos: S_t mod k, para k=2..25
-  B - Divisibilidade: S_t é divisível por k?
-  C - Dígitos: último dígito, soma dos dígitos, raiz digital, paridade da soma dos dígitos
-  D - Relações simples: primo/composto
+  A - Resíduos: S_t mod k, k=2..25 (24)
+  B - Divisibilidade: S_t é divisível por k? (24)
+  C - Dígitos: último dígito, soma dos dígitos, raiz digital, paridade da soma dos dígitos (4)
+  D - Relações simples: primo (1)
+  Total = 53 transformações.
 
-Protocolo:
-  60% descoberta → FDR global → 20% confirmação → FDR → 20% holdout final.
+Protocolo: 60% descoberta → FDR global → 20% confirmação → FDR → 20% holdout final.
 Placebo: permutação da transformação (mantém alvo fixo).
-
-Métricas: Informação Mútua (MI) entre transformação e indicador da dezena.
+Métrica: Informação Mútua (MI) entre transformação e indicador da dezena.
 """
 
 import numpy as np
@@ -68,21 +66,31 @@ def matriz_presenca(contests):
             X[i, d-1] = 1
     return X
 
-def informacao_mutua_discreta(x, y):
-    """MI entre x categórico (já discretizado) e y binário."""
+def mi_discreta_fast(x, y):
+    """Informação mútua entre x (categórico) e y (binário) via numpy."""
+    x = np.asarray(x, dtype=np.int16)
+    y = np.asarray(y, dtype=np.int8)
     if len(x) < 10:
         return 0.0
-    cont = Counter(zip(x, y))
+
+    # Codificar x para códigos 0..k-1
+    _, x_codes = np.unique(x, return_inverse=True)
+    k = x_codes.max() + 1
+
+    # Tabela de contingência k x 2
+    pair = x_codes * 2 + y
+    tabela = np.bincount(pair, minlength=k*2).reshape(k, 2)
+
     total = len(x)
-    px = Counter(x)
-    py = Counter(y)
+    px = tabela.sum(axis=1) / total
+    py = tabela.sum(axis=0) / total
+    pxy = tabela / total
+
     mi = 0.0
-    for (xi, yi), count in cont.items():
-        pxy = count / total
-        px_ = px[xi] / total
-        py_ = py[yi] / total
-        if pxy > 0 and px_ > 0 and py_ > 0:
-            mi += pxy * np.log2(pxy / (px_ * py_))
+    for i in range(k):
+        for j in range(2):
+            if pxy[i, j] > 0:
+                mi += pxy[i, j] * np.log2(pxy[i, j] / (px[i] * py[j]))
     return mi
 
 def fdr_bh(p_values, alpha=0.05):
@@ -141,19 +149,18 @@ TRANSFORMACOES.extend([
     ("raiz_digital", raiz_digital, "categorico"),
     ("paridade_soma_digitos", paridade_soma_digitos, "binario"),
 ])
-# D - Relações simples (apenas primo, sem duplicatas)
+# D - Relações simples (apenas primo)
 TRANSFORMACOES.append(("primo", lambda s: int(is_prime(s)), "binario"))
 
-# Criar dicionário nome -> (função, tipo)
 TRANSFORM_DICT = {nome: (func, tipo) for nome, func, tipo in TRANSFORMACOES}
 
 # ============================================================
-# FUNÇÃO PRINCIPAL
+# FUNÇÃO PRINCIPAL OTIMIZADA
 # ============================================================
 def auditoria_matematica_soma(contests, frac_descoberta=0.6, frac_confirmacao=0.2,
-                              n_placebos_descoberta=5000, n_placebos_confirmacao=5000,
-                              n_placebos_holdout=5000, alpha=0.05):
-    print("\n🔍 AUDITORIA MATEMÁTICA DA SOMA v1.1")
+                              n_placebos_descoberta=2000, n_placebos_confirmacao=10000,
+                              n_placebos_holdout=10000, alpha=0.05):
+    print("\n🔍 AUDITORIA MATEMÁTICA DA SOMA v1.2 (otimizada)")
     print(f"   Divisão: {frac_descoberta:.0%} descoberta / {frac_confirmacao:.0%} confirmação / "
           f"{1-frac_descoberta-frac_confirmacao:.0%} holdout")
     print(f"   Total de transformações: {len(TRANSFORMACOES)}")
@@ -185,39 +192,42 @@ def auditoria_matematica_soma(contests, frac_descoberta=0.6, frac_confirmacao=0.
     resultados = []
 
     total_testes = len(TRANSFORMACOES) * 25
-    print(f"Total de testes (transformações × dezenas): {total_testes}")
+    print(f"Total de testes: {total_testes}")
 
     for i_trans, (nome_trans, func, tipo) in enumerate(tqdm(TRANSFORMACOES, desc="Transformações")):
         # Aplicar transformação à descoberta
         trans_desc = np.array([func(s) for s in somas_desc])
-        # Discretizar se necessário
         if tipo == "continuo":
             limites = np.percentile(trans_desc, np.linspace(0,100,6))
-            trans_desc_disc = np.digitize(trans_desc, limites[1:-1])
-            # Armazenar limites para uso posterior
+            trans_desc = np.digitize(trans_desc, limites[1:-1])
             globals().setdefault('TRANSFORM_LIMITS', {})[nome_trans] = limites
-        else:
-            trans_desc_disc = trans_desc
+        # Codificar para inteiros contínuos 0..k-1
+        _, trans_cod = np.unique(trans_desc, return_inverse=True)
+
+        # Gerar matriz de permutações (n_placebos x n_desc)
+        rng = np.random.default_rng(20260916 + i_trans * 100)
+        perm_indices = np.empty((n_placebos_descoberta, len(trans_desc)), dtype=np.int32)
+        for p in range(n_placebos_descoberta):
+            perm_indices[p] = rng.permutation(len(trans_desc))
 
         for d in range(25):
             y = pres_desc[:, d]
-            mi_real = informacao_mutua_discreta(trans_desc_disc, y)
+            mi_real = mi_discreta_fast(trans_cod, y)
 
-            # Placebo determinístico
-            rng = np.random.default_rng(20260916 + i_trans * 100 + d)
-            mi_placebo = []
-            for _ in range(n_placebos_descoberta):
-                idx = rng.permutation(len(trans_desc_disc))
-                trans_p = trans_desc_disc[idx]
-                mi_placebo.append(informacao_mutua_discreta(trans_p, y))
-            mi_placebo = np.array(mi_placebo)
-            p_mi = (1 + np.sum(mi_placebo >= mi_real)) / (len(mi_placebo) + 1)
+            # Calcular MI para cada permutação
+            mi_placebo = np.empty(n_placebos_descoberta)
+            for p in range(n_placebos_descoberta):
+                trans_perm = trans_cod[perm_indices[p]]
+                mi_placebo[p] = mi_discreta_fast(trans_perm, y)
+
+            p_mi = (1 + np.sum(mi_placebo >= mi_real)) / (n_placebos_descoberta + 1)
 
             resultados.append({
                 'transformacao': nome_trans,
                 'dezena': d+1,
                 'mi_real': mi_real,
                 'p_mi': p_mi,
+                'i_trans': i_trans,
             })
 
     # FDR global
@@ -249,37 +259,33 @@ def auditoria_matematica_soma(contests, frac_descoberta=0.6, frac_confirmacao=0.
     for r in selecionados:
         nome_trans = r['transformacao']
         dezena = r['dezena']
+        i_trans = r['i_trans']
         func, tipo = TRANSFORM_DICT[nome_trans]
 
         trans_conf = np.array([func(s) for s in somas_conf])
         if tipo == "continuo":
             limites = globals().get('TRANSFORM_LIMITS', {}).get(nome_trans)
             if limites is not None:
-                trans_conf_disc = np.digitize(trans_conf, limites[1:-1])
-            else:
-                trans_conf_disc = trans_conf
-        else:
-            trans_conf_disc = trans_conf
+                trans_conf = np.digitize(trans_conf, limites[1:-1])
+        _, trans_cod = np.unique(trans_conf, return_inverse=True)
 
         y = pres_conf[:, dezena-1]
-        mi_real = informacao_mutua_discreta(trans_conf_disc, y)
+        mi_real = mi_discreta_fast(trans_cod, y)
 
-        # Placebo determinístico
-        i_trans = [i for i,(n,_,_) in enumerate(TRANSFORMACOES) if n == nome_trans][0]
         rng = np.random.default_rng(20260917 + i_trans * 100 + dezena)
-        mi_placebo = []
-        for _ in range(n_placebos_confirmacao):
-            idx = rng.permutation(len(trans_conf_disc))
-            trans_p = trans_conf_disc[idx]
-            mi_placebo.append(informacao_mutua_discreta(trans_p, y))
-        mi_placebo = np.array(mi_placebo)
-        p_mi = (1 + np.sum(mi_placebo >= mi_real)) / (len(mi_placebo) + 1)
+        mi_placebo = np.empty(n_placebos_confirmacao)
+        for p in range(n_placebos_confirmacao):
+            idx = rng.permutation(len(trans_cod))
+            trans_perm = trans_cod[idx]
+            mi_placebo[p] = mi_discreta_fast(trans_perm, y)
+        p_mi = (1 + np.sum(mi_placebo >= mi_real)) / (n_placebos_confirmacao + 1)
 
         resultados_conf.append({
             'transformacao': nome_trans,
             'dezena': dezena,
             'mi_real': mi_real,
             'p_mi': p_mi,
+            'i_trans': i_trans,
         })
 
     # FDR na confirmação
@@ -308,30 +314,26 @@ def auditoria_matematica_soma(contests, frac_descoberta=0.6, frac_confirmacao=0.
     for r in confirmados:
         nome_trans = r['transformacao']
         dezena = r['dezena']
+        i_trans = r['i_trans']
         func, tipo = TRANSFORM_DICT[nome_trans]
 
         trans_hold = np.array([func(s) for s in somas_hold])
         if tipo == "continuo":
             limites = globals().get('TRANSFORM_LIMITS', {}).get(nome_trans)
             if limites is not None:
-                trans_hold_disc = np.digitize(trans_hold, limites[1:-1])
-            else:
-                trans_hold_disc = trans_hold
-        else:
-            trans_hold_disc = trans_hold
+                trans_hold = np.digitize(trans_hold, limites[1:-1])
+        _, trans_cod = np.unique(trans_hold, return_inverse=True)
 
         y = pres_hold[:, dezena-1]
-        mi_real = informacao_mutua_discreta(trans_hold_disc, y)
+        mi_real = mi_discreta_fast(trans_cod, y)
 
-        i_trans = [i for i,(n,_,_) in enumerate(TRANSFORMACOES) if n == nome_trans][0]
         rng = np.random.default_rng(20260918 + i_trans * 100 + dezena)
-        mi_placebo = []
-        for _ in range(n_placebos_holdout):
-            idx = rng.permutation(len(trans_hold_disc))
-            trans_p = trans_hold_disc[idx]
-            mi_placebo.append(informacao_mutua_discreta(trans_p, y))
-        mi_placebo = np.array(mi_placebo)
-        p_mi = (1 + np.sum(mi_placebo >= mi_real)) / (len(mi_placebo) + 1)
+        mi_placebo = np.empty(n_placebos_holdout)
+        for p in range(n_placebos_holdout):
+            idx = rng.permutation(len(trans_cod))
+            trans_perm = trans_cod[idx]
+            mi_placebo[p] = mi_discreta_fast(trans_perm, y)
+        p_mi = (1 + np.sum(mi_placebo >= mi_real)) / (n_placebos_holdout + 1)
 
         resultados_hold.append({
             'transformacao': nome_trans,
@@ -367,7 +369,7 @@ def auditoria_matematica_soma(contests, frac_descoberta=0.6, frac_confirmacao=0.
 # ============================================================
 def main():
     print("="*70)
-    print("🔍 AUDITORIA MATEMÁTICA DA SOMA v1.1")
+    print("🔍 AUDITORIA MATEMÁTICA DA SOMA v1.2")
     print("="*70)
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
@@ -385,12 +387,12 @@ def main():
             try:
                 frac_desc = float(input("   Fração de descoberta [0.6]: ").strip() or "0.6")
                 frac_conf = float(input("   Fração de confirmação [0.2]: ").strip() or "0.2")
-                n_placebos_desc = int(input("   Placebos descoberta [5000]: ").strip() or "5000")
-                n_placebos_conf = int(input("   Placebos confirmação [5000]: ").strip() or "5000")
-                n_placebos_hold = int(input("   Placebos holdout [5000]: ").strip() or "5000")
+                n_placebos_desc = int(input("   Placebos descoberta [2000]: ").strip() or "2000")
+                n_placebos_conf = int(input("   Placebos confirmação [10000]: ").strip() or "10000")
+                n_placebos_hold = int(input("   Placebos holdout [10000]: ").strip() or "10000")
             except:
                 frac_desc, frac_conf = 0.6, 0.2
-                n_placebos_desc = n_placebos_conf = n_placebos_hold = 5000
+                n_placebos_desc, n_placebos_conf, n_placebos_hold = 2000, 10000, 10000
             auditoria_matematica_soma(contests, frac_descoberta=frac_desc, frac_confirmacao=frac_conf,
                                       n_placebos_descoberta=n_placebos_desc,
                                       n_placebos_confirmacao=n_placebos_conf,
