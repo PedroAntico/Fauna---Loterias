@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA +MILIONÁRIA – v1.0
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA +MILIONÁRIA – v1.1
 Baseado no v48.3 da Lotofácil, adaptado para:
   - 6 números de 1 a 50
   - 2 trevos de 1 a 6
@@ -13,10 +13,13 @@ EVOLUÇÃO:
 ✅ Exclusão de dezenas principais
 ✅ Walk‑forward do Structural Predictor
 ✅ Filtros estruturais adaptados (pares, borda, primos, soma, amplitude, consecutivos)
+✅ NOVO v1.1: Auditoria do Fator de Escala (F_t = S_{t-1} / média móvel)
+              com teste de hipóteses concorrentes (persistência / reversão / independência),
+              comparação de baselines e teste pareado de Wilcoxon (sem leakage)
 """
 
 import numpy as np
-from scipy.stats import hypergeom, binomtest
+from scipy.stats import hypergeom, binomtest, pearsonr, spearmanr, wilcoxon
 from collections import defaultdict
 from itertools import combinations
 import os, random, time, warnings
@@ -793,12 +796,144 @@ def compare_trincas(contests, trinca1, trinca2, n_games=5, n_candidates=50000, m
         print(f"   Trinca {i} ({trinca}): Lift={bt['lift']:.2f}x | ROI={bt['roi']:+.1f}%")
 
 # ============================================================
+# OPÇÃO 13 – AUDITORIA DO FATOR DE ESCALA
+#   F_t = S_{t-1} / média_móvel(S, janela)
+#   Testa H1 (persistência), H2 (reversão), H3 (independência)
+#   Compara preditores da soma S_t contra baselines simples
+# ============================================================
+def audit_scale_factor(contests, window=50):
+    """
+    Auditoria walk-forward do Fator de Escala.
+
+    Para cada t (com histórico suficiente):
+        ref_t   = mean(S[t-window : t])          # usa S_{t-window} .. S_{t-1}
+        F_prev  = S[t-1] / ref_t                 # estado do "último"
+        F_next  = S[t]   / ref_t                 # estado do "próximo" (mesma referência)
+        S_next  = S[t]                           # alvo real
+
+    Nada olha para S[t] ao prever; nada é calculado com o futuro.
+    """
+    sums = np.array([sum(c['dezenas']) for c in contests], dtype=float)
+    n = len(sums)
+    if n < window + 30:
+        print(f"⚠️  Histórico insuficiente ({n} < {window+30}).")
+        return None
+
+    F_prev_l, F_next_l, S_prev_l, S_next_l, ref_l, idx_l = [], [], [], [], [], []
+    for t in range(window, n - 1):
+        ref = float(np.mean(sums[t - window:t]))
+        if ref <= 0:
+            continue
+        F_prev_l.append(sums[t - 1] / ref)
+        F_next_l.append(sums[t]     / ref)
+        S_prev_l.append(sums[t - 1])
+        S_next_l.append(sums[t])
+        ref_l.append(ref)
+        idx_l.append(t)
+
+    F_prev = np.array(F_prev_l)
+    F_next = np.array(F_next_l)
+    S_prev = np.array(S_prev_l)
+    S_next = np.array(S_next_l)
+    refs   = np.array(ref_l)
+    N = len(F_prev)
+
+    print(f"\n📐 AUDITORIA DO FATOR DE ESCALA  (janela = {window})")
+    print(f"   Observações válidas: {N}")
+    print(f"   F médio = {np.mean(F_prev):.4f} | desvio = {np.std(F_prev):.4f} | "
+          f"min = {np.min(F_prev):.4f} | max = {np.max(F_prev):.4f}")
+
+    # --- Correlações F_t vs F_(t+1) ---
+    pear  = pearsonr(F_prev, F_next)
+    spear = spearmanr(F_prev, F_next)
+    print(f"\n   Correlação  F_t  vs  F_(t+1):")
+    print(f"     Pearson   r = {pear.statistic:+.4f}  (p = {pear.pvalue:.4f})")
+    print(f"     Spearman  ρ = {spear.statistic:+.4f}  (p = {spear.pvalue:.4f})")
+
+    # --- Concordância de estado (F>1 vs F<1) ---
+    above_prev = F_prev > 1
+    above_next = F_next > 1
+    concord = int(np.sum(above_prev == above_next))
+    p_sign  = binomtest(concord, N, 0.5, alternative='two-sided').pvalue
+    print(f"\n   Concordância de estado  (F>1  ⇔  próximo F>1):")
+    print(f"     {concord}/{N} = {concord/N*100:.1f}%   (binomial p = {p_sign:.4f})")
+
+    # --- Veredito sobre as hipóteses ---
+    print(f"\n   Hipóteses concorrentes:")
+    if pear.pvalue < 0.05 and pear.statistic > 0:
+        print(f"     ✅ H1 PERSISTÊNCIA suportada   (r = {pear.statistic:+.3f}, p = {pear.pvalue:.4f})")
+    elif pear.pvalue < 0.05 and pear.statistic < 0:
+        print(f"     ✅ H2 REVERSÃO suportada       (r = {pear.statistic:+.3f}, p = {pear.pvalue:.4f})")
+    else:
+        print(f"     ⚪ H3 INDEPENDÊNCIA não rejeitada (p = {pear.pvalue:.4f})")
+
+    # --- Baselines + previsões F-based (sem leakage) ---
+    pred_mean_hist = np.array([np.mean(sums[:t])              for t in idx_l])
+    pred_mean_mov  = refs.copy()                                    # = mean(S[t-window:t])
+    pred_median    = np.array([np.median(sums[t-window:t])    for t in idx_l])
+    pred_last      = S_prev.copy()
+    pred_F_last    = refs * F_prev                                  # = S[t-1]
+    pred_F_rev05   = refs + 0.5 * (refs - S_prev)                   # reversão parcial
+    pred_F_rev10   = refs + 1.0 * (refs - S_prev)                   # reversão total
+
+    methods = {
+        'Média histórica':   pred_mean_hist,
+        'Média móvel':       pred_mean_mov,
+        'Mediana móvel':     pred_median,
+        'Último valor':      pred_last,
+        'F (último = S[t-1])': pred_F_last,
+        'F (reversão 0.5)':  pred_F_rev05,
+        'F (reversão 1.0)':  pred_F_rev10,
+    }
+
+    print(f"\n   📊 COMPARAÇÃO DE PREDITORES DA SOMA S_t  (N = {N}):")
+    print(f"   {'Método':<24} {'MAE':>8} {'RMSE':>8} {'MAPE%':>8} {'Corr':>9}")
+    print("   " + "-" * 62)
+
+    results = {}
+    for name, pred in methods.items():
+        err  = np.abs(pred - S_next)
+        mae  = float(np.mean(err))
+        rmse = float(np.sqrt(np.mean(err ** 2)))
+        mape = float(np.mean(err / S_next) * 100)
+        corr = float(pearsonr(pred, S_next).statistic) if np.std(pred) > 0 else 0.0
+        results[name] = {'pred': pred, 'err': err, 'mae': mae, 'rmse': rmse,
+                         'mape': mape, 'corr': corr}
+        print(f"   {name:<24} {mae:>8.2f} {rmse:>8.2f} {mape:>8.2f} {corr:>+9.3f}")
+
+    # --- Wilcoxon pareado contra 'Último valor' (baseline duro) ---
+    ref_key = 'Último valor'
+    ref_err = results[ref_key]['err']
+    print(f"\n   📊 TESTE PAREADO (Wilcoxon, one-sided)  vs  '{ref_key}':")
+    print(f"   Δmédio > 0  ⇒  o método é MELHOR que '{ref_key}' (menor erro).")
+    for name, r in results.items():
+        if name == ref_key:
+            continue
+        delta = ref_err - r['err']
+        if np.all(delta == 0):
+            continue
+        try:
+            _stat, p = wilcoxon(delta, alternative='greater')
+            sig = "✅" if p < 0.05 else ("📊" if p < 0.15 else "  ")
+            print(f"     {name:<24} Δmédio = {np.mean(delta):+7.2f}   p = {p:.4f}   {sig}")
+        except Exception as e:
+            print(f"     {name:<24} (erro: {e})")
+
+    print("\n   Nota: se F_t ≡ S[t-1]/média, então F*ref = S[t-1], "
+          "ou seja, o modelo F puro degenera em 'Último valor'.")
+    print("   A linha 'F (reversão 0.5)' / 'F (reversão 1.0)' testa "
+          "se após S[t-1] acima/abaixo da média o próximo volta à média.")
+
+    return {'F_prev': F_prev, 'F_next': F_next, 'S_next': S_next, 'results': results}
+
+# ============================================================
 # INTERFACE PRINCIPAL
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA +MILIONÁRIA – v1.0")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA +MILIONÁRIA – v1.1")
     print("   MONTE CARLO CORRIGIDO + WALK‑FORWARD ESTRUTURAL + EXCLUSÃO")
+    print("   + AUDITORIA DO FATOR DE ESCALA")
     print("="*70)
     contests = load_all_contests('resultados_maismilionaria.csv')
     if not contests:
@@ -821,6 +956,7 @@ def main():
         print("10. Controle Monte Carlo (FWER corrigido)")
         print("11. Teste preditivo concurso a concurso (corrigido)")
         print("12. Walk‑forward do Structural Predictor")
+        print("13. Auditoria do Fator de Escala (F_t = S_{t-1}/média móvel)")
         print("0. Sair")
         op = input("Escolha: ").strip()
 
@@ -1023,6 +1159,13 @@ def main():
             excl_str = input("   Excluídas (ENTER para pular): ").strip()
             excluded = [int(x) for x in excl_str.split()] if excl_str else []
             walk_forward_structural(contests, train_size, test_size, step, excluded=excluded)
+
+        elif op == '13':
+            try:
+                win = int(input("\n   Janela da média móvel [50]: ").strip() or "50")
+            except ValueError:
+                win = 50
+            audit_scale_factor(contests, window=win)
 
         elif op == '0':
             break
