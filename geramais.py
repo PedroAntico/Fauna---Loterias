@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA +MILIONÁRIA – v1.2
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA +MILIONÁRIA – v1.3
 Baseado no v48.3 da Lotofácil, adaptado para:
   - 6 números de 1 a 50
   - 2 trevos de 1 a 6
@@ -10,12 +10,13 @@ Baseado no v48.3 da Lotofácil, adaptado para:
 EVOLUÇÃO:
 ✅ v1.0: Correção de leakage, controle FWER, walk-forward, filtros estruturais
 ✅ v1.1: Auditoria do Fator de Escala (F_t = S_{t-1}/média móvel)
-✅ v1.2: Correções estatísticas na auditoria F:
-        • F_prev e F_next usam referências DIFERENTES (sem denominador compartilhado)
-        • Nova Opção 14 — Auditoria do Coeficiente de Escala γ
-        • Split walk-forward 60/20/20 (descoberta / confirmação / holdout)
-        • Grid de γ pré-especificado, congelado após a descoberta
-        • Baseline IID Monte Carlo
+✅ v1.2: F_prev e F_next usam referências DIFERENTES (sem denominador compartilhado)
+        Nova Opção 14 — Auditoria do Coeficiente de Escala γ
+        Split walk-forward 60/20/20 + grid pré-especificado + baseline IID
+✅ v1.3: CORREÇÃO do alinhamento de índices na Opção 14
+        (err_abs com target explícito; fim do broadcast 227 vs 379)
+        IID MC reproduz o PROCEDIMENTO COMPLETO (escolha de γ* + avaliação no holdout)
+        Reporta distribuição nula de γ* sob IID
 """
 
 import numpy as np
@@ -691,23 +692,10 @@ def compare_trincas(contests, trinca1, trinca2, n_games=5, n_candidates=50000, m
         print(f"   Trinca {i} ({trinca}): Lift={bt['lift']:.2f}x | ROI={bt['roi']:+.1f}%")
 
 # ============================================================
-# OPÇÃO 13 – AUDITORIA DO FATOR DE ESCALA (v1.2 CORRIGIDA)
-#
-# Correção principal:
-#   F_prev e F_next usam referências DIFERENTES.
-#
-#   Para cada t:
-#       ref_prev = mean(S[t-window-1 : t-1])   # NÃO inclui S[t-1]
-#       F_prev   = S[t-1] / ref_prev
-#       ref_next = mean(S[t-window   : t  ])   # NÃO inclui S[t]
-#       F_next   = S[t]   / ref_next
-#
-#   Assim não há denominador compartilhado entre os dois estados.
+# OPÇÃO 13 – AUDITORIA DO FATOR DE ESCALA (v1.3)
+#   F_prev e F_next usam referências DIFERENTES (sem denominador compartilhado).
 # ============================================================
 def audit_scale_factor(contests, window=50):
-    """
-    Auditoria walk-forward do Fator de Escala (versão CORRIGIDA).
-    """
     sums = np.array([sum(c['dezenas']) for c in contests], dtype=float)
     n = len(sums)
     if n < window + 30:
@@ -715,11 +703,9 @@ def audit_scale_factor(contests, window=50):
         return None
 
     F_prev_l, F_next_l, S_prev_l, S_next_l, idx_l = [], [], [], [], []
-    # t é o índice do "próximo" concurso (alvo); precisamos de t-1, e janelas anteriores.
-    # ref_prev usa S[t-window-1 : t-1]  → precisa t-window-1 >= 0  → t >= window+1
     for t in range(window + 1, n):
-        ref_prev = float(np.mean(sums[t - window - 1 : t - 1]))  # S[t-window-1 .. t-2]
-        ref_next = float(np.mean(sums[t - window     : t    ]))  # S[t-window   .. t-1]
+        ref_prev = float(np.mean(sums[t - window - 1 : t - 1]))
+        ref_next = float(np.mean(sums[t - window     : t    ]))
         if ref_prev <= 0 or ref_next <= 0:
             continue
         F_prev_l.append(sums[t - 1] / ref_prev)
@@ -735,7 +721,7 @@ def audit_scale_factor(contests, window=50):
     refs_next = np.array([np.mean(sums[t - window:t]) for t in idx_l])
     N = len(F_prev)
 
-    print(f"\n📐 AUDITORIA DO FATOR DE ESCALA (v1.2 — refs independentes)  janela = {window}")
+    print(f"\n📐 AUDITORIA DO FATOR DE ESCALA (v1.3 — refs independentes)  janela = {window}")
     print(f"   Observações válidas: {N}")
     print(f"   F_prev: média={np.mean(F_prev):.4f} | dp={np.std(F_prev):.4f} | "
           f"min={np.min(F_prev):.4f} | max={np.max(F_prev):.4f}")
@@ -753,7 +739,6 @@ def audit_scale_factor(contests, window=50):
     print(f"\n   Concordância de estado (F>1 ⇔ próximo F>1):")
     print(f"     {concord}/{N} = {concord/N*100:.1f}%  (binomial p = {p_sign:.4f})")
 
-    # Probabilidades condicionais de reversão
     if np.sum(above_prev) > 0:
         p_below_given_above = float(np.mean(F_next[above_prev] < 1.0))
         print(f"     P(F_next < 1 | F_prev > 1) = {p_below_given_above:.4f}  (esperado se IID: ~0.5)")
@@ -769,7 +754,6 @@ def audit_scale_factor(contests, window=50):
     else:
         print(f"     ⚪ H3 INDEPENDÊNCIA não rejeitada (p = {pear.pvalue:.4f})")
 
-    # ---------- Previsores quantitativos ----------
     pred_mean_hist = np.array([np.mean(sums[:t]) for t in idx_l])
     pred_mean_mov  = refs_next.copy()
     pred_median    = np.array([np.median(sums[t-window:t]) for t in idx_l])
@@ -819,243 +803,262 @@ def audit_scale_factor(contests, window=50):
     return {'F_prev': F_prev, 'F_next': F_next, 'S_next': S_next, 'results': results}
 
 # ============================================================
-# OPÇÃO 14 – AUDITORIA DO COEFICIENTE DE ESCALA γ
+# OPÇÃO 14 – AUDITORIA DO COEFICIENTE DE ESCALA γ  (v1.3 CORRIGIDA)
 #
-# Modelo:
-#   Ŝ_t = R_t + γ · (S_{t-1} - R_t)
-#   R_t = mean(S[t-window : t])   (não inclui S_t)
+# Modelo:  Ŝ_t = R_t + γ·(S_(t-1) − R_t),  R_t = mean(S[t-w : t])
 #
-# Interpretação:
-#   γ = 0    → média móvel (shrinkage total)
-#   γ = 1    → último valor
-#   γ = -1   → reversão total em direção à média (2R - S_prev)
-#   γ = 0.5  → meio caminho (shrinkage parcial)
-#   γ > 1    → extrapolação
-#
-# Protocolo:
-#   60% DESCOBERTA   → escolhe γ por MAE
-#   20% CONFIRMAÇÃO  → verifica se γ vencedor segue bom
-#   20% HOLDOUT      → teste final, intocado
+# Correções v1.3:
+#   • err_abs com target explícito (fim do broadcast 227 vs 379)
+#   • Sn[i_disc] / Sn[i_conf] / Sn[i_hold] aplicados consistentemente
+#   • IID MC reproduz o PROCEDIMENTO COMPLETO:
+#       escolhe γ* na descoberta sintética → mede Δ_OOS no holdout sintético
+#   • Reporta distribuição nula de γ* sob IID
 # ============================================================
 GAMMA_GRID = [-1.00, -0.75, -0.50, -0.25, 0.00, 0.25, 0.50, 0.75, 1.00, 1.25]
 WINDOWS_DEFAULT = [7, 10, 20, 30, 50, 100]
 
-def audit_gamma_coefficient(contests, windows=None, gamma_grid=None, iid_mc=1000):
-    """
-    Auditoria do coeficiente γ (descoberta/confirmação/holdout).
-    """
-    if windows is None:
-        windows = WINDOWS_DEFAULT
-    if gamma_grid is None:
-        gamma_grid = GAMMA_GRID
 
-    sums = np.array([sum(c['dezenas']) for c in contests], dtype=float)
+def _gamma_experiment(sums, window, gamma_grid):
+    """
+    Executa UM experimento γ completo sobre uma série `sums` (real ou sintética).
+    Nenhum vazamento: cada predição em t usa apenas S[t-window : t].
+    """
     n = len(sums)
+    idx_l, S_prev_l, S_next_l, ref_l = [], [], [], []
+    for t in range(window + 1, n):
+        ref = float(np.mean(sums[t - window:t]))
+        if ref <= 0:
+            continue
+        idx_l.append(t)
+        S_prev_l.append(sums[t - 1])
+        S_next_l.append(sums[t])
+        ref_l.append(ref)
 
-    print(f"\n📐 AUDITORIA DO COEFICIENTE DE ESCALA γ")
-    print(f"   Modelo: Ŝ_t = R_t + γ·(S_(t-1) − R_t),  R_t = mean(S[t-w:t])")
-    print(f"   γ grid: {gamma_grid}")
-    print(f"   Janelas: {windows}")
-    print(f"   Split: 60% descoberta | 20% confirmação | 20% holdout\n")
-
-    # Estatísticas dos baselines
-    print(f"   📌 Estatísticas da soma S_t:")
-    print(f"      E[S] teórico (uniforme) = {CHOOSE_MAIN*(TOTAL_MAIN+1)/2:.1f}")
-    print(f"      E[S] amostral            = {np.mean(sums):.2f}")
-    print(f"      SD  amostral             = {np.std(sums):.2f}")
-    print(f"      MAE esperado IID (média) ≈ SD·sqrt(2/π) = {np.std(sums)*np.sqrt(2/np.pi):.2f}\n")
-
-    # Pré-computar modelos para cada janela; guardar apenas pares (idx, prev, ref, target)
-    # para respeitar o split temporal comum.
-    # Primeiro índice válido para todas as janelas: max(windows)+1
-    wmax = max(windows)
-    valid_from = wmax + 1
-    if valid_from >= n - 10:
-        print(f"⚠️  Histórico insuficiente ({n} <= {valid_from+10}).")
+    idx = np.asarray(idx_l, dtype=int)
+    Sp  = np.asarray(S_prev_l, dtype=float)
+    Sn  = np.asarray(S_next_l, dtype=float)
+    R   = np.asarray(ref_l,   dtype=float)
+    N   = len(idx)
+    if N < 50:
         return None
 
-    all_results = {}  # window -> dict
+    n_disc = int(0.60 * N)
+    n_conf = int(0.20 * N)
+    i_disc = slice(0, n_disc)
+    i_conf = slice(n_disc, n_disc + n_conf)
+    i_hold = slice(n_disc + n_conf, N)
 
-    for window in windows:
-        idx_l, S_prev_l, S_next_l, ref_l = [], [], [], []
-        for t in range(window + 1, n):
-            ref = float(np.mean(sums[t - window:t]))
-            if ref <= 0:
-                continue
-            idx_l.append(t)
-            S_prev_l.append(sums[t - 1])
-            S_next_l.append(sums[t])
-            ref_l.append(ref)
-        idx  = np.array(idx_l)
-        Sp   = np.array(S_prev_l)
-        Sn   = np.array(S_next_l)
-        R    = np.array(ref_l)
-        N    = len(idx)
-        if N < 50:
-            continue
+    preds = {g: R + g * (Sp - R) for g in gamma_grid}
+    baselines = {
+        'Média histórica': np.array([np.mean(sums[:t]) for t in idx]),
+        'Média móvel':     R.copy(),
+        'Mediana móvel':   np.array([np.median(sums[t - window:t]) for t in idx]),
+        'Último valor':    Sp.copy(),
+    }
 
-        # Split temporal (NÃO aleatório)
-        n_disc = int(0.60 * N)
-        n_conf = int(0.20 * N)
-        i_disc = slice(0, n_disc)
-        i_conf = slice(n_disc, n_disc + n_conf)
-        i_hold = slice(n_disc + n_conf, N)
+    def mae(p, target):
+        return float(np.mean(np.abs(np.asarray(p, dtype=float)
+                                    - np.asarray(target, dtype=float))))
 
-        # Previsões por γ (vetor N)
-        preds = {}
+    # γ* escolhido SÓ com a descoberta
+    mae_disc_g = {g: mae(preds[g][i_disc], Sn[i_disc]) for g in gamma_grid}
+    best_gamma = min(gamma_grid, key=lambda g: mae_disc_g[g])
+    best_key   = f'γ={best_gamma:+.2f}'
+
+    phases = {}
+    for phase, sl in [('disc', i_disc), ('conf', i_conf), ('hold', i_hold)]:
+        target_ph = Sn[sl]                              # ← ALVO ALINHADO
+        phase_mae = {name: mae(v[sl], target_ph) for name, v in baselines.items()}
         for g in gamma_grid:
-            preds[g] = R + g * (Sp - R)
-
-        # Baselines
-        baselines = {
-            'Média histórica': np.array([np.mean(sums[:t]) for t in idx]),
-            'Média móvel':     R.copy(),
-            'Mediana móvel':   np.array([np.median(sums[t - window:t]) for t in idx]),
-            'Último valor':    Sp.copy(),
+            phase_mae[f'γ={g:+.2f}'] = mae(preds[g][sl], target_ph)
+        phase_abs = {
+            'Média histórica': np.abs(baselines['Média histórica'][sl] - target_ph),
+            'Média móvel':     np.abs(baselines['Média móvel'][sl]     - target_ph),
+            'Mediana móvel':   np.abs(baselines['Mediana móvel'][sl]   - target_ph),
+            'Último valor':    np.abs(baselines['Último valor'][sl]    - target_ph),
+            'γ*':              np.abs(preds[best_gamma][sl]            - target_ph),
         }
+        if 0.0 in gamma_grid:
+            phase_abs['γ=0'] = np.abs(preds[0.0][sl] - target_ph)
+        phases[phase] = {'mae': phase_mae, 'abs_err': phase_abs}
 
-        # Erro absoluto por método (vetor N)
-        def err_abs(p):
-            return np.abs(p - Sn)
+    return {
+        'N': N, 'n_disc': n_disc, 'n_conf': n_conf, 'n_hold': N - n_disc - n_conf,
+        'best_gamma': best_gamma, 'best_key': best_key, 'phases': phases,
+    }
 
-        errs_disc = {k: err_abs(v[i_disc]) for k, v in baselines.items()}
-        errs_conf = {k: err_abs(v[i_conf]) for k, v in baselines.items()}
-        errs_hold = {k: err_abs(v[i_hold]) for k, v in baselines.items()}
-        for g in gamma_grid:
-            errs_disc[f'γ={g:+.2f}'] = err_abs(preds[g][i_disc])
-            errs_conf[f'γ={g:+.2f}'] = err_abs(preds[g][i_conf])
-            errs_hold[f'γ={g:+.2f}'] = err_abs(preds[g][i_hold])
 
-        # Escolher γ vencedor na descoberta (menor MAE)
-        mae_disc = {k: float(np.mean(v)) for k, v in errs_disc.items()}
-        gamma_keys = [f'γ={g:+.2f}' for g in gamma_grid]
-        best_gamma_key = min(gamma_keys, key=lambda k: mae_disc[k])
-        best_gamma = float(best_gamma_key.split('=')[1])
+def _iid_sums(n, rng):
+    """Gera n somas IID equivalentes a um sorteio uniforme 6-de-50."""
+    out = np.empty(n, dtype=float)
+    for i in range(n):
+        s = rng.choice(np.arange(1, TOTAL_MAIN + 1), size=CHOOSE_MAIN, replace=False)
+        out[i] = float(np.sum(s))
+    return out
 
-        all_results[window] = {
-            'idx': idx, 'Sp': Sp, 'Sn': Sn, 'R': R,
-            'i_disc': i_disc, 'i_conf': i_conf, 'i_hold': i_hold,
-            'preds': preds, 'baselines': baselines,
-            'errs_disc': errs_disc, 'errs_conf': errs_conf, 'errs_hold': errs_hold,
-            'mae_disc': mae_disc,
-            'best_gamma': best_gamma,
-            'best_gamma_key': best_gamma_key,
-        }
 
-    # ======================== RELATÓRIO ========================
+def audit_gamma_coefficient(contests, windows=None, gamma_grid=None, iid_mc=200):
+    if windows is None:    windows = WINDOWS_DEFAULT
+    if gamma_grid is None: gamma_grid = GAMMA_GRID
+
+    sums = np.asarray([sum(c['dezenas']) for c in contests], dtype=float)
+    n_real = len(sums)
+
+    print(f"\n📐 AUDITORIA DO COEFICIENTE DE ESCALA γ  (v1.3)")
+    print(f"   Modelo: Ŝ_t = R_t + γ·(S_(t-1) − R_t),  R_t = mean(S[t-w : t])")
+    print(f"   γ grid: {gamma_grid}")
+    print(f"   Janelas: {windows}")
+    print(f"   Split: 60% descoberta | 20% confirmação | 20% holdout")
+    print(f"   IID MC por janela: {iid_mc} réplicas\n")
+
+    print(f"   📌 Estatísticas da soma S_t (real):")
+    print(f"      E[S] teórico (uniforme 6/50) = {CHOOSE_MAIN*(TOTAL_MAIN+1)/2:.2f}")
+    print(f"      E[S] amostral                = {np.mean(sums):.2f}")
+    print(f"      SD  amostral                 = {np.std(sums):.2f}")
+    print(f"      MAE esperado IID (média)     ≈ SD·sqrt(2/π) = "
+          f"{np.std(sums)*np.sqrt(2/np.pi):.2f}\n")
+
+    # ---------- 1) Execução real ----------
+    reais = {}
+    for w in windows:
+        r = _gamma_experiment(sums, w, gamma_grid)
+        if r is not None:
+            reais[w] = r
+    if not reais:
+        print("⚠️  Nenhuma janela produziu amostra válida.")
+        return None
+
+    # ---------- 2) Tabela por janela ----------
     print("=" * 100)
-    print("   RESULTADOS POR JANELA  (MAE nas três fases)")
+    print("   RESULTADOS REAIS  (MAE por fase)")
     print("=" * 100)
-    header = (f"{'Janela':<7} {'Fase':<12} {'N':<6} "
-              f"{'MédiaHist':<10} {'MédiaMóv':<10} {'Mediana':<10} {'Último':<10} "
-              f"{'γ*':<7} {'MAE(γ*)':<10}")
+    header = (f"{'Jan':<5} {'Fase':<11} {'N':<5} "
+              f"{'MHist':<8} {'MMov':<8} {'Med':<8} {'Últ':<8} "
+              f"{'γ*':<7} {'MAE(γ*)':<8}")
     print(header)
     print("-" * len(header))
-
-    for window, R_ in all_results.items():
-        for phase, sl in [('Descoberta', R_['i_disc']),
-                          ('Confirmação', R_['i_conf']),
-                          ('Holdout', R_['i_hold'])]:
-            n_ph = sl.stop - sl.start
-            mh = float(np.mean(R_['errs_disc' if phase=='Descoberta' else ('errs_conf' if phase=='Confirmação' else 'errs_hold')]['Média histórica']))
-            # re-index para o erro correspondente
-            key_err = 'errs_disc' if phase == 'Descoberta' else ('errs_conf' if phase == 'Confirmação' else 'errs_hold')
-            mh = float(np.mean(R_[key_err]['Média histórica']))
-            mm = float(np.mean(R_[key_err]['Média móvel']))
-            md = float(np.mean(R_[key_err]['Mediana móvel']))
-            ul = float(np.mean(R_[key_err]['Último valor']))
-            gk = R_['best_gamma_key']
-            mg = float(np.mean(R_[key_err][gk]))
-            print(f"{window:<7} {phase:<12} {n_ph:<6} "
-                  f"{mh:<10.2f} {mm:<10.2f} {md:<10.2f} {ul:<10.2f} "
-                  f"{R_['best_gamma']:<+7.2f} {mg:<10.2f}")
+    for w, r in reais.items():
+        for phase, label in [('disc', 'Descoberta'),
+                             ('conf', 'Confirmação'),
+                             ('hold', 'Holdout')]:
+            ph = r['phases'][phase]
+            n_ph = {'disc': r['n_disc'],
+                    'conf': r['n_conf'],
+                    'hold': r['n_hold']}[phase]
+            mh = ph['mae']['Média histórica']
+            mm = ph['mae']['Média móvel']
+            md = ph['mae']['Mediana móvel']
+            ul = ph['mae']['Último valor']
+            gk = r['best_key']
+            mg = ph['mae'][gk]
+            print(f"{w:<5} {label:<11} {n_ph:<5} "
+                  f"{mh:<8.2f} {mm:<8.2f} {md:<8.2f} {ul:<8.2f} "
+                  f"{r['best_gamma']:<+7.2f} {mg:<8.2f}")
         print("-" * len(header))
 
-    # ====================== RESUMO DE HIPÓTESES ======================
+    # ---------- 3) Veredito OOS ----------
     print("\n" + "=" * 100)
-    print("   VEREDITO: γ* escolhido na descoberta mantém vantagem no HOLDOUT?")
+    print("   VEREDITO OOS — γ* (congelado na descoberta) vs baselines no HOLDOUT")
     print("=" * 100)
 
-    for window, R_ in all_results.items():
-        gk = R_['best_gamma_key']
-        g  = R_['best_gamma']
-        mae_hold_g  = float(np.mean(R_['errs_hold'][gk]))
-        mae_hold_mh = float(np.mean(R_['errs_hold']['Média histórica']))
-        mae_hold_mm = float(np.mean(R_['errs_hold']['Média móvel']))
-        mae_hold_ul = float(np.mean(R_['errs_hold']['Último valor']))
+    for w, r in reais.items():
+        ph = r['phases']['hold']
+        gk = r['best_key']
+        mae_g  = ph['mae'][gk]
+        mae_0  = ph['mae'].get('γ=0.00', ph['mae']['Média móvel'])
+        mae_mm = ph['mae']['Média móvel']
+        mae_mh = ph['mae']['Média histórica']
+        mae_ul = ph['mae']['Último valor']
 
-        better_hist = mae_hold_g < mae_hold_mh
-        better_mov  = mae_hold_g < mae_hold_mm
-        better_last = mae_hold_g < mae_hold_ul
+        def _wil(a, b):
+            d = a - b
+            if np.all(d == 0):
+                return 1.0
+            try:
+                return wilcoxon(d, alternative='greater').pvalue
+            except Exception:
+                return 1.0
 
-        # Wilcoxon: γ* vs Média móvel (baseline justo — mesmo R_t)
-        delta_mov = R_['errs_hold']['Média móvel'] - R_['errs_hold'][gk]
-        try:
-            _s, p_mov = wilcoxon(delta_mov, alternative='greater')
-        except Exception:
-            p_mov = 1.0
-        # Wilcoxon: γ* vs Último valor (baseline trivial)
-        delta_last = R_['errs_hold']['Último valor'] - R_['errs_hold'][gk]
-        try:
-            _s, p_last = wilcoxon(delta_last, alternative='greater')
-        except Exception:
-            p_last = 1.0
+        p_vs_0  = _wil(ph['abs_err']['γ=0'],           ph['abs_err']['γ*'])
+        p_vs_ul = _wil(ph['abs_err']['Último valor'], ph['abs_err']['γ*'])
+        delta_oos = mae_0 - mae_g
 
-        verdict = []
-        if better_mov and p_mov < 0.05:
-            verdict.append("✅ vence MédiaMóvel (p<0.05)")
-        elif better_mov and p_mov < 0.15:
-            verdict.append("📊 vence MédiaMóvel (p<0.15)")
-        elif better_mov:
-            verdict.append("🟡 vence MédiaMóvel (n.s.)")
+        print(f"\n   Janela {w:>3}:  N={r['N']}  γ* = {r['best_gamma']:+.2f}")
+        print(f"      MAE holdout — γ*: {mae_g:.2f} | γ=0: {mae_0:.2f} | "
+              f"MMov: {mae_mm:.2f} | MHist: {mae_mh:.2f} | Últ: {mae_ul:.2f}")
+        print(f"      Δ_OOS (γ=0 − γ*): {delta_oos:+.3f}   "
+              f"(Wilcoxon γ* < γ=0: p = {p_vs_0:.4f})")
+        print(f"      Δ   (Últ − γ*):   {mae_ul - mae_g:+.3f}   "
+              f"(Wilcoxon γ* < Últ:  p = {p_vs_ul:.4f})")
+
+        if r['best_gamma'] == 0.0:
+            print(f"      → γ* = 0  ⇒  o vencedor é a própria Média Móvel "
+                  f"(nenhuma informação além do baseline).")
+        elif delta_oos > 0 and p_vs_0 < 0.05:
+            print(f"      → ✅ γ* ≠ 0 com vantagem significativa OOS (p < 0.05).")
+        elif delta_oos > 0 and p_vs_0 < 0.15:
+            print(f"      → 📊 γ* ≠ 0 com vantagem marginal OOS (p < 0.15).")
         else:
-            verdict.append("❌ perde p/ MédiaMóvel")
+            print(f"      → ⚪ Sem evidência de vantagem OOS de γ* sobre γ=0.")
 
-        if better_hist and p_mov < 0.05:
-            verdict.append("✅ vence MédiaHist")
-        elif better_hist:
-            verdict.append("🟡 vence MédiaHist")
-
-        print(f"   Janela {window:>3}: γ* = {g:+.2f}")
-        print(f"      MAE holdout — γ*: {mae_hold_g:.2f} | "
-              f"MédiaHist: {mae_hold_mh:.2f} | MédiaMóv: {mae_hold_mm:.2f} | Último: {mae_hold_ul:.2f}")
-        print(f"      Δ(γ* vs MédiaMóv): {mae_hold_mm - mae_hold_g:+.2f}  "
-              f"(Wilcoxon p = {p_mov:.4f})")
-        print(f"      Δ(γ* vs Último):   {mae_hold_ul - mae_hold_g:+.2f}  "
-              f"(Wilcoxon p = {p_last:.4f})")
-        print(f"      → {' | '.join(verdict)}\n")
-
-    # ======================= BASELINE IID =======================
+    # ---------- 4) IID MC reproduzindo o procedimento completo ----------
+    print("\n" + "=" * 100)
+    print(f"   BASELINE IID MONTE CARLO  ({iid_mc} réplicas/janela, procedimento completo)")
     print("=" * 100)
-    print("   BASELINE IID MONTE CARLO  (somas geradas por sorteio uniforme 6-de-50)")
-    print("=" * 100)
+    print("   Para cada réplica sintética: mesma escolha de γ* na descoberta, "
+          "mesma avaliação no holdout.")
+    print("   A distribuição nula de Δ_OOS e de γ* é diretamente comparável "
+          "ao resultado real.\n")
 
-    from math import comb as _comb
-    # Gerar uma amostra IID de somas equivalentes
-    iid_sums = []
-    for _ in range(iid_mc):
-        s = sorted(np.random.choice(range(1, TOTAL_MAIN + 1), CHOOSE_MAIN, replace=False))
-        iid_sums.append(sum(s))
-    iid_sums = np.array(iid_sums, dtype=float)
-    iid_mean = float(np.mean(iid_sums))
-    iid_sd   = float(np.std(iid_sums))
-    iid_mae  = float(np.mean(np.abs(iid_sums - iid_mean)))
+    rng = np.random.default_rng(20250911)
 
-    print(f"   E[S] empírico IID  = {iid_mean:.2f}")
-    print(f"   SD[S] empírico IID = {iid_sd:.2f}")
-    print(f"   MAE do preditor 'constante = E[S]' em IID puro = {iid_mae:.2f}")
-    print(f"   → Qualquer MAE < {iid_mae:.2f} em holdout merece explicação.")
-    print(f"   → MAE ≈ {iid_mae:.2f} é perfeitamente consistente com aleatoriedade IID.")
+    for w, r_real in reais.items():
+        mae0_real = r_real['phases']['hold']['mae'].get(
+            'γ=0.00', r_real['phases']['hold']['mae']['Média móvel'])
+        maeg_real = r_real['phases']['hold']['mae'][r_real['best_key']]
+        delta_oos_real = mae0_real - maeg_real
 
-    return all_results
+        delta_oos_sim = []
+        gamma_choosen_sim = defaultdict(int)
+
+        for _ in range(iid_mc):
+            sim_sums = _iid_sums(n_real, rng)
+            sim_r = _gamma_experiment(sim_sums, w, gamma_grid)
+            if sim_r is None:
+                continue
+            ph_hold = sim_r['phases']['hold']
+            mae0 = ph_hold['mae'].get('γ=0.00', ph_hold['mae']['Média móvel'])
+            maeg = ph_hold['mae'][sim_r['best_key']]
+            delta_oos_sim.append(mae0 - maeg)
+            gamma_choosen_sim[sim_r['best_gamma']] += 1
+
+        delta_oos_sim = np.asarray(delta_oos_sim, dtype=float)
+        if len(delta_oos_sim) == 0:
+            continue
+
+        p_emp = float(np.mean(delta_oos_sim >= delta_oos_real))
+
+        top = sorted(gamma_choosen_sim.items(), key=lambda kv: -kv[1])[:5]
+        top_str = " | ".join(f"{g:+.2f}:{c}" for g, c in top)
+
+        print(f"   Janela {w:>3}: Δ_OOS real = {delta_oos_real:+.3f} | "
+              f"IID: média={np.mean(delta_oos_sim):+.3f} "
+              f"sd={np.std(delta_oos_sim):.3f} | p_emp = {p_emp:.4f}")
+        print(f"      γ* mais frequentes sob IID: {top_str}")
+        if p_emp < 0.05:
+            print(f"      → ✅ Δ_OOS real > IID em {1-p_emp:.1%} das réplicas — sinal genuíno.")
+        else:
+            print(f"      → ⚪ Δ_OOS real compatível com IID (p_emp = {p_emp:.3f} ≥ 0.05).")
+
+    return reais
 
 # ============================================================
 # INTERFACE PRINCIPAL
 # ============================================================
 def main():
     print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA +MILIONÁRIA – v1.2")
-    print("   FWER + WALK-FORWARD + FATOR DE ESCALA CORRIGIDO + γ")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA +MILIONÁRIA – v1.3")
+    print("   FWER + WALK-FORWARD + FATOR DE ESCALA + γ (corrigido)")
     print("="*70)
     contests = load_all_contests('resultados_maismilionaria.csv')
     if not contests:
@@ -1078,8 +1081,8 @@ def main():
         print("10. Controle Monte Carlo (FWER corrigido)")
         print("11. Teste preditivo concurso a concurso (corrigido)")
         print("12. Walk‑forward do Structural Predictor")
-        print("13. Auditoria do Fator de Escala (v1.2, refs independentes)")
-        print("14. Auditoria do Coeficiente γ  (60/20/20 + grid + IID)")
+        print("13. Auditoria do Fator de Escala (v1.3, refs independentes)")
+        print("14. Auditoria do Coeficiente γ  (v1.3, 60/20/20 + grid + IID)")
         print("0. Sair")
         op = input("Escolha: ").strip()
 
