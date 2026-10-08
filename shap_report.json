@@ -1,0 +1,202 @@
+[
+  {
+    "feature": "rep_x_energia",
+    "importance": 1.208545446395874
+  },
+  {
+    "feature": "gap_medio",
+    "importance": 0.2867427170276642
+  },
+  {
+    "feature": "avg_fadiga",
+    "importance": 0.0016608766745775938
+  },
+  {
+    "feature": "rep_x_pares",
+    "importance": 0.0009695913759060204
+  },
+  {
+    "feature": "gap_var",
+    "importance": 0.0006360821425914764
+  },
+  {
+    "feature": "delta_rep_t",
+    "importance": 0.000586428795941174
+  },
+  {
+    "feature": "rep_x_primos",
+    "importance": 0.00047697609988972545
+  },
+  {
+    "feature": "avg_ema",
+    "importance": 0.0003525365318637341
+  },
+  {
+    "feature": "rep_t-1",
+    "importance": 0.0002417083887849003
+  },
+  {
+    "feature": "rep_x_moldura",
+    "importance": 0.0001718038402032107
+  },
+  {
+    "feature": "rep_t-2",
+    "importance": 0.00016642958507873118
+  },
+  {
+    "feature": "rep_t-3",
+    "importance": 0.00016382535977754742
+  },
+  {
+    "feature": "soma_t-2",
+    "importance": 0.00015036918921396136
+  },
+  {
+    "feature": "max_ema",
+    "importance": 0.00010762496094685048
+  },
+  {
+    "feature": "avg_streak_dezenas",
+    "importance": 0.00010166752326767892
+  },
+  {
+    "feature": "max_fadiga",
+    "importance": 8.241952309617773e-05
+  },
+  {
+    "feature": "quadrantes",
+    "importance": 6.872000085422769e-05
+  },
+  {
+    "feature": "pares_t-2",
+    "importance": 6.405829481082037e-05
+  },
+  {
+    "feature": "pares_t-1",
+    "importance": 6.386889435816556e-05
+  },
+  {
+    "feature": "delta_rep_t-1",
+    "importance": 5.943090218352154e-05
+  },
+  {
+    "feature": "delta_soma",
+    "importance": 5.603744648396969e-05
+  },
+  {
+    "feature": "soma_t-1",
+    "importance": 4.9692655011313036e-05
+  },
+  {
+    "feature": "consecutivos",
+    "importance": 4.338625876698643e-05
+  },
+  {
+    "feature": "moldura_t-1",
+    "importance": 3.936765278922394e-05
+  },
+  {
+    "feature": "delta_soma_recente",
+    "importance": 2.3322751076193526e-05
+  },
+  {
+    "feature": "elasticidade",
+    "importance": 2.306253918504808e-05
+  },
+  {
+    "feature": "delta_pares",
+    "importance": 2.029000097536482e-05
+  },
+  {
+    "feature": "moldura_t-2",
+    "importance": 2.004499765462242e-05
+  },
+  {
+    "feature": "delta_pares_recente",
+    "importance": 1.9781018636422232e-05
+  },
+  {
+    "feature": "streak_sem_9",
+    "importance": 1.5897592675173655e-05
+  },
+  {
+    "feature": "delta_moldura",
+    "importance": 1.5880952560110018e-05
+  },
+  {
+    "feature": "entropia_rep",
+    "importance": 1.55981833813712e-05
+  },
+  {
+    "feature": "pares_x_soma",
+    "importance": 1.5006102330517024e-05
+  },
+  {
+    "feature": "pares_x_moldura",
+    "importance": 1.3133646461938042e-05
+  },
+  {
+    "feature": "entropia_conjunta",
+    "importance": 9.862954357231501e-06
+  },
+  {
+    "feature": "delta_moldura_recente",
+    "importance": 8.51916593092028e-06
+  },
+  {
+    "feature": "acc_rep",
+    "importance": 5.450680419016862e-06
+  },
+  {
+    "feature": "abs_elasticidade",
+    "importance": 5.422528374765534e-06
+  },
+  {
+    "feature": "primos_x_moldura",
+    "importance": 3.4342876915616216e-06
+  },
+  {
+    "feature": "delta_energia",
+    "importance": 2.683767434064066e-06
+  },
+  {
+    "feature": "energia_t-1",
+    "importance": 1.5999761444618343e-06
+  },
+  {
+    "feature": "energia_t-2",
+    "importance": 9.244066063729406e-07
+  },
+  {
+    "feature": "max_streak_dezenas",
+    "importance": 2.401096423909621e-07
+  },
+  {
+    "feature": "pares_recente",
+    "importance": 0.0
+  },
+  {
+    "feature": "soma_recente",
+    "importance": 0.0
+  },
+  {
+    "feature": "moldura_recente",
+    "importance": 0.0
+  },
+  {
+    "feature": "mean_reversion_9",
+    "importance": 0.0
+  },
+  {
+    "feature": "gap_max",
+    "importance": 0.0
+  },
+  {
+    "feature": "energia_jogo",
+    "importance": 0.0
+  },
+  {
+    "feature": "gap_min",
+    "importance": 0.0
+  }
+]

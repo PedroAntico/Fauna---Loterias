@@ -1,0 +1,218 @@
+{
+  "timestamp": "2026-05-15T16:24:16.424971",
+  "data_analisada": {
+    "concursos": 3008,
+    "periodo": "11/03/1996 a 14/05/2026"
+  },
+  "resultados_fft": {
+    "soma": {
+      "observed_max_magnitude": 5231.29646479165,
+      "baseline_max_mean": 6230.635939337764,
+      "baseline_max_std": 498.33587164631297,
+      "z_score_max": -2.005353279595698,
+      "is_anomalous": true
+    },
+    "pares": {
+      "observed_max_magnitude": 223.1662695029681,
+      "baseline_max_mean": 179.9740341793354,
+      "baseline_max_std": 14.760708477764911,
+      "z_score_max": 2.9261627508392425,
+      "is_anomalous": true
+    },
+    "primos": {
+      "observed_max_magnitude": 167.51112517755772,
+      "baseline_max_mean": 161.96081923405453,
+      "baseline_max_std": 13.002160759869907,
+      "z_score_max": 0.4268756590545896,
+      "is_anomalous": false
+    },
+    "consecutivas": {
+      "observed_max_magnitude": 163.05990368064252,
+      "baseline_max_mean": 189.25771011124465,
+      "baseline_max_std": 15.134139439689186,
+      "z_score_max": -1.7310403762964246,
+      "is_anomalous": false
+    }
+  },
+  "permutation_entropy": {
+    "soma": {
+      "pe_real": 1.7914823514514109,
+      "pe_normalized": 0.9998453376240487,
+      "pe_baseline_mean": 0.9996371241244285,
+      "pe_baseline_std": 0.0002909021031090507,
+      "z_score": 2722.033353709178,
+      "p_value": 0.0
+    },
+    "pares": {
+      "pe_real": 1.7074446554540588,
+      "pe_normalized": 0.9529430064570432,
+      "pe_baseline_mean": 0.952507297371562,
+      "pe_baseline_std": 0.004093829989030524,
+      "z_score": 184.40857585814803,
+      "p_value": 0.0
+    },
+    "primos": {
+      "pe_real": 1.6764606647991864,
+      "pe_normalized": 0.9356505120195945,
+      "pe_baseline_mean": 0.9409407069596265,
+      "pe_baseline_std": 0.004635407455398658,
+      "z_score": 158.67428374239933,
+      "p_value": 0.0
+    },
+    "consecutivas": {
+      "pe_real": 1.4547313761970906,
+      "pe_normalized": 0.8119010398331165,
+      "pe_baseline_mean": 0.8062085357547416,
+      "pe_baseline_std": 0.008523390666330725,
+      "z_score": 76.08742410507561,
+      "p_value": 0.0
+    },
+    "amplitude": {
+      "pe_real": 1.7890707579468548,
+      "pe_normalized": 0.9984994016622339,
+      "pe_baseline_mean": 0.9988116343266977,
+      "pe_baseline_std": 0.0006089877069898565,
+      "z_score": 1297.660222939968,
+      "p_value": 0.0
+    }
+  },
+  "testes_nist": {
+    "frequency": {
+      "observed": 0.0,
+      "baseline_mean": 0.0,
+      "baseline_std": 0.0,
+      "z_score": 0.0,
+      "p_value": 1.0,
+      "is_significant": false
+    },
+    "runs": {
+      "observed": 0.0,
+      "baseline_mean": 0.0,
+      "baseline_std": 0.0,
+      "z_score": 0.0,
+      "p_value": 1.0,
+      "is_significant": false
+    },
+    "cumulative_sums_forward": {
+      "observed": 0.0,
+      "baseline_mean": 0.0,
+      "baseline_std": 0.0,
+      "z_score": 0.0,
+      "p_value": 1.0,
+      "is_significant": false
+    },
+    "cumulative_sums_backward": {
+      "observed": 0.0,
+      "baseline_mean": 0.0,
+      "baseline_std": 0.0,
+      "z_score": 0.0,
+      "p_value": 1.0,
+      "is_significant": false
+    },
+    "serial": {
+      "observed": 0.0,
+      "baseline_mean": 0.0,
+      "baseline_std": 0.0,
+      "z_score": 0.0,
+      "p_value": 1.0,
+      "is_significant": false
+    },
+    "approximate_entropy": {
+      "observed": 0.0,
+      "baseline_mean": 0.0,
+      "baseline_std": 0.0,
+      "z_score": 0.0,
+      "p_value": 1.0,
+      "is_significant": false
+    }
+  },
+  "compressibilidade": {
+    "dezenas_raw": {
+      "original_bytes": 144384,
+      "compressed_bytes": 18764,
+      "ratio": 0.12995899822695037,
+      "entropy_estimate": 1.039671985815603,
+      "baseline_mean": 0.1300657967641844,
+      "baseline_std": 0.00018673482330884127,
+      "z_score": -0.571926196419143,
+      "is_anomalous": false
+    },
+    "binary_60bits": {
+      "original_bytes": 1443840,
+      "compressed_bytes": 21823,
+      "ratio": 0.015114555629432624,
+      "entropy_estimate": 0.12091644503546099,
+      "baseline_mean": 0.015118593472961,
+      "baseline_std": 3.063036385167224e-05,
+      "z_score": -0.1318248633261115,
+      "is_anomalous": false
+    },
+    "soma_sequence": {
+      "original_bytes": 24064,
+      "compressed_bytes": 4496,
+      "ratio": 0.18683510638297873,
+      "entropy_estimate": 1.4946808510638299,
+      "baseline_mean": 0.18768450797872344,
+      "baseline_std": 0.0007189118996610838,
+      "z_score": -1.1815099960720306,
+      "is_anomalous": false
+    },
+    "pares_sequence": {
+      "original_bytes": 24064,
+      "compressed_bytes": 1619,
+      "ratio": 0.06727892287234043,
+      "entropy_estimate": 0.5382313829787234,
+      "baseline_mean": 0.06723321143617021,
+      "baseline_std": 0.0004665558143463877,
+      "z_score": 0.09797635087723307,
+      "is_anomalous": false
+    }
+  },
+  "comparacao_internacional": {
+    "Mega-Sena": {
+      "n_games": 3008,
+      "n_numbers": 6,
+      "max_number": 60,
+      "avg_sum": 183.20046542553192,
+      "std_sum": 39.950734785354854,
+      "avg_pares": 3.0149601063829787,
+      "entropy_dezenas": 4.092102347991095
+    },
+    "Powerball": {
+      "n_games": 3008,
+      "n_numbers": 5,
+      "max_number": 69,
+      "avg_sum": 175.68251329787233,
+      "std_sum": 43.85105274898166,
+      "avg_pares": 2.4737367021276597,
+      "entropy_dezenas": 4.232176505526667
+    },
+    "EuroMillions": {
+      "n_games": 3008,
+      "n_numbers": 5,
+      "max_number": 50,
+      "avg_sum": 128.453125,
+      "std_sum": 30.416367017144058,
+      "avg_pares": 2.4930186170212765,
+      "entropy_dezenas": 3.9108466402440727
+    },
+    "SuperEnalotto": {
+      "n_games": 3008,
+      "n_numbers": 6,
+      "max_number": 90,
+      "avg_sum": 272.578125,
+      "std_sum": 61.890119151703324,
+      "avg_pares": 3.051529255319149,
+      "entropy_dezenas": 4.497419204368644
+    },
+    "El Gordo": {
+      "n_games": 3008,
+      "n_numbers": 5,
+      "max_number": 54,
+      "avg_sum": 137.4222074468085,
+      "std_sum": 33.31166193180841,
+      "avg_pares": 2.49468085106383,
+      "entropy_dezenas": 3.987515579389916
+    }
+  }
+}

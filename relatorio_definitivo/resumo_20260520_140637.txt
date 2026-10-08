@@ -1,0 +1,16 @@
+RELATÓRIO DE ANÁLISE ESTRUTURAL DA MEGA-SENA
+==================================================
+
+Data: 20/05/2026 14:06
+Concursos analisados: 3009
+
+ENTROPIA CONDICIONAL
+H(X_t+1 | X_t) = 2.1698
+
+ANOMALIAS
+Taxa real: 5.018%
+Taxa aleatória: 5.350%
+Z-score: -1.47
+
+CONCLUSÃO
+Possível estrutura não-aleatória detectada.
