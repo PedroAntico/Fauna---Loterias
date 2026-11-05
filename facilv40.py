@@ -2,17 +2,21 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v49.4
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v49.4.1
 
-EVOLUÇÃO DO v49.3:
-✅ Braços A/B/C isolam corretamente: A (crit+grp+fix/estrut),
-   B (fix+estrut), C (fix/excl apenas — aleatório condicionado)
-✅ Teste pareado (ttest_rel) nas comparações entre braços
-✅ Backtest nulo com dois controles: irrestrito e condicionado
+EVOLUÇÃO DO v49.4:
+✅ CORREÇÃO CRÍTICA: input_groups() agora inclui "dezenas_set" no dicionário
+   retornado, eliminando o KeyError em validate_groups().
+✅ validate_groups() tornou-se defensiva: aceita dicts com "dezenas" ou
+   "dezenas_set", normalizando internamente. Nenhuma regra mudou.
+
+Mantido do v49.4:
+✅ Braços A/B/C isolam efeitos corretamente
+✅ Teste pareado (ttest_rel) entre braços
+✅ Backtest nulo com controles irrestrito e condicionado
 ✅ p-valor empírico corrigido: (1 + sum) / (n + 1)
 ✅ search_best_fixed_oos com split treino/validação/teste
 ✅ Validação de conflitos entre grupos
-✅ Nota explícita sobre limitação do Monte Carlo
 """
 
 import numpy as np
@@ -163,42 +167,64 @@ def passes_groups(game, groups):
 
 
 def validate_groups(groups, fixed, excluded):
-    """Detecta conflitos entre grupos e restrições básicas."""
+    """
+    Detecta conflitos entre grupos e restrições básicas.
+    Aceita dicts com 'dezenas' e/ou 'dezenas_set' — normaliza internamente.
+    Não altera os grupos recebidos.
+    """
     warns = []
-    n = len(groups)
     fixed_set = set(fixed or [])
     excl_set = set(excluded or [])
 
+    # Normalização defensiva: aceita 'dezenas_set', 'dezenas' ou ambos.
+    normalized = []
     for i, g in enumerate(groups):
+        dset = g.get("dezenas_set")
+        if dset is None:
+            dset = set(g.get("dezenas", []))
+        normalized.append({
+            "idx": i,
+            "dezenas_set": set(dset),
+            "min": g["min"],
+            "max": g["max"],
+        })
+
+    # (a) Checagens individuais
+    for g in normalized:
         n_fx = len(fixed_set & g["dezenas_set"])
         if n_fx > g["max"]:
             warns.append(
-                f"Grupo {i+1}: {n_fx} fixas no grupo > máximo {g['max']}."
+                f"Grupo {g['idx']+1}: {n_fx} fixas no grupo > máximo {g['max']}."
             )
         disp = len(g["dezenas_set"] - excl_set - fixed_set)
         if disp + n_fx < g["min"]:
             warns.append(
-                f"Grupo {i+1}: mínimo {g['min']} > disponíveis ({disp + n_fx})."
+                f"Grupo {g['idx']+1}: mínimo {g['min']} "
+                f"> disponíveis ({disp + n_fx})."
             )
 
+    # (b) Checagens par-a-par no overlap
+    n = len(normalized)
     for i in range(n):
         for j in range(i + 1, n):
-            g1, g2 = groups[i], groups[j]
+            g1, g2 = normalized[i], normalized[j]
             overlap = g1["dezenas_set"] & g2["dezenas_set"]
             if not overlap:
                 continue
-            # Mínimo forçado no overlap por dois mínimos independentes
-            min_forced_overlap = max(0, g1["min"] + g2["min"] - (15 - len(overlap)))
-            if min_forced_overlap > len(overlap):
+
+            min_forced = max(0, g1["min"] + g2["min"] - (15 - len(overlap)))
+            if min_forced > len(overlap):
                 warns.append(
-                    f"Grupos {i+1} e {j+1}: mínimos {g1['min']}+{g2['min']} "
-                    f"forçam {min_forced_overlap} no overlap de {len(overlap)} "
-                    f"— impossível satisfazer ambos."
+                    f"Grupos {g1['idx']+1} e {g2['idx']+1}: mínimos "
+                    f"{g1['min']}+{g2['min']} forçam {min_forced} no overlap "
+                    f"de {len(overlap)} — impossível satisfazer ambos."
                 )
-            # Máximo conjunto no overlap
+
             max_possible = min(g1["max"], g2["max"])
             if max_possible < 0:
-                warns.append(f"Grupos {i+1} e {j+1}: máximos inviáveis.")
+                warns.append(
+                    f"Grupos {g1['idx']+1} e {g2['idx']+1}: máximos inviáveis."
+                )
 
     return warns
 
@@ -284,7 +310,7 @@ def load_all_contests(csv_file='resultados_lotofacil.csv'):
     return contests
 
 # ============================================================
-# PORTFÓLIOS ALEATÓRIOS (para controles nulos e braço C)
+# PORTFÓLIOS ALEATÓRIOS (controles nulos)
 # ============================================================
 def random_portfolio_unrestricted(n_games, rng):
     return [sorted(rng.choice(range(1, 26), 15, replace=False).tolist())
@@ -310,7 +336,7 @@ def random_portfolio_conditioned(n_games, fixed, excluded, rng):
     return out
 
 # ============================================================
-# BACKTEST (função standalone — sem dependência de self)
+# BACKTEST (standalone)
 # ============================================================
 def backtest_portfolio(portfolio, test_draws):
     if not portfolio or not test_draws:
@@ -585,8 +611,8 @@ class PortfolioOptimizer:
                          fixed=None, excluded=None):
         """
         Compara contra N carteiras aleatórias.
-        Se fixed ou excluded forem fornecidos, o nulo é CONDICIONADO
-        (respeita essas restrições). Caso contrário, é IRRESTRITO.
+        Se fixed ou excluded forem fornecidos, o nulo é CONDICIONADO.
+        Caso contrário, é IRRESTRITO.
         """
         rng = np.random.default_rng(seed)
         real_bt = self.backtest(portfolio, test_draws)
@@ -613,7 +639,6 @@ class PortfolioOptimizer:
             return None
 
         null_arr = np.array(null_vals)
-        # Correção do p-valor empírico
         p_value = (1.0 + float(np.sum(null_arr >= real_val))) / (len(null_arr) + 1.0)
         percentile = float(np.mean(null_arr < real_val) * 100.0)
 
@@ -714,10 +739,14 @@ def input_groups(fixed=None, semifixed=None, excluded=None):
             print(f"   ℹ️ Ajuste do máximo {mx}→{disp} (excluídas).")
             mx = disp
 
-        groups.append({"dezenas": sorted(dset), "min": mn, "max": mx})
+        groups.append({
+            "dezenas": sorted(dset),
+            "dezenas_set": set(dset),   # ← CORREÇÃO: campo que faltava
+            "min": mn,
+            "max": mx,
+        })
         print(f"   ✅ Grupo {i+1}: {n_grp}d, [{mn}-{mx}]")
 
-    # Validação cruzada
     warns = validate_groups(groups, fixed or [], excluded or [])
     if warns:
         print("\n   ⚠️ CONFLITOS POTENCIAIS ENTRE GRUPOS:")
@@ -948,9 +977,8 @@ def three_arm_experiment(
     """
     Braço A: critérios + grupos + fixas/excluídas + filtros estruturais
     Braço B: fixas/excluídas + filtros estruturais (SEM critérios, SEM grupos)
-    Braço C: fixas/excluídas apenas (SEM critérios, SEM grupos, SEM filtros estruturais)
-             → aleatório CONDICIONADO nas mesmas fixas/excluídas
-    
+    Braço C: fixas/excluídas apenas (aleatório CONDICIONADO)
+
     Mesmos concursos de teste entre braços e entre replicações.
     Teste estatístico: ttest_rel (pareado por réplica).
     """
@@ -975,9 +1003,7 @@ def three_arm_experiment(
     print(f"   Filtros estruturais (A e B)="
           f"{ {k: v for k, v in ranges.items() if v is not None} }")
     print(f"   Critérios em A: {use_criteria_in_A}")
-    print(f"\n   ⚠️ Teste PAREADO: usa mesmas replicações nos 3 braços.")
-    print(f"   ⚠️ Estimativa: ~{n_replicates * n_candidates * 2 // 100000 * 15}s "
-          f"(varia muito com rejeições).\n")
+    print(f"\n   ⚠️ Teste PAREADO: usa mesmas replicações nos 3 braços.\n")
 
     rates = {'A': [], 'B': [], 'C': []}
 
@@ -1060,7 +1086,7 @@ def three_arm_experiment(
         print(f"{labels[arm]:<38} {arr.mean():.4f} ± {arr.std():.4f}       "
               f"{np.percentile(arr, 95):.4f}")
 
-    # Teste pareado: só pares completos
+    # Teste pareado
     print(f"\n🔬 COMPARAÇÕES PAREADAS (ttest_rel, H1: linha > coluna):")
     def paired(a, b):
         pairs = [(x, y) for x, y in zip(rates[a], rates[b])
@@ -1075,18 +1101,16 @@ def three_arm_experiment(
         print(f"   {a} > {b}: n_pares={len(pairs)}, diff_médio={np.mean(ra-rb):+.4f}, "
               f"t={t:+.2f}, p={p:.4f} {sig}")
 
-    paired('A', 'B')  # efeito de critérios+grupos
-    paired('B', 'C')  # efeito de filtros estruturais + covering
-    paired('A', 'C')  # efeito combinado
+    paired('A', 'B')
+    paired('B', 'C')
+    paired('A', 'C')
 
     print(f"\n⚠️ Interpretação:")
-    print(f"   A>B: mede efeito de critérios+grupos (sobre filtros estruturais)")
-    print(f"   B>C: mede efeito de filtros estruturais + covering (sobre aleatório)")
-    print(f"   A>C: mede efeito total combinado")
-    print(f"   Cuidado: o braço C não aplica covering — a diferença B-C inclui")
-    print(f"   tanto os filtros quanto a otimização de cobertura.")
-    print(f"   p-value < 0.05 é necessário, mas não suficiente para conclusão")
-    print(f"   robusta: repita com sementes diferentes e test_size variável.")
+    print(f"   A>B: efeito de critérios+grupos")
+    print(f"   B>C: efeito de filtros estruturais + covering")
+    print(f"   A>C: efeito combinado")
+    print(f"   Cuidado: braço C não aplica covering — a diferença B-C inclui")
+    print(f"   filtros estruturais E otimização de cobertura.")
 
     return {
         'rates': rates,
@@ -1133,7 +1157,7 @@ def search_best_fixed_oos(contests, n_fixed=3, top_n=20,
     candidates.sort(key=lambda x: x[1], reverse=True)
     print(f"   Candidatos pós-treino: {len(candidates)}")
 
-    # Fase 2: escolher top_n pela VALIDAÇÃO (treino+val como base de geração)
+    # Fase 2: escolher top_n pela VALIDAÇÃO
     train_plus_val = train + val
     val_results = []
     for ft, freq in tqdm(candidates[:200], desc="Validação"):
@@ -1155,7 +1179,7 @@ def search_best_fixed_oos(contests, n_fixed=3, top_n=20,
     top = val_results[:top_n]
     print(f"   Top {len(top)} escolhidos pela VALIDAÇÃO")
 
-    # Fase 3: avaliação única no TESTE (sem reseleção)
+    # Fase 3: avaliação única no TESTE
     print(f"\n🏆 AVALIAÇÃO FINAL NO TESTE (não usada para seleção)")
     final = []
     for r in top:
@@ -1183,7 +1207,7 @@ def search_best_fixed_oos(contests, n_fixed=3, top_n=20,
         print(f"   rate = {avg_rate:.4f}")
         print(f"   roi  = {avg_roi:+.1f}%")
         print(f"\n   ⚠️ Se avg_roi ≈ 0, a seleção por validação NÃO generalizou.")
-        print(f"   ⚠️ Se avg_roi > 0 com p<0.05 (compare contra nulo), pode haver sinal.")
+        print(f"   ⚠️ Se avg_roi > 0 com p<0.05 (contra nulo), pode haver sinal.")
 
         print(f"\n   TOP 10 (val_roi vs test_roi):")
         for i, r in enumerate(final[:10], 1):
@@ -1238,7 +1262,7 @@ def _ask_structural_ranges():
 
 def main():
     print("=" * 70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v49.4")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v49.4.1")
     print("=" * 70)
 
     contests = load_all_contests('resultados_lotofacil.csv')
