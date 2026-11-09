@@ -2,21 +2,16 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v49.4.1
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v49.4.3
 
-EVOLUÇÃO DO v49.4:
-✅ CORREÇÃO CRÍTICA: input_groups() agora inclui "dezenas_set" no dicionário
-   retornado, eliminando o KeyError em validate_groups().
-✅ validate_groups() tornou-se defensiva: aceita dicts com "dezenas" ou
-   "dezenas_set", normalizando internamente. Nenhuma regra mudou.
-
-Mantido do v49.4:
-✅ Braços A/B/C isolam efeitos corretamente
-✅ Teste pareado (ttest_rel) entre braços
-✅ Backtest nulo com controles irrestrito e condicionado
-✅ p-valor empírico corrigido: (1 + sum) / (n + 1)
-✅ search_best_fixed_oos com split treino/validação/teste
-✅ Validação de conflitos entre grupos
+EVOLUÇÃO DO v49.4.2:
+✅ Semifixas respeitadas no modo exato (min/max validados por jogo)
+✅ allowed_pares/moldura/primos aplicados no modo exato
+✅ Universo efetivo calculado por combinatória exata (considera semifixas)
+✅ Relatório de rejeições por filtro (semifixas, allowed_*, ranges, grupos, critérios)
+✅ Covering explicita dupla amostragem: enumeração → amostra; amostra → covering (MAX_COVER)
+✅ Docstring corrigida: memória O(k) onde k = n_sample (reservoir)
+✅ Checagem de consistência quando não há filtros ativos
 """
 
 import numpy as np
@@ -24,6 +19,7 @@ from scipy.stats import hypergeom, binomtest, ttest_rel
 from collections import defaultdict
 from itertools import combinations
 import os, random, time, warnings
+from math import comb
 from tqdm import tqdm
 
 warnings.filterwarnings('ignore')
@@ -167,43 +163,28 @@ def passes_groups(game, groups):
 
 
 def validate_groups(groups, fixed, excluded):
-    """
-    Detecta conflitos entre grupos e restrições básicas.
-    Aceita dicts com 'dezenas' e/ou 'dezenas_set' — normaliza internamente.
-    Não altera os grupos recebidos.
-    """
     warns = []
     fixed_set = set(fixed or [])
     excl_set = set(excluded or [])
 
-    # Normalização defensiva: aceita 'dezenas_set', 'dezenas' ou ambos.
     normalized = []
     for i, g in enumerate(groups):
         dset = g.get("dezenas_set")
         if dset is None:
             dset = set(g.get("dezenas", []))
         normalized.append({
-            "idx": i,
-            "dezenas_set": set(dset),
-            "min": g["min"],
-            "max": g["max"],
+            "idx": i, "dezenas_set": set(dset),
+            "min": g["min"], "max": g["max"],
         })
 
-    # (a) Checagens individuais
     for g in normalized:
         n_fx = len(fixed_set & g["dezenas_set"])
         if n_fx > g["max"]:
-            warns.append(
-                f"Grupo {g['idx']+1}: {n_fx} fixas no grupo > máximo {g['max']}."
-            )
+            warns.append(f"Grupo {g['idx']+1}: {n_fx} fixas > máximo {g['max']}.")
         disp = len(g["dezenas_set"] - excl_set - fixed_set)
         if disp + n_fx < g["min"]:
-            warns.append(
-                f"Grupo {g['idx']+1}: mínimo {g['min']} "
-                f"> disponíveis ({disp + n_fx})."
-            )
+            warns.append(f"Grupo {g['idx']+1}: mínimo {g['min']} > disponíveis ({disp + n_fx}).")
 
-    # (b) Checagens par-a-par no overlap
     n = len(normalized)
     for i in range(n):
         for j in range(i + 1, n):
@@ -211,7 +192,6 @@ def validate_groups(groups, fixed, excluded):
             overlap = g1["dezenas_set"] & g2["dezenas_set"]
             if not overlap:
                 continue
-
             min_forced = max(0, g1["min"] + g2["min"] - (15 - len(overlap)))
             if min_forced > len(overlap):
                 warns.append(
@@ -219,13 +199,6 @@ def validate_groups(groups, fixed, excluded):
                     f"{g1['min']}+{g2['min']} forçam {min_forced} no overlap "
                     f"de {len(overlap)} — impossível satisfazer ambos."
                 )
-
-            max_possible = min(g1["max"], g2["max"])
-            if max_possible < 0:
-                warns.append(
-                    f"Grupos {g1['idx']+1} e {g2['idx']+1}: máximos inviáveis."
-                )
-
     return warns
 
 
@@ -255,8 +228,6 @@ def audit_portfolio(portfolio, groups=None, applied_criteria=True):
                 print(f"Jogo {i}: ✅ APROVADO | maior: {best[0]}/{best[2]} (critério {best[1]}d)")
         print("\n✅ CARTEIRA VALIDADA (critérios)." if all_valid
               else "\n❌ CARTEIRA COM VIOLAÇÕES (critérios).")
-    else:
-        print("\n⚠️ Sem critérios carregados — auditoria de critérios pulada.")
 
     if groups:
         print("\n🔎 AUDITORIA DA CARTEIRA (GRUPOS)")
@@ -310,7 +281,7 @@ def load_all_contests(csv_file='resultados_lotofacil.csv'):
     return contests
 
 # ============================================================
-# PORTFÓLIOS ALEATÓRIOS (controles nulos)
+# PORTFÓLIOS ALEATÓRIOS
 # ============================================================
 def random_portfolio_unrestricted(n_games, rng):
     return [sorted(rng.choice(range(1, 26), 15, replace=False).tolist())
@@ -325,7 +296,7 @@ def random_portfolio_conditioned(n_games, fixed, excluded, rng):
     if n_free < 0:
         raise ValueError(f"Fixas ({len(fs)}) > 15.")
     if n_free > len(avail):
-        raise ValueError(f"Disponíveis ({len(avail)}) insuficientes para {n_free} livres.")
+        raise ValueError(f"Disponíveis insuficientes.")
     out = []
     for _ in range(n_games):
         if n_free == 0:
@@ -336,7 +307,7 @@ def random_portfolio_conditioned(n_games, fixed, excluded, rng):
     return out
 
 # ============================================================
-# BACKTEST (standalone)
+# BACKTEST
 # ============================================================
 def backtest_portfolio(portfolio, test_draws):
     if not portfolio or not test_draws:
@@ -381,7 +352,7 @@ def backtest_portfolio(portfolio, test_draws):
     }
 
 # ============================================================
-# GERADOR BRUTO
+# GERADOR BRUTO (modo rápido / tentativas)
 # ============================================================
 class LooseGenerator:
     def generate_one(self, fixed=None, semifixed=None, min_semifixed=0, max_semifixed=None,
@@ -504,6 +475,44 @@ class PortfolioOptimizer:
             for g in (groups or [])
         ]
 
+    # --------------------------------------------------------
+    # Universo efetivo considerando semifixas (combinatória exata)
+    # --------------------------------------------------------
+    def _effective_universe_with_semifixas(self):
+        """
+        Calcula sum_{k in [lo, hi]} C(s, k) * C(f, n_free - k),
+        onde:
+          s = |semifixas após remover fixas/excluídas|
+          f = |dezenas livres que NÃO são semifixas|
+          n_free = 15 - |fixed|
+        e k precisa satisfazer min_semifixed <= k <= max_semifixed (ou |semi| se None),
+        além de k <= n_free e n_free - k <= f.
+        """
+        fixed_set = set(self.fixed)
+        excl_set = set(self.excluded)
+        semi_set = set(self.semifixed) - fixed_set - excl_set
+        free = set(range(1, 26)) - fixed_set - excl_set
+        non_semi_free = free - semi_set
+
+        s = len(semi_set)
+        f = len(non_semi_free)
+        n_free = 15 - len(fixed_set)
+
+        if n_free < 0:
+            return 0
+
+        min_k = max(0, self.min_semifixed)
+        max_k = s if self.max_semifixed is None else min(self.max_semifixed, s)
+
+        lo = max(min_k, n_free - f, 0)
+        hi = min(max_k, n_free, s)
+        if lo > hi:
+            return 0
+        return sum(comb(s, k) * comb(f, n_free - k) for k in range(lo, hi + 1))
+
+    # --------------------------------------------------------
+    # MODO RÁPIDO: tentativas até completar pool
+    # --------------------------------------------------------
     def generate_pool(self, n_candidates):
         pool, seen = [], set()
         rej_crit = rej_grp = rej_dup = falhas = 0
@@ -546,22 +555,223 @@ class PortfolioOptimizer:
             seen.add(key)
             pool.append(g)
 
-        print(f"\n📊 POOL: solicitado={n_candidates} obtido={len(pool)} "
-              f"tentativas={attempts}")
+        print(f"\n📊 POOL (tentativas)")
+        print(f"   Solicitado: {n_candidates}")
+        print(f"   Obtido:     {len(pool)}")
+        print(f"   Tentativas: {attempts}")
         print(f"   rej_crit={rej_crit} (aplicado={self.use_criteria}) "
               f"rej_grp={rej_grp} rej_dup={rej_dup} falhas={falhas}")
         if len(pool) < n_candidates:
             print("⚠️ Pool incompleto: limite de tentativas atingido.")
         return pool
 
+    # --------------------------------------------------------
+    # MODO EXATO: enumera universo + reservoir sampling O(k)
+    # --------------------------------------------------------
+    def enumerate_and_sample(self, n_sample, seed=None):
+        """
+        Enumera TODAS as combinações efetivas (após fixas/excluídas),
+        aplica semifixas, allowed_*, ranges, grupos e critérios.
+        Amostra n_sample sem reposição via reservoir sampling.
+
+        Memória: O(k) onde k = n_sample (NÃO O(universo)).
+        """
+        rng = np.random.default_rng(seed)
+
+        fixed_set = set(self.fixed)
+        excl_set = set(self.excluded)
+        semi_set = set(self.semifixed) - fixed_set - excl_set
+        free = sorted(set(range(1, 26)) - fixed_set - excl_set)
+        n_free = 15 - len(fixed_set)
+
+        universe_full = comb(25, 15)
+
+        if n_free < 0:
+            print(f"❌ Fixas ({len(fixed_set)}) > 15.")
+            return [], {'error': 'fixed_gt_15'}
+        if n_free > len(free):
+            print(f"❌ Dezenas livres ({len(free)}) insuficientes para {n_free}.")
+            return [], {'error': 'not_enough_free'}
+
+        universe_effective = comb(len(free), n_free)
+        universe_effective_semi = self._effective_universe_with_semifixas()
+
+        min_semi = max(0, self.min_semifixed)
+        max_semi = (len(semi_set) if self.max_semifixed is None
+                    else min(self.max_semifixed, len(semi_set)))
+
+        print(f"\n🔎 ENUMERAÇÃO DO UNIVERSO")
+        print(f"   Fixas={sorted(fixed_set)} Excluídas={sorted(excl_set)}")
+        print(f"   Semifixas disponíveis={sorted(semi_set)} "
+              f"(min={min_semi}, max={max_semi})")
+        print(f"   Dezenas livres: {len(free)} "
+              f"(semi: {len(semi_set)}, não-semi: {len(free)-len(semi_set)})")
+        print(f"   Livres no jogo: {n_free}")
+        print(f"   Universo bruto C(25,15):              {universe_full:>15,}")
+        print(f"   Efetivas C({len(free)},{n_free}):                   {universe_effective:>15,}")
+        print(f"   Efetivas considerando semifixas:      {universe_effective_semi:>15,}")
+        print(f"   Tempo pode variar de segundos a minutos.\n")
+
+        n_valid = 0
+        reservoir = []
+
+        # Contadores por filtro (ordem de avaliação)
+        rej = {
+            'semifixas': 0,
+            'pares_allowed': 0, 'moldura_allowed': 0, 'primos_allowed': 0,
+            'pares_range': 0, 'moldura_range': 0, 'primos_range': 0,
+            'soma': 0, 'amplitude': 0, 'consecutivos': 0,
+            'grupos': 0, 'criteria': 0,
+        }
+
+        fixed_tuple = tuple(sorted(fixed_set)) if fixed_set else None
+        need_set_for_semi = bool(semi_set)
+        need_set_for_groups = bool(self.groups)
+
+        t0 = time.time()
+        for combo_free in tqdm(
+            combinations(free, n_free),
+            total=universe_effective,
+            desc="Enumeração",
+            unit=" combo",
+            mininterval=0.5,
+            miniters=10000,
+        ):
+            if fixed_tuple is not None:
+                game = tuple(sorted(fixed_tuple + combo_free))
+            else:
+                game = combo_free
+
+            # 1) Semifixas
+            if need_set_for_semi:
+                game_set = set(game)
+                n_semi_in = len(game_set & semi_set)
+                if n_semi_in < min_semi or n_semi_in > max_semi:
+                    rej['semifixas'] += 1
+                    continue
+            elif not need_set_for_groups:
+                game_set = None
+            else:
+                game_set = set(game)
+
+            # Estatísticas (uma passada)
+            p = m = pr = s = 0
+            prev = game[0]
+            c = 0
+            for i, x in enumerate(game):
+                if x % 2 == 0: p += 1
+                if x in MOLDURA: m += 1
+                if x in PRIMES: pr += 1
+                s += x
+                if i > 0 and x - prev == 1: c += 1
+                prev = x
+            a = game[-1] - game[0]
+
+            # 2) allowed_*
+            if self.allowed_pares is not None and p not in self.allowed_pares:
+                rej['pares_allowed'] += 1; continue
+            if self.allowed_moldura is not None and m not in self.allowed_moldura:
+                rej['moldura_allowed'] += 1; continue
+            if self.allowed_primos is not None and pr not in self.allowed_primos:
+                rej['primos_allowed'] += 1; continue
+
+            # 3) ranges
+            if self.range_pares is not None and not (self.range_pares[0] <= p <= self.range_pares[1]):
+                rej['pares_range'] += 1; continue
+            if self.range_moldura is not None and not (self.range_moldura[0] <= m <= self.range_moldura[1]):
+                rej['moldura_range'] += 1; continue
+            if self.range_primos is not None and not (self.range_primos[0] <= pr <= self.range_primos[1]):
+                rej['primos_range'] += 1; continue
+            if self.range_soma is not None and not (self.range_soma[0] <= s <= self.range_soma[1]):
+                rej['soma'] += 1; continue
+            if self.range_amplitude is not None and not (self.range_amplitude[0] <= a <= self.range_amplitude[1]):
+                rej['amplitude'] += 1; continue
+            if self.range_consecutivos is not None and not (self.range_consecutivos[0] <= c <= self.range_consecutivos[1]):
+                rej['consecutivos'] += 1; continue
+
+            # 4) grupos
+            if need_set_for_groups:
+                skip_g = False
+                for g in self.groups:
+                    qty = len(game_set & g["dezenas_set"])
+                    if qty < g["min"] or qty > g["max"]:
+                        skip_g = True
+                        break
+                if skip_g:
+                    rej['grupos'] += 1
+                    continue
+
+            # 5) critérios
+            if self.use_criteria:
+                gm = BITMASK_CACHE.get_mask(game)
+                skip_c = False
+                for cmask, limit in CRITERIA_MASKS:
+                    if (gm & cmask).bit_count() > limit:
+                        skip_c = True
+                        break
+                if skip_c:
+                    rej['criteria'] += 1
+                    continue
+
+            # válido
+            n_valid += 1
+            if len(reservoir) < n_sample:
+                reservoir.append(list(game))
+            else:
+                j = int(rng.integers(0, n_valid))
+                if j < n_sample:
+                    reservoir[j] = list(game)
+
+        elapsed = time.time() - t0
+
+        # Checagem de consistência (só quando não há outro filtro ativo)
+        has_other_filters = (
+            self.allowed_pares is not None or self.allowed_moldura is not None
+            or self.allowed_primos is not None
+            or self.range_pares is not None or self.range_moldura is not None
+            or self.range_primos is not None or self.range_soma is not None
+            or self.range_amplitude is not None or self.range_consecutivos is not None
+            or bool(self.groups) or self.use_criteria
+        )
+        if not has_other_filters and n_valid != universe_effective_semi:
+            print(f"\n⚠️ INCONSISTÊNCIA INTERNA: n_valid={n_valid:,} "
+                  f"≠ universo_semi={universe_effective_semi:,}")
+
+        stats = {
+            'universe_full': universe_full,
+            'universe_effective': universe_effective,
+            'universe_effective_semi': universe_effective_semi,
+            'n_valid': n_valid,
+            'requested': n_sample,
+            'obtained': len(reservoir),
+            'coverage_valid_over_full': n_valid / universe_full if universe_full else 0.0,
+            'coverage_valid_over_effective_semi': (
+                n_valid / universe_effective_semi if universe_effective_semi else 0.0
+            ),
+            'coverage_sample_over_valid': len(reservoir) / n_valid if n_valid else 0.0,
+            'rejections': rej,
+            'elapsed': elapsed,
+        }
+        return reservoir, stats
+
+    # --------------------------------------------------------
+    # COVERING (com clareza sobre dois estágios)
+    # --------------------------------------------------------
     def select_covering(self, candidates, n_select, level='pair'):
         if len(candidates) < n_select:
             raise ValueError(f"Pool insuficiente: {len(candidates)} < {n_select}")
 
         MAX_COVER = 50000 if level == 'pair' else 20000
-        working = random.sample(candidates, MAX_COVER) if len(candidates) > MAX_COVER else list(candidates)
-        if len(candidates) > MAX_COVER:
-            print(f"   Amostrando {MAX_COVER} de {len(candidates)}")
+        total_available = len(candidates)
+
+        print(f"\n🔧 COVERING ({level})")
+        print(f"   Entrada (pool): {total_available:,}")
+        if total_available > MAX_COVER:
+            print(f"   MAX_COVER: {MAX_COVER:,} → truncando (subamostra do pool)")
+            working = random.sample(candidates, MAX_COVER)
+        else:
+            print(f"   Sem truncar (pool ≤ MAX_COVER)")
+            working = list(candidates)
 
         t0 = time.time()
         masks = [_pairs_mask(c) if level == 'pair' else _triples_mask(c) for c in working]
@@ -588,10 +798,46 @@ class PortfolioOptimizer:
         print(f"   Seleção: {time.time()-t1:.2f}s")
         return [working[i] for i in selected]
 
-    def optimize(self, n_games=5, n_candidates=600000, method='pair_covering'):
-        print(f"\n🧩 CARTEIRA: {n_games} jogos | {method} | pool={n_candidates} | "
-              f"crit={self.use_criteria} | grp={len(self.groups)}")
-        pool = self.generate_pool(n_candidates)
+    # --------------------------------------------------------
+    # OPTIMIZE
+    # --------------------------------------------------------
+    def optimize(self, n_games=5, n_candidates=600000, method='pair_covering',
+                 exact_universe=False, seed=None):
+        print(f"\n🧩 CARTEIRA: {n_games} jogos | {method} | "
+              f"pool={n_candidates:,} | crit={self.use_criteria} | grp={len(self.groups)}")
+        print(f"   Modo: {'ENUMERAÇÃO EXATA' if exact_universe else 'TENTATIVAS'}")
+
+        if exact_universe:
+            pool, stats = self.enumerate_and_sample(n_candidates, seed=seed)
+            if not pool:
+                raise RuntimeError(f"Enumeração falhou: {stats}")
+
+            print(f"\n📊 UNIVERSO E POOL")
+            print(f"   Universo bruto (C(25,15)):         {stats['universe_full']:>15,}")
+            print(f"   Efetivas (fixas/excluídas):        {stats['universe_effective']:>15,}")
+            print(f"   Efetivas considerando semifixas:   {stats['universe_effective_semi']:>15,}")
+            print(f"   Válidas (todos os filtros):        {stats['n_valid']:>15,}  "
+                  f"({stats['coverage_valid_over_effective_semi']*100:.2f}% das efetivas c/ semi)")
+            print(f"   Pool solicitado:                   {stats['requested']:>15,}")
+            print(f"   Pool obtido:                       {stats['obtained']:>15,}")
+            if stats['requested'] > stats['n_valid']:
+                print(f"   ⚠️ Pool limitado ao universo válido ({stats['n_valid']:,})")
+            print(f"   Cobertura sobre universo válido:   "
+                  f"{stats['coverage_sample_over_valid']*100:.2f}%")
+            print(f"   Tempo de enumeração:               {stats['elapsed']:.1f}s")
+
+            print(f"\n📊 REJEIÇÕES POR FILTRO (ordem de avaliação)")
+            rej = stats['rejections']
+            total_rej = sum(rej.values())
+            for k, v in rej.items():
+                if v > 0:
+                    print(f"   {k:<18} {v:>15,}")
+            print(f"   {'Total rejeitado':<18} {total_rej:>15,}")
+            print(f"   {'Aprovado':<18} {stats['n_valid']:>15,}")
+            print(f"   ⚠️ Cada jogo é creditado apenas ao PRIMEIRO filtro que falhar.")
+        else:
+            pool = self.generate_pool(n_candidates)
+
         if len(pool) < n_games:
             raise RuntimeError(f"Pool insuficiente: {len(pool)} < {n_games}.")
 
@@ -609,15 +855,9 @@ class PortfolioOptimizer:
     def backtest_vs_null(self, portfolio, test_draws, n_null=1000, seed=42,
                          metric='draws_with_win_rate',
                          fixed=None, excluded=None):
-        """
-        Compara contra N carteiras aleatórias.
-        Se fixed ou excluded forem fornecidos, o nulo é CONDICIONADO.
-        Caso contrário, é IRRESTRITO.
-        """
         rng = np.random.default_rng(seed)
         real_bt = self.backtest(portfolio, test_draws)
         real_val = real_bt[metric]
-
         conditioned = (fixed is not None) or (excluded is not None)
         null_vals = []
 
@@ -661,19 +901,12 @@ def print_null_comparison(r, label="Carteira"):
         return
     tag = "CONDICIONADO" if r['conditioned'] else "IRRESTRITO"
     print(f"\n🔬 BACKTEST vs. NULO ({tag}) — {label}")
-    print(f"   Métrica: {r['metric']}")
     print(f"   Real: {r['real_metric']:.4f}")
     print(f"   Nulo (n={r['n_null']}): média={r['null_mean']:.4f}, "
           f"std={r['null_std']:.4f}, P95={r['null_p95']:.4f}")
     print(f"   Percentil: {r['percentile']:.1f}%")
     sig = "🔍" if r['p_value'] < 0.05 else "  "
-    print(f"   p-valor (H1: real > nulo): {r['p_value']:.4f} {sig}")
-    if r['p_value'] < 0.05:
-        print("   ✅ Carteira supera significativamente o nulo.")
-    else:
-        print("   ❌ Compatível com o nulo (mesmo tamanho/condições).")
-    print("   ⚠️ Métrica = taxa de sorteios com premiação ≥ 11. "
-          "Premiação/custo fixos → NÃO interpretar como ROI financeiro real.")
+    print(f"   p-valor: {r['p_value']:.4f} {sig}")
 
 # ============================================================
 # INPUT E VALIDAÇÃO DE GRUPOS
@@ -741,7 +974,7 @@ def input_groups(fixed=None, semifixed=None, excluded=None):
 
         groups.append({
             "dezenas": sorted(dset),
-            "dezenas_set": set(dset),   # ← CORREÇÃO: campo que faltava
+            "dezenas_set": set(dset),
             "min": mn,
             "max": mx,
         })
@@ -764,8 +997,7 @@ def input_pool_size(default=600000):
     if not s:
         return default
     try:
-        v = int(s)
-        return max(5, v)
+        return max(5, int(s))
     except:
         return default
 
@@ -798,10 +1030,6 @@ class PredictiveRanking:
         filters = ['pares', 'moldura', 'primos', 'consecutivos', 'amplitude']
         out = {}
         for bs in block_sizes:
-            if verbose:
-                print(f"\n📊 BLOCOS DE {bs}")
-                print(f"{'Filtro':<15} {'Estrat':<12} {'Prec':<10} {'Acertos':<12} {'p':<10}")
-                print("-" * 60)
             for f in filters:
                 s = np.array([extract_filter(c['dezenas'], f) for c in self.contests], dtype=float)
                 nb = len(s) // bs
@@ -850,32 +1078,26 @@ class PredictiveRanking:
                 if tot:
                     accs.append(ac / tot * 100)
             if accs:
-                print(f"   Bloco {bs}: média={np.mean(accs):.1f}%, "
-                      f"max={max(accs):.1f}%, min={min(accs):.1f}%")
+                print(f"   Bloco {bs}: média={np.mean(accs):.1f}%, max={max(accs):.1f}%")
 
 
 def monte_carlo_control(contests, n_simulations=1000, block_sizes=None):
     block_sizes = block_sizes or [50, 100, 200]
-    print(f"\n🎲 MONTE CARLO (FWER corrigido)")
+    print(f"\n🎲 MONTE CARLO")
     real = PredictiveRanking(contests).rank_predictive_power(block_sizes, verbose=False)
     real_max = max(v['accuracy'] for v in real.values())
     real_key = max(real, key=lambda k: real[k]['accuracy'])
 
     sim_max = []
-    sim_by = defaultdict(list)
     for _ in tqdm(range(n_simulations), desc="MC"):
         sim = [{'dezenas': sorted(np.random.choice(range(1, 26), 15, replace=False))}
                for _ in range(len(contests))]
         res = PredictiveRanking(sim).rank_predictive_power(block_sizes, verbose=False)
         sim_max.append(max(v['accuracy'] for v in res.values()))
-        for k, v in res.items():
-            sim_by[k].append(v['accuracy'])
 
     p_glob = np.mean(np.array(sim_max) >= real_max)
     print(f"\n🌟 Melhor real: {real_key} = {real_max:.1f}%")
     print(f"   p-global: {p_glob:.4f} {'🔍' if p_glob < 0.05 else '❌'}")
-    print("\n⚠️ Limitação: o MC testa ausência de estrutura temporal nos filtros,")
-    print("   mas NÃO demonstra que um filtro melhora a chance de premiação.")
 
 
 def test_concurso_a_concurso(contests, min_hist=200):
@@ -930,14 +1152,12 @@ class StructuralPredictor:
         return r
 
 # ============================================================
-# WALK-FORWARD SEM VAZAMENTO
+# WALK-FORWARD
 # ============================================================
 def walk_forward_structural(contests, train_size=500, test_size=50, step=50,
                             excluded=None, use_criteria=False):
     print(f"\n🔬 WALK-FORWARD ESTRUTURAL")
-    print(f"   Treino={train_size} Teste={test_size} Passo={step}")
     print(f"   Critérios: {'ATIVOS' if use_criteria else 'DESATIVADOS (seguro)'}")
-
     rates = []
     start = train_size
     while start + test_size <= len(contests):
@@ -955,17 +1175,16 @@ def walk_forward_structural(contests, train_size=500, test_size=50, step=50,
             p = opt.optimize(5, 10000, method='pair_covering')
             bt = opt.backtest(p, test)
             rates.append(bt['draws_with_win_rate'])
-            print(f"   Janela {start}: rate={bt['draws_with_win_rate']:.3f} | ROI={bt['roi']:+.1f}%")
+            print(f"   Janela {start}: rate={bt['draws_with_win_rate']:.3f}")
         except Exception as e:
             print(f"   Janela {start}: ERRO — {e}")
         start += step
-
     if rates:
         print(f"\n📊 Média rate: {np.mean(rates):.4f} ± {np.std(rates):.4f}")
     return rates
 
 # ============================================================
-# EXPERIMENTO DE TRÊS BRAÇOS (isolado corretamente)
+# EXPERIMENTO DE TRÊS BRAÇOS
 # ============================================================
 def three_arm_experiment(
     contests, n_games=5, n_candidates=10000,
@@ -974,14 +1193,6 @@ def three_arm_experiment(
     structural_ranges=None, groups=None,
     use_criteria_in_A=True,
 ):
-    """
-    Braço A: critérios + grupos + fixas/excluídas + filtros estruturais
-    Braço B: fixas/excluídas + filtros estruturais (SEM critérios, SEM grupos)
-    Braço C: fixas/excluídas apenas (aleatório CONDICIONADO)
-
-    Mesmos concursos de teste entre braços e entre replicações.
-    Teste estatístico: ttest_rel (pareado por réplica).
-    """
     fixed = fixed or []
     semifixed = semifixed or []
     excluded = excluded or []
@@ -989,141 +1200,82 @@ def three_arm_experiment(
     ranges = structural_ranges or {}
 
     if test_size >= len(contests):
-        print("❌ test_size maior que histórico")
-        return None
-
+        print("❌ test_size > histórico"); return None
     train = contests[:-test_size]
     test = contests[-test_size:]
 
-    print(f"\n⚖️ EXPERIMENTO DE TRÊS BRAÇOS")
-    print(f"   n_games={n_games}, n_candidates={n_candidates}")
-    print(f"   n_replicates={n_replicates}, test_size={test_size}")
-    print(f"   Fixas={fixed} | Excluídas={excluded}")
-    print(f"   Grupos (só A)={len(groups)}")
-    print(f"   Filtros estruturais (A e B)="
-          f"{ {k: v for k, v in ranges.items() if v is not None} }")
-    print(f"   Critérios em A: {use_criteria_in_A}")
-    print(f"\n   ⚠️ Teste PAREADO: usa mesmas replicações nos 3 braços.\n")
-
+    print(f"\n⚖️ EXPERIMENTO 3 BRAÇOS | n_replic={n_replicates} test={test_size}")
     rates = {'A': [], 'B': [], 'C': []}
-
     for rep in range(n_replicates):
         if (rep + 1) % 10 == 0:
             print(f"   réplica {rep+1}/{n_replicates}")
 
-        # --- A ---
         try:
-            random.seed(rep * 997 + 1)
-            np.random.seed(rep * 997 + 1)
+            random.seed(rep * 997 + 1); np.random.seed(rep * 997 + 1)
             opt = PortfolioOptimizer(
-                train, fixed=fixed, semifixed=semifixed,
-                excluded=excluded,
+                train, fixed=fixed, semifixed=semifixed, excluded=excluded,
                 range_pares=ranges.get('range_pares'),
                 range_moldura=ranges.get('range_moldura'),
                 range_primos=ranges.get('range_primos'),
                 range_soma=ranges.get('range_soma'),
                 range_amplitude=ranges.get('range_amplitude'),
                 range_consecutivos=ranges.get('range_consecutivos'),
-                groups=groups,
-                use_criteria=use_criteria_in_A,
+                groups=groups, use_criteria=use_criteria_in_A,
             )
             p = opt.optimize(n_games, n_candidates)
             bt = opt.backtest(p, test)
             rates['A'].append(bt['draws_with_win_rate'])
         except Exception as e:
-            print(f"   A rep {rep+1}: falhou — {e}")
-            rates['A'].append(np.nan)
+            print(f"   A rep {rep+1}: {e}"); rates['A'].append(np.nan)
 
-        # --- B ---
         try:
-            random.seed(rep * 997 + 500000)
-            np.random.seed(rep * 997 + 500000)
+            random.seed(rep * 997 + 500000); np.random.seed(rep * 997 + 500000)
             opt = PortfolioOptimizer(
-                train, fixed=fixed, semifixed=semifixed,
-                excluded=excluded,
+                train, fixed=fixed, semifixed=semifixed, excluded=excluded,
                 range_pares=ranges.get('range_pares'),
                 range_moldura=ranges.get('range_moldura'),
                 range_primos=ranges.get('range_primos'),
                 range_soma=ranges.get('range_soma'),
                 range_amplitude=ranges.get('range_amplitude'),
                 range_consecutivos=ranges.get('range_consecutivos'),
-                groups=None,
-                use_criteria=False,
+                groups=None, use_criteria=False,
             )
             p = opt.optimize(n_games, n_candidates)
             bt = opt.backtest(p, test)
             rates['B'].append(bt['draws_with_win_rate'])
         except Exception as e:
-            print(f"   B rep {rep+1}: falhou — {e}")
-            rates['B'].append(np.nan)
+            print(f"   B rep {rep+1}: {e}"); rates['B'].append(np.nan)
 
-        # --- C ---
         try:
-            random.seed(rep * 997 + 1000000)
-            np.random.seed(rep * 997 + 1000000)
             rng = np.random.default_rng(rep * 997 + 1000000)
             p = random_portfolio_conditioned(n_games, fixed, excluded, rng)
             bt = backtest_portfolio(p, test)
             rates['C'].append(bt['draws_with_win_rate'])
         except Exception as e:
-            print(f"   C rep {rep+1}: falhou — {e}")
-            rates['C'].append(np.nan)
+            print(f"   C rep {rep+1}: {e}"); rates['C'].append(np.nan)
 
-    # Sumário
-    print(f"\n📊 RESULTADOS (n={n_replicates} replicações)")
-    print(f"{'Braço':<38} {'rate (mean±std)':<24} {'P95':<10}")
-    print("-" * 78)
-    labels = {
-        'A': 'A: crit+grp+fix/estrut',
-        'B': 'B: fix+estrut (sem crit/grp)',
-        'C': 'C: fix/excl apenas (aleat. condic.)',
-    }
+    print(f"\n📊 RESULTADOS (n={n_replicates})")
+    labels = {'A': 'A: crit+grp+fix/estrut',
+              'B': 'B: fix+estrut (sem crit/grp)',
+              'C': 'C: fix/excl apenas (aleat. condic.)'}
     for arm in ('A', 'B', 'C'):
         arr = np.array([x for x in rates[arm] if not np.isnan(x)])
-        if len(arr) == 0:
-            print(f"{labels[arm]:<38} sem dados")
-            continue
-        print(f"{labels[arm]:<38} {arr.mean():.4f} ± {arr.std():.4f}       "
-              f"{np.percentile(arr, 95):.4f}")
+        if len(arr):
+            print(f"{labels[arm]:<38} {arr.mean():.4f} ± {arr.std():.4f}")
 
-    # Teste pareado
-    print(f"\n🔬 COMPARAÇÕES PAREADAS (ttest_rel, H1: linha > coluna):")
+    print(f"\n🔬 COMPARAÇÕES PAREADAS (H1: maior):")
     def paired(a, b):
         pairs = [(x, y) for x, y in zip(rates[a], rates[b])
                  if not (np.isnan(x) or np.isnan(y))]
         if len(pairs) < 3:
-            print(f"   {a} > {b}: pares insuficientes ({len(pairs)})")
-            return
-        ra = np.array([p[0] for p in pairs])
-        rb = np.array([p[1] for p in pairs])
+            print(f"   {a} > {b}: pares insuficientes"); return
+        ra = np.array([p[0] for p in pairs]); rb = np.array([p[1] for p in pairs])
         t, p = ttest_rel(ra, rb, alternative='greater')
         sig = "🔍" if p < 0.05 else "  "
-        print(f"   {a} > {b}: n_pares={len(pairs)}, diff_médio={np.mean(ra-rb):+.4f}, "
-              f"t={t:+.2f}, p={p:.4f} {sig}")
+        print(f"   {a}>{b}: diff={np.mean(ra-rb):+.4f} t={t:+.2f} p={p:.4f} {sig}")
+    paired('A', 'B'); paired('B', 'C'); paired('A', 'C')
 
-    paired('A', 'B')
-    paired('B', 'C')
-    paired('A', 'C')
-
-    print(f"\n⚠️ Interpretação:")
-    print(f"   A>B: efeito de critérios+grupos")
-    print(f"   B>C: efeito de filtros estruturais + covering")
-    print(f"   A>C: efeito combinado")
-    print(f"   Cuidado: braço C não aplica covering — a diferença B-C inclui")
-    print(f"   filtros estruturais E otimização de cobertura.")
-
-    return {
-        'rates': rates,
-        'labels': labels,
-        'config': {
-            'n_games': n_games, 'n_candidates': n_candidates,
-            'n_replicates': n_replicates, 'test_size': test_size,
-            'fixed': fixed, 'excluded': excluded,
-            'groups_count': len(groups),
-            'ranges': ranges,
-            'use_criteria_in_A': use_criteria_in_A,
-        },
-    }
+    return {'rates': rates, 'labels': labels}
 
 # ============================================================
 # BUSCA OOS EM TRÊS FASES
@@ -1133,18 +1285,13 @@ def search_best_fixed_oos(contests, n_fixed=3, top_n=20,
                           n_games=5, n_candidates=10000,
                           method='pair_covering', excluded=None):
     if train_size + val_size >= len(contests):
-        print("❌ Histórico insuficiente para split treino/val/teste.")
-        return []
-
+        print("❌ Histórico insuficiente."); return []
     train = contests[:train_size]
     val = contests[train_size:train_size + val_size]
     test = contests[train_size + val_size:]
 
-    print(f"\n🔎 BUSCA DE FIXAS — split honesto")
-    print(f"   Treino={train_size} | Validação={val_size} | Teste={len(test)}")
-    print(f"   ⚠️ Critérios DESATIVADOS em todas as fases (vazamento temporal).")
+    print(f"\n🔎 BUSCA DE FIXAS (Treino={train_size} Val={val_size} Teste={len(test)})")
 
-    # Fase 1: filtro de frequência no treino
     candidates = []
     for ft in tqdm(combinations(range(1, 26), n_fixed), desc="Treino"):
         if excluded and any(x in ft for x in excluded):
@@ -1155,77 +1302,38 @@ def search_best_fixed_oos(contests, n_fixed=3, top_n=20,
         if freq >= 0.05:
             candidates.append((ft, freq))
     candidates.sort(key=lambda x: x[1], reverse=True)
-    print(f"   Candidatos pós-treino: {len(candidates)}")
 
-    # Fase 2: escolher top_n pela VALIDAÇÃO
     train_plus_val = train + val
     val_results = []
     for ft, freq in tqdm(candidates[:200], desc="Validação"):
-        opt = PortfolioOptimizer(
-            train_plus_val, fixed=list(ft),
-            excluded=excluded, use_criteria=False,
-        )
+        opt = PortfolioOptimizer(train_plus_val, fixed=list(ft),
+                                 excluded=excluded, use_criteria=False)
         try:
             p = opt.optimize(n_games, n_candidates, method=method)
             bt = opt.backtest(p, val)
-            val_results.append({
-                'fixed': ft, 'freq_train': freq,
-                'val_rate': bt['draws_with_win_rate'],
-                'val_roi': bt['roi'],
-            })
+            val_results.append({'fixed': ft, 'val_roi': bt['roi'],
+                                'val_rate': bt['draws_with_win_rate']})
         except:
             continue
     val_results.sort(key=lambda x: x['val_roi'], reverse=True)
     top = val_results[:top_n]
-    print(f"   Top {len(top)} escolhidos pela VALIDAÇÃO")
 
-    # Fase 3: avaliação única no TESTE
-    print(f"\n🏆 AVALIAÇÃO FINAL NO TESTE (não usada para seleção)")
     final = []
     for r in top:
-        opt = PortfolioOptimizer(
-            train_plus_val, fixed=list(r['fixed']),
-            excluded=excluded, use_criteria=False,
-        )
+        opt = PortfolioOptimizer(train_plus_val, fixed=list(r['fixed']),
+                                 excluded=excluded, use_criteria=False)
         try:
             p = opt.optimize(n_games, n_candidates, method=method)
             bt = opt.backtest(p, test)
-            final.append({
-                'fixed': r['fixed'],
-                'freq_train': r['freq_train'],
-                'val_roi': r['val_roi'],
-                'test_rate': bt['draws_with_win_rate'],
-                'test_roi': bt['roi'],
-            })
+            final.append({'fixed': r['fixed'], 'val_roi': r['val_roi'],
+                          'test_roi': bt['roi'], 'test_rate': bt['draws_with_win_rate']})
         except:
             continue
 
     if final:
-        avg_rate = np.mean([r['test_rate'] for r in final])
-        avg_roi = np.mean([r['test_roi'] for r in final])
-        print(f"\n📊 MÉDIA NO TESTE (top {len(final)}):")
-        print(f"   rate = {avg_rate:.4f}")
-        print(f"   roi  = {avg_roi:+.1f}%")
-        print(f"\n   ⚠️ Se avg_roi ≈ 0, a seleção por validação NÃO generalizou.")
-        print(f"   ⚠️ Se avg_roi > 0 com p<0.05 (contra nulo), pode haver sinal.")
-
-        print(f"\n   TOP 10 (val_roi vs test_roi):")
-        for i, r in enumerate(final[:10], 1):
-            print(f"   {i:<4} {str(r['fixed']):<20} "
-                  f"val={r['val_roi']:+.1f}% test={r['test_roi']:+.1f}%")
-
+        print(f"\n📊 MÉDIA NO TESTE: rate={np.mean([r['test_rate'] for r in final]):.4f} "
+              f"roi={np.mean([r['test_roi'] for r in final]):+.1f}%")
     return final
-
-
-def compare_trincas(contests, t1, t2, n_games=5, n_candidates=600000,
-                    method='pair_covering', excluded=None):
-    print(f"\n⚔️ COMPARAÇÃO DE TRINCAS (critérios desativados)")
-    for i, t in enumerate([t1, t2], 1):
-        opt = PortfolioOptimizer(contests, fixed=list(t), excluded=excluded,
-                                 use_criteria=False)
-        p = opt.optimize(n_games, n_candidates, method=method)
-        bt = opt.backtest(p, contests[-200:])
-        print(f"   Trinca {i} ({t}): rate={bt['draws_with_win_rate']:.4f} | ROI={bt['roi']:+.1f}%")
 
 # ============================================================
 # MENU
@@ -1233,66 +1341,49 @@ def compare_trincas(contests, t1, t2, n_games=5, n_candidates=600000,
 def _ask_structural_ranges():
     r = {}
     print("   Faixas estruturais (ENTER para pular cada)")
-    try:
-        v = input("   Pares min,max: ").strip()
-        r['range_pares'] = tuple(int(x) for x in v.split(',')) if v else None
-    except: r['range_pares'] = None
-    try:
-        v = input("   Moldura min,max: ").strip()
-        r['range_moldura'] = tuple(int(x) for x in v.split(',')) if v else None
-    except: r['range_moldura'] = None
-    try:
-        v = input("   Primos min,max: ").strip()
-        r['range_primos'] = tuple(int(x) for x in v.split(',')) if v else None
-    except: r['range_primos'] = None
-    try:
-        v = input("   Soma min,max: ").strip()
-        r['range_soma'] = tuple(int(x) for x in v.split(',')) if v else None
-    except: r['range_soma'] = None
-    try:
-        v = input("   Amplitude min,max: ").strip()
-        r['range_amplitude'] = tuple(int(x) for x in v.split(',')) if v else None
-    except: r['range_amplitude'] = None
-    try:
-        v = input("   Consecutivos min,max: ").strip()
-        r['range_consecutivos'] = tuple(int(x) for x in v.split(',')) if v else None
-    except: r['range_consecutivos'] = None
+    for key, label in [
+        ('range_pares', 'Pares'), ('range_moldura', 'Moldura'),
+        ('range_primos', 'Primos'), ('range_soma', 'Soma'),
+        ('range_amplitude', 'Amplitude'), ('range_consecutivos', 'Consecutivos'),
+    ]:
+        try:
+            v = input(f"   {label} min,max: ").strip()
+            r[key] = tuple(int(x) for x in v.split(',')) if v else None
+        except:
+            r[key] = None
     return r
 
 
 def main():
     print("=" * 70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v49.4.1")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v49.4.3")
     print("=" * 70)
 
     contests = load_all_contests('resultados_lotofacil.csv')
     if not contests:
-        print("❌ 'resultados_lotofacil.csv' não encontrado.")
-        return
+        print("❌ 'resultados_lotofacil.csv' não encontrado."); return
     print(f"\n📂 {len(contests)} concursos | último: {contests[-1]['concurso']}")
 
     try:
         load_criteria_games('jogos_criterios.txt')
     except (FileNotFoundError, ValueError) as e:
-        print(f"\n❌ ERRO: {e}")
-        print("   Geração cancelada. Critérios são obrigatórios.")
-        return
+        print(f"\n❌ ERRO: {e}\n   Geração cancelada."); return
 
     while True:
         print("\nOpções:")
         print("1.  Gerar carteira personalizada")
-        print("2.  Walk-forward condicional (seguro)")
-        print("3.  Backtest nos últimos 200 (+ nulo condicionado)")
-        print("4.  Buscar fixas OOS (treino/val/teste)")
+        print("2.  Walk-forward condicional")
+        print("3.  Backtest nos últimos 200 (+ nulo)")
+        print("4.  Buscar fixas OOS")
         print("5.  Comparar trincas")
         print("6.  Ranking preditivo")
         print("7.  Poder preditivo das 25 dezenas")
         print("8.  Structural Predictor")
         print("9.  Carteira estrutural")
-        print("10. Monte Carlo (FWER)")
+        print("10. Monte Carlo")
         print("11. Teste concurso a concurso")
-        print("12. Walk-forward estrutural (seguro)")
-        print("13. EXPERIMENTO DE 3 BRAÇOS (A/B/C)")
+        print("12. Walk-forward estrutural")
+        print("13. EXPERIMENTO 3 BRAÇOS")
         print("0.  Sair")
         op = input("Escolha: ").strip()
 
@@ -1315,9 +1406,19 @@ def main():
 
             ranges = _ask_structural_ranges()
             groups = input_groups(fixed, semifixed, excluded)
+
+            print("\n   Modo de amostragem:")
+            print("     [1] Tentativas (rápido)")
+            print("     [2] Universo exato (enumera todas as combinações efetivas,")
+            print("         conta válidas, amostra SEM reposição via reservoir)")
+            modo = input("   Escolha [1]: ").strip() or "1"
+            exact = (modo == '2')
+
+            default_pool = 50000 if exact else 600000
+            pool = input_pool_size(default_pool)
+
             metodo = input("\n   Método [1.Pair 2.Triple]: ").strip() or "1"
             method = 'pair_covering' if metodo == '1' else 'triple_covering'
-            pool = input_pool_size(600000)
 
             opt = PortfolioOptimizer(
                 contests, fixed=fixed, semifixed=semifixed,
@@ -1325,7 +1426,8 @@ def main():
                 excluded=excluded, groups=groups, use_criteria=True,
                 **ranges,
             )
-            portfolio = opt.optimize(5, pool, method=method)
+            portfolio = opt.optimize(5, pool, method=method, exact_universe=exact)
+
             for i, g in enumerate(portfolio, 1):
                 print(f" {i}. {g}")
             audit_portfolio(portfolio, groups, applied_criteria=True)
@@ -1348,18 +1450,15 @@ def main():
             for w in range(8):
                 te = len(contests) - w * 50
                 ts = te - 50
-                t_end = ts
-                t_start = max(0, t_end - 400)
+                t_end = ts; t_start = max(0, t_end - 400)
                 if t_start >= t_end or ts >= te:
                     continue
-                opt = PortfolioOptimizer(
-                    contests[t_start:t_end], fixed=fixed,
-                    excluded=excluded, use_criteria=False,
-                )
+                opt = PortfolioOptimizer(contests[t_start:t_end], fixed=fixed,
+                                         excluded=excluded, use_criteria=False)
                 p = opt.optimize(5, 10000, method=method)
                 bt = opt.backtest(p, contests[ts:te])
                 rates.append(bt['draws_with_win_rate'])
-                print(f"   Janela {w}: rate={bt['draws_with_win_rate']:.3f} | ROI={bt['roi']:+.1f}%")
+                print(f"   Janela {w}: rate={bt['draws_with_win_rate']:.3f}")
             if rates:
                 print(f"\n📊 Média: {np.mean(rates):.4f}")
 
@@ -1370,17 +1469,21 @@ def main():
             excluded = [int(x) for x in es.split()] if es else []
             ranges = _ask_structural_ranges()
             groups = input_groups(fixed, [], excluded)
-            metodo = input("\n   Método [1/2]: ").strip() or "1"
+
+            print("\n   Modo: [1] Tentativas [2] Universo exato")
+            modo = input("   Escolha [1]: ").strip() or "1"
+            exact = (modo == '2')
+            pool = input_pool_size(50000 if exact else 600000)
+
+            metodo = input("   Método [1/2]: ").strip() or "1"
             method = 'pair_covering' if metodo == '1' else 'triple_covering'
-            pool = input_pool_size(600000)
 
             opt = PortfolioOptimizer(
                 contests, fixed=fixed, excluded=excluded,
                 groups=groups, use_criteria=True, **ranges,
             )
-            portfolio = opt.optimize(5, pool, method=method)
+            portfolio = opt.optimize(5, pool, method=method, exact_universe=exact)
             audit_portfolio(portfolio, groups, applied_criteria=True)
-
             null_r = opt.backtest_vs_null(
                 portfolio, contests[-200:],
                 n_null=500, fixed=fixed, excluded=excluded,
@@ -1390,8 +1493,7 @@ def main():
         elif op == '4':
             try:
                 nf = int(input("\n   Fixas (2-4): ").strip())
-                if nf not in (2, 3, 4):
-                    continue
+                if nf not in (2, 3, 4): continue
             except: continue
             top_n = int(input("   Top N [20]: ").strip() or "20")
             ts = int(input("   Treino [2500]: ").strip() or "2500")
@@ -1408,10 +1510,15 @@ def main():
             try:
                 t1 = tuple(int(x) for x in s1.split())
                 t2 = tuple(int(x) for x in s2.split())
-                if len(t1) != 3 or len(t2) != 3:
-                    continue
+                if len(t1) != 3 or len(t2) != 3: continue
             except: continue
-            compare_trincas(contests, t1, t2, excluded=excluded)
+            print(f"\n⚔️ COMPARAÇÃO DE TRINCAS (critérios desativados)")
+            for i, t in enumerate([t1, t2], 1):
+                opt = PortfolioOptimizer(contests, fixed=list(t),
+                                         excluded=excluded, use_criteria=False)
+                p = opt.optimize(5, 600000)
+                bt = opt.backtest(p, contests[-200:])
+                print(f"   Trinca {i} ({t}): rate={bt['draws_with_win_rate']:.4f}")
 
         elif op == '6':
             bs = input("\n   Blocos [50,100,200,500]: ").strip()
@@ -1433,9 +1540,14 @@ def main():
             es = input("   Excluídas: ").strip()
             excluded = [int(x) for x in es.split()] if es else []
             groups = input_groups(fixed, [], excluded)
-            metodo = input("\n   Método [1/2]: ").strip() or "1"
+
+            print("\n   Modo: [1] Tentativas [2] Universo exato")
+            modo = input("   Escolha [1]: ").strip() or "1"
+            exact = (modo == '2')
+            pool = input_pool_size(50000 if exact else 600000)
+
+            metodo = input("   Método [1/2]: ").strip() or "1"
             method = 'pair_covering' if metodo == '1' else 'triple_covering'
-            pool = input_pool_size(600000)
 
             opt = PortfolioOptimizer(
                 contests, fixed=fixed, excluded=excluded,
@@ -1445,7 +1557,7 @@ def main():
                 range_consecutivos=ranges.get('consecutivos'),
                 groups=groups, use_criteria=True,
             )
-            portfolio = opt.optimize(5, pool, method=method)
+            portfolio = opt.optimize(5, pool, method=method, exact_universe=exact)
             audit_portfolio(portfolio, groups, applied_criteria=True)
             if len(contests) > 200:
                 null_r = opt.backtest_vs_null(
@@ -1478,12 +1590,9 @@ def main():
             walk_forward_structural(contests, ts, te, st, excluded=excluded, use_criteria=False)
 
         elif op == '13':
-            print("\n⚖️ EXPERIMENTO DE TRÊS BRAÇOS")
-            print("   A: critérios + grupos + fix/estrut")
-            print("   B: fix/estrut (sem crit, sem grupos)")
-            print("   C: fix/excl apenas (aleat. condicionado)")
+            print("\n⚖️ EXPERIMENTO 3 BRAÇOS")
             try:
-                ng = int(input("\n   n_games [5]: ").strip() or "5")
+                ng = int(input("   n_games [5]: ").strip() or "5")
                 nc = int(input("   n_candidates [10000]: ").strip() or "10000")
                 nr = int(input("   n_replicates [100]: ").strip() or "100")
                 tsz = int(input("   test_size [200]: ").strip() or "200")
@@ -1494,20 +1603,15 @@ def main():
             fixed = [int(x) for x in fs.split()] if fs else []
             es = input("   Excluídas (todos os braços): ").strip()
             excluded = [int(x) for x in es.split()] if es else []
-
-            print("\n   Filtros estruturais (aplicados em A e B, não em C):")
             ranges = _ask_structural_ranges()
-
             groups = input_groups(fixed, [], excluded)
-
             use_crit = input("\n   Braço A usa critérios? (s/n) [s]: ").strip().lower() != 'n'
 
             three_arm_experiment(
                 contests, n_games=ng, n_candidates=nc,
                 n_replicates=nr, test_size=tsz,
                 fixed=fixed, excluded=excluded,
-                structural_ranges=ranges,
-                groups=groups,
+                structural_ranges=ranges, groups=groups,
                 use_criteria_in_A=use_crit,
             )
 
