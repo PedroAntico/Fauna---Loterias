@@ -2,21 +2,22 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA +MILIONÁRIA – v1.3
-Baseado no v48.3 da Lotofácil, adaptado para:
-  - 6 números de 1 a 50
-  - 2 trevos de 1 a 6
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA +MILIONÁRIA – v1.5
+MÓDULOS 1–5: Gerador validado + Carteiras sem duplicata + Backtest corrigido
+             + Estatística com MC + Auditoria de integridade.
 
-EVOLUÇÃO:
-✅ v1.0: Correção de leakage, controle FWER, walk-forward, filtros estruturais
-✅ v1.1: Auditoria do Fator de Escala (F_t = S_{t-1}/média móvel)
-✅ v1.2: F_prev e F_next usam referências DIFERENTES (sem denominador compartilhado)
-        Nova Opção 14 — Auditoria do Coeficiente de Escala γ
-        Split walk-forward 60/20/20 + grid pré-especificado + baseline IID
-✅ v1.3: CORREÇÃO do alinhamento de índices na Opção 14
-        (err_abs com target explícito; fim do broadcast 227 vs 379)
-        IID MC reproduz o PROCEDIMENTO COMPLETO (escolha de γ* + avaliação no holdout)
-        Reporta distribuição nula de γ* sob IID
+EVOLUÇÃO v1.5 (correções cirúrgicas sobre v1.4):
+✅ Backtest: p_bet vs p_draw separados; lift usa MC (não independência)
+✅ Prêmios: tabela oficial (R$ 6,00; 13 combinações; fixos 3+2/3+1/2+2/2+1)
+✅ Semifixas: sempre validadas; _validate_config rejeita impossíveis
+✅ Entradas: validação estrita (1–50, sem repetidos, sem conflitos)
+✅ Covering: selected_mains evita duplicata; avisa se <n_select
+✅ Covering: coverage_stats reportado
+✅ γ: 'Média móvel' como γ=0 (sem KeyError); BH entre janelas
+✅ Ranking: block permutation opcional
+✅ MC FWER: (1+Σ)/(n_sim+1)
+✅ Structural IPE: clamp dentro dos limites
+✅ Módulo 5: integrity_audit() com 7 verificações automáticas
 """
 
 import numpy as np
@@ -43,13 +44,23 @@ MOLDURA = set(range(1, 11)) | set(range(41, 51))
 HYPE_PROBS_MAIN = {k: hypergeom.pmf(k, TOTAL_MAIN, CHOOSE_MAIN, CHOOSE_MAIN) for k in range(0, CHOOSE_MAIN+1)}
 HYPE_PROBS_TREVO = {k: hypergeom.pmf(k, TOTAL_TREVO, CHOOSE_TREVO, CHOOSE_TREVO) for k in range(0, CHOOSE_TREVO+1)}
 
-PREMIO_VALORES = {
-    (6,2): 10000000.0, (6,1): 50000.0, (6,0): 1500.0,
-    (5,2): 2000.0, (5,1): 100.0, (5,0): 10.0,
-    (4,2): 50.0, (4,1): 5.0, (4,0): 0.0,
-    (3,2): 3.0, (3,1): 0.0, (3,0): 0.0,
+# --- TABELA OFICIAL ---
+# 13 combinações premiadas. 3+0 e 2+0 NÃO pagam.
+# Valores variáveis marcados como None (não fabricar prêmio).
+FAIXAS_PREMIADAS = {
+    (6, 2): None, (6, 1): None, (6, 0): None,
+    (5, 2): None, (5, 1): None, (5, 0): None,
+    (4, 2): None, (4, 1): None, (4, 0): None,
+    (3, 2): 50.0, (3, 1): 24.0,
+    (2, 2): 12.0, (2, 1):  6.0,
 }
-CUSTO_APOSTA = 4.5
+FAIXAS_PREMIADAS_SET = set(FAIXAS_PREMIADAS.keys())
+CUSTO_APOSTA = 6.0   # CORRIGIDO: R$ 6,00 (v1.4 usava 4.5)
+
+# Probabilidade matemática de uma aposta premiar (qualquer faixa)
+P_BET_WIN_THEORETICAL = sum(
+    HYPE_PROBS_MAIN[m] * HYPE_PROBS_TREVO[t] for (m, t) in FAIXAS_PREMIADAS
+)
 
 # ============================================================
 # BITMASK
@@ -70,7 +81,52 @@ BITMASK_CACHE = BitmaskCache()
 mask_intersection = lambda m1, m2: (m1 & m2).bit_count()
 
 # ============================================================
-# CARREGAMENTO DE DADOS
+# VALIDAÇÃO DE ENTRADAS
+# ============================================================
+def validate_numbers(numbers, name, max_val=TOTAL_MAIN):
+    if numbers is None:
+        return []
+    if not isinstance(numbers, (list, tuple)):
+        raise ValueError(f"{name}: deve ser lista ou tupla.")
+    if len(set(numbers)) != len(numbers):
+        raise ValueError(f"{name}: valores repetidos: {sorted(numbers)}")
+    for x in numbers:
+        if not isinstance(x, int) or x < 1 or x > max_val:
+            raise ValueError(f"{name}: valores devem ser inteiros 1–{max_val}. Recebido: {x!r}")
+    return sorted(numbers)
+
+
+def validate_inputs(fixed=None, semifixed=None, excluded=None,
+                    min_semifixed=0, max_semifixed=None):
+    fixed = validate_numbers(fixed, 'fixas', TOTAL_MAIN)
+    semifixed = validate_numbers(semifixed, 'semifixas', TOTAL_MAIN)
+    excluded = validate_numbers(excluded, 'excluídas', TOTAL_MAIN)
+
+    if len(fixed) > CHOOSE_MAIN:
+        raise ValueError(f"Fixas: máximo {CHOOSE_MAIN}, recebido {len(fixed)}.")
+
+    fs, ss, es = set(fixed), set(semifixed), set(excluded)
+    if fs & ss:
+        raise ValueError(f"Conflito fixas/semifixas: {sorted(fs & ss)}")
+    if fs & es:
+        raise ValueError(f"Conflito fixas/excluídas: {sorted(fs & es)}")
+    if ss & es:
+        raise ValueError(f"Conflito semifixas/excluídas: {sorted(ss & es)}")
+
+    if min_semifixed < 0:
+        raise ValueError(f"min_semifixed < 0: {min_semifixed}")
+    if max_semifixed is not None:
+        if max_semifixed < 0:
+            raise ValueError(f"max_semifixed < 0: {max_semifixed}")
+        if max_semifixed < min_semifixed:
+            raise ValueError(
+                f"max_semifixed ({max_semifixed}) < min_semifixed ({min_semifixed})"
+            )
+
+    return fixed, semifixed, excluded
+
+# ============================================================
+# CARREGAMENTO
 # ============================================================
 def load_all_contests(csv_file='resultados_maismilionaria.csv'):
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -86,19 +142,17 @@ def load_all_contests(csv_file='resultados_maismilionaria.csv'):
             try:
                 dezenas = [int(x.strip()) for x in parts[2:8] if x.strip()]
                 trevos = [int(x.strip()) for x in parts[8:10] if x.strip()]
-                if len(dezenas) != CHOOSE_MAIN or len(set(dezenas)) != CHOOSE_MAIN:
+                if (len(dezenas) != CHOOSE_MAIN or len(set(dezenas)) != CHOOSE_MAIN
+                    or any(x < 1 or x > TOTAL_MAIN for x in dezenas)):
                     continue
-                if any(x < 1 or x > TOTAL_MAIN for x in dezenas):
-                    continue
-                if len(trevos) != CHOOSE_TREVO or len(set(trevos)) != CHOOSE_TREVO:
-                    continue
-                if any(x < 1 or x > TOTAL_TREVO for x in trevos):
+                if (len(trevos) != CHOOSE_TREVO or len(set(trevos)) != CHOOSE_TREVO
+                    or any(x < 1 or x > TOTAL_TREVO for x in trevos)):
                     continue
                 contests.append({
                     'concurso': int(parts[0]),
                     'data': parts[1],
                     'dezenas': sorted(dezenas),
-                    'trevos': sorted(trevos)
+                    'trevos': sorted(trevos),
                 })
             except:
                 continue
@@ -110,104 +164,82 @@ def load_all_contests(csv_file='resultados_maismilionaria.csv'):
 # GERADOR
 # ============================================================
 class LooseGenerator:
-    def __init__(self):
-        pass
-
     def generate_one(self, fixed=None, semifixed=None, min_semifixed=0, max_semifixed=None,
-                     excluded=None,
-                     allowed_pares=None, allowed_moldura=None, allowed_primos=None,
+                     excluded=None, allowed_pares=None, allowed_moldura=None, allowed_primos=None,
                      range_pares=None, range_moldura=None, range_primos=None,
                      range_soma=None, range_amplitude=None, range_consecutivos=None):
         for _ in range(500):
-            game = self._generate_raw(fixed, semifixed, min_semifixed, max_semifixed,
-                                      excluded, allowed_pares, allowed_moldura, allowed_primos,
-                                      range_pares, range_moldura, range_primos,
-                                      range_soma, range_amplitude, range_consecutivos)
-            if game is not None:
-                return game
-        raise RuntimeError("Não foi possível gerar jogo com os parâmetros fornecidos.")
+            g = self._generate_raw(
+                fixed, semifixed, min_semifixed, max_semifixed, excluded,
+                allowed_pares, allowed_moldura, allowed_primos,
+                range_pares, range_moldura, range_primos,
+                range_soma, range_amplitude, range_consecutivos,
+            )
+            if g is not None:
+                return g
+        raise RuntimeError("Geração falhou com os parâmetros fornecidos.")
 
     def _generate_raw(self, fixed, semifixed, min_semifixed, max_semifixed,
                       excluded, allowed_pares, allowed_moldura, allowed_primos,
                       range_pares, range_moldura, range_primos,
                       range_soma, range_amplitude, range_consecutivos):
-        if fixed is None: fixed = []
-        if semifixed is None: semifixed = []
-        if excluded is None: excluded = []
+        fixed = fixed or []
+        semifixed = semifixed or []
+        excluded = excluded or []
 
-        excluded_set = set(excluded)
-        fixed_set = set(fixed) - excluded_set
-        semifixed_set = set(semifixed) - fixed_set - excluded_set
+        excl_set = set(excluded)
+        fixed_set = set(fixed) - excl_set
+        semi_set = set(semifixed) - fixed_set - excl_set
+        banned = fixed_set | semi_set | excl_set
+        rest = list(set(range(1, TOTAL_MAIN + 1)) - banned)
+        n_fix = len(fixed_set)
 
-        proibidas = fixed_set | semifixed_set | excluded_set
-        todas = set(range(1, TOTAL_MAIN + 1))
-        restantes = list(todas - proibidas)
-
-        n_fixas = len(fixed_set)
-
-        if max_semifixed is None:
-            max_semi = len(semifixed_set)
-        else:
-            max_semi = min(max_semifixed, len(semifixed_set))
-
+        max_semi = len(semi_set) if max_semifixed is None else min(max_semifixed, len(semi_set))
         min_semi = max(min_semifixed, 0)
         if min_semi > max_semi:
             return None
 
-        n_semifixed_escolher = random.randint(min_semi, max_semi)
-        n_restantes = CHOOSE_MAIN - n_fixas - n_semifixed_escolher
-
-        if n_restantes < 0 or n_restantes > len(restantes):
+        n_semi = random.randint(min_semi, max_semi)
+        n_rest = CHOOSE_MAIN - n_fix - n_semi
+        if n_rest < 0 or n_rest > len(rest):
             return None
 
         for _ in range(200):
-            if n_semifixed_escolher > 0 and len(semifixed_set) > 0:
-                chosen_semi = set(random.sample(list(semifixed_set), min(n_semifixed_escolher, len(semifixed_set))))
-            else:
-                chosen_semi = set()
-
-            if n_restantes > 0:
-                chosen_rest = set(random.sample(restantes, min(n_restantes, len(restantes))))
-            else:
-                chosen_rest = set()
-
-            main_numbers = sorted(fixed_set | chosen_semi | chosen_rest)
-            if len(main_numbers) != CHOOSE_MAIN:
+            semi_pick = set(random.sample(list(semi_set), n_semi)) if n_semi > 0 else set()
+            rest_pick = set(random.sample(rest, n_rest)) if n_rest > 0 else set()
+            main = sorted(fixed_set | semi_pick | rest_pick)
+            if len(main) != CHOOSE_MAIN:
                 continue
 
-            if allowed_pares is not None:
-                if sum(1 for x in main_numbers if x % 2 == 0) not in allowed_pares:
-                    continue
-            if allowed_moldura is not None:
-                if sum(1 for x in main_numbers if x in MOLDURA) not in allowed_moldura:
-                    continue
-            if allowed_primos is not None:
-                if sum(1 for x in main_numbers if x in PRIMES) not in allowed_primos:
-                    continue
+            if allowed_pares is not None and sum(1 for x in main if x % 2 == 0) not in allowed_pares:
+                continue
+            if allowed_moldura is not None and sum(1 for x in main if x in MOLDURA) not in allowed_moldura:
+                continue
+            if allowed_primos is not None and sum(1 for x in main if x in PRIMES) not in allowed_primos:
+                continue
 
-            pares = sum(1 for x in main_numbers if x % 2 == 0)
-            mol = sum(1 for x in main_numbers if x in MOLDURA)
-            prim = sum(1 for x in main_numbers if x in PRIMES)
-            soma = sum(main_numbers)
-            amplitude = max(main_numbers) - min(main_numbers)
-            consec = sum(1 for i in range(len(main_numbers)-1) if main_numbers[i+1]-main_numbers[i] == 1)
+            p = sum(1 for x in main if x % 2 == 0)
+            m = sum(1 for x in main if x in MOLDURA)
+            pr = sum(1 for x in main if x in PRIMES)
+            s = sum(main)
+            a = max(main) - min(main)
+            c = sum(1 for i in range(len(main)-1) if main[i+1]-main[i] == 1)
 
-            if range_pares is not None and not (range_pares[0] <= pares <= range_pares[1]):
+            if range_pares is not None and not (range_pares[0] <= p <= range_pares[1]):
                 continue
-            if range_moldura is not None and not (range_moldura[0] <= mol <= range_moldura[1]):
+            if range_moldura is not None and not (range_moldura[0] <= m <= range_moldura[1]):
                 continue
-            if range_primos is not None and not (range_primos[0] <= prim <= range_primos[1]):
+            if range_primos is not None and not (range_primos[0] <= pr <= range_primos[1]):
                 continue
-            if range_soma is not None and not (range_soma[0] <= soma <= range_soma[1]):
+            if range_soma is not None and not (range_soma[0] <= s <= range_soma[1]):
                 continue
-            if range_amplitude is not None and not (range_amplitude[0] <= amplitude <= range_amplitude[1]):
+            if range_amplitude is not None and not (range_amplitude[0] <= a <= range_amplitude[1]):
                 continue
-            if range_consecutivos is not None and not (range_consecutivos[0] <= consec <= range_consecutivos[1]):
+            if range_consecutivos is not None and not (range_consecutivos[0] <= c <= range_consecutivos[1]):
                 continue
 
             trevos = sorted(random.sample(range(1, TOTAL_TREVO + 1), CHOOSE_TREVO))
-            return (main_numbers, trevos)
-
+            return (main, trevos)
         return None
 
     def generate_pure_random(self):
@@ -223,23 +255,14 @@ class PortfolioOptimizer:
                  excluded=None, allowed_pares=None, allowed_moldura=None, allowed_primos=None,
                  range_pares=None, range_moldura=None, range_primos=None,
                  range_soma=None, range_amplitude=None, range_consecutivos=None):
+        fixed, semifixed, excluded = validate_inputs(
+            fixed, semifixed, excluded, min_semifixed, max_semifixed
+        )
         self.contests = contests
         self.generator = LooseGenerator()
-        self.excluded = excluded if excluded else []
-
-        excl_set = set(self.excluded)
-        self.fixed = fixed if fixed else []
-        if excl_set & set(self.fixed):
-            removidas_fixas = excl_set & set(self.fixed)
-            print(f"⚠️ Dezenas fixas também excluídas; removendo das fixas: {sorted(removidas_fixas)}")
-            self.fixed = [d for d in self.fixed if d not in excl_set]
-
-        self.semifixed = semifixed if semifixed else []
-        if excl_set & set(self.semifixed):
-            removidas_semi = excl_set & set(self.semifixed)
-            print(f"⚠️ Dezenas semifixas também excluídas; removendo das semifixas: {sorted(removidas_semi)}")
-            self.semifixed = [d for d in self.semifixed if d not in excl_set]
-
+        self.fixed = fixed
+        self.semifixed = semifixed
+        self.excluded = excluded
         self.min_semifixed = min_semifixed
         self.max_semifixed = max_semifixed
         self.allowed_pares = allowed_pares
@@ -251,11 +274,50 @@ class PortfolioOptimizer:
         self.range_soma = range_soma
         self.range_amplitude = range_amplitude
         self.range_consecutivos = range_consecutivos
+        self._validate_config()
+
+    def _validate_config(self):
+        """Rejeita configurações impossíveis antes de gerar."""
+        semi_set = set(self.semifixed) - set(self.fixed) - set(self.excluded)
+        if self.min_semifixed > len(semi_set):
+            raise ValueError(
+                f"Semifixas efetivas ({len(semi_set)}) < mínimo exigido "
+                f"({self.min_semifixed}). Impossível satisfazer."
+            )
+        n_free = CHOOSE_MAIN - len(self.fixed)
+        available = TOTAL_MAIN - len(self.fixed) - len(self.excluded)
+        if n_free < 0:
+            raise ValueError(f"Fixas ({len(self.fixed)}) > {CHOOSE_MAIN}.")
+        if n_free > available:
+            raise ValueError(
+                f"Livres necessárias ({n_free}) > disponíveis ({available})."
+            )
+
+    def _effective_universe_main(self):
+        fixed_set = set(self.fixed)
+        excl_set = set(self.excluded)
+        semi_set = set(self.semifixed) - fixed_set - excl_set
+        free = set(range(1, TOTAL_MAIN + 1)) - fixed_set - excl_set
+        non_semi_free = free - semi_set
+        s = len(semi_set)
+        f = len(non_semi_free)
+        n_free = CHOOSE_MAIN - len(fixed_set)
+        if n_free < 0:
+            return 0
+        min_k = max(0, self.min_semifixed)
+        max_k = s if self.max_semifixed is None else min(self.max_semifixed, s)
+        lo = max(min_k, n_free - f, 0)
+        hi = min(max_k, n_free, s)
+        if lo > hi:
+            return 0
+        return sum(comb(s, k) * comb(f, n_free - k) for k in range(lo, hi + 1))
 
     def generate_pool(self, n_candidates):
-        pool = []
-        seen = set()
-        for _ in tqdm(range(n_candidates), desc="Gerando pool"):
+        pool, seen = [], set()
+        attempts = 0
+        max_attempts = n_candidates * 20
+        while len(pool) < n_candidates and attempts < max_attempts:
+            attempts += 1
             try:
                 g = self.generator.generate_one(
                     fixed=self.fixed, semifixed=self.semifixed,
@@ -265,53 +327,248 @@ class PortfolioOptimizer:
                     allowed_primos=self.allowed_primos,
                     range_pares=self.range_pares, range_moldura=self.range_moldura,
                     range_primos=self.range_primos, range_soma=self.range_soma,
-                    range_amplitude=self.range_amplitude, range_consecutivos=self.range_consecutivos)
-                key = (tuple(g[0]), tuple(g[1]))
-                if key not in seen:
-                    seen.add(key)
-                    pool.append(g)
+                    range_amplitude=self.range_amplitude,
+                    range_consecutivos=self.range_consecutivos,
+                )
             except RuntimeError:
-                break
+                continue
+            key = (tuple(g[0]), tuple(g[1]))
+            if key in seen:
+                continue
+            seen.add(key)
+            pool.append(g)
         return pool
+
+    def enumerate_and_sample(self, n_sample, seed=None):
+        """
+        Enumera universe_main_eff mains. Para cada main válido, percorre
+        15 pares de trevos. Reservoir sampling sobre (main, trevo).
+        Memória: O(k), k = n_sample.
+        """
+        rng = np.random.default_rng(seed)
+        fixed_set = set(self.fixed)
+        excl_set = set(self.excluded)
+        semi_set = set(self.semifixed) - fixed_set - excl_set
+        free = sorted(set(range(1, TOTAL_MAIN + 1)) - fixed_set - excl_set)
+        n_free = CHOOSE_MAIN - len(fixed_set)
+
+        if n_free < 0 or n_free > len(free):
+            return [], {'error': 'infeasible'}
+
+        all_trevo_combos = list(combinations(range(1, TOTAL_TREVO + 1), CHOOSE_TREVO))
+        n_trevo = len(all_trevo_combos)
+
+        universe_main_raw  = comb(TOTAL_MAIN, CHOOSE_MAIN)
+        universe_main_eff  = comb(len(free), n_free)
+        universe_main_semi = self._effective_universe_main()
+
+        universe_pairs_raw  = universe_main_raw  * n_trevo
+        universe_pairs_eff  = universe_main_eff  * n_trevo
+        universe_pairs_semi = universe_main_semi * n_trevo
+
+        min_semi = max(0, self.min_semifixed)
+        max_semi = len(semi_set) if self.max_semifixed is None else min(self.max_semifixed, len(semi_set))
+
+        print(f"\n🔎 ENUMERAÇÃO DO UNIVERSO (+Milionária)")
+        print(f"   Fixas={sorted(fixed_set)} Excluídas={sorted(excl_set)}")
+        print(f"   Semifixas disponíveis={sorted(semi_set)} (min={min_semi}, max={max_semi})")
+        print(f"   Universo bruto mains C(50,6):           {universe_main_raw:>18,}")
+        print(f"   Efetivas mains (após fixas/excl):       {universe_main_eff:>18,}")
+        print(f"   Efetivas mains (após semifixas):        {universe_main_semi:>18,}")
+        print(f"   Efetivas (main, trevo):                 {universe_pairs_semi:>18,}")
+
+        n_valid_main = n_valid = 0
+        reservoir = []
+        rej = {k: 0 for k in [
+            'semifixas', 'pares_allowed', 'moldura_allowed', 'primos_allowed',
+            'pares_range', 'moldura_range', 'primos_range',
+            'soma', 'amplitude', 'consecutivos',
+        ]}
+        fixed_tuple = tuple(sorted(fixed_set)) if fixed_set else None
+
+        t0 = time.time()
+        for combo_free in tqdm(
+            combinations(free, n_free),
+            total=universe_main_eff, desc="Enumeração", unit=" main",
+            mininterval=0.5, miniters=10000,
+        ):
+            main = tuple(sorted(fixed_tuple + combo_free)) if fixed_tuple else combo_free
+
+            # SEMIFIXAS: sempre verificado (mesmo se semi_set vazio → n=0)
+            main_set = set(main)
+            n_semi_in = len(main_set & semi_set)
+            if n_semi_in < min_semi or n_semi_in > max_semi:
+                rej['semifixas'] += 1
+                continue
+
+            p = m = pr = s = 0
+            prev = main[0]; c = 0
+            for i, x in enumerate(main):
+                if x % 2 == 0: p += 1
+                if x in MOLDURA: m += 1
+                if x in PRIMES: pr += 1
+                s += x
+                if i > 0 and x - prev == 1: c += 1
+                prev = x
+            a = main[-1] - main[0]
+
+            if self.allowed_pares is not None and p not in self.allowed_pares:
+                rej['pares_allowed'] += 1; continue
+            if self.allowed_moldura is not None and m not in self.allowed_moldura:
+                rej['moldura_allowed'] += 1; continue
+            if self.allowed_primos is not None and pr not in self.allowed_primos:
+                rej['primos_allowed'] += 1; continue
+
+            if self.range_pares is not None and not (self.range_pares[0] <= p <= self.range_pares[1]):
+                rej['pares_range'] += 1; continue
+            if self.range_moldura is not None and not (self.range_moldura[0] <= m <= self.range_moldura[1]):
+                rej['moldura_range'] += 1; continue
+            if self.range_primos is not None and not (self.range_primos[0] <= pr <= self.range_primos[1]):
+                rej['primos_range'] += 1; continue
+            if self.range_soma is not None and not (self.range_soma[0] <= s <= self.range_soma[1]):
+                rej['soma'] += 1; continue
+            if self.range_amplitude is not None and not (self.range_amplitude[0] <= a <= self.range_amplitude[1]):
+                rej['amplitude'] += 1; continue
+            if self.range_consecutivos is not None and not (self.range_consecutivos[0] <= c <= self.range_consecutivos[1]):
+                rej['consecutivos'] += 1; continue
+
+            n_valid_main += 1
+            main_list = list(main)
+            for trevo in all_trevo_combos:
+                n_valid += 1
+                if len(reservoir) < n_sample:
+                    reservoir.append((main_list.copy(), list(trevo)))
+                else:
+                    j = int(rng.integers(0, n_valid))
+                    if j < n_sample:
+                        reservoir[j] = (main_list.copy(), list(trevo))
+
+        elapsed = time.time() - t0
+        has_filters = any([
+            self.allowed_pares is not None, self.allowed_moldura is not None,
+            self.allowed_primos is not None,
+            self.range_pares is not None, self.range_moldura is not None,
+            self.range_primos is not None, self.range_soma is not None,
+            self.range_amplitude is not None, self.range_consecutivos is not None,
+        ])
+        if not has_filters and n_valid_main != universe_main_semi:
+            print(f"\n⚠️ INCONSISTÊNCIA: n_valid_main={n_valid_main:,} ≠ semi={universe_main_semi:,}")
+
+        stats = {
+            'universe_main_raw': universe_main_raw,
+            'universe_main_eff': universe_main_eff,
+            'universe_main_semi': universe_main_semi,
+            'universe_pairs_raw': universe_pairs_raw,
+            'universe_pairs_eff': universe_pairs_eff,
+            'universe_pairs_semi': universe_pairs_semi,
+            'n_valid_main': n_valid_main,
+            'n_valid': n_valid,
+            'n_trevo_combos': n_trevo,
+            'requested': n_sample,
+            'obtained': len(reservoir),
+            'coverage_valid_over_eff_semi': (n_valid / universe_pairs_semi) if universe_pairs_semi else 0.0,
+            'coverage_sample_over_valid': (len(reservoir) / n_valid) if n_valid else 0.0,
+            'rejections': rej,
+            'elapsed': elapsed,
+        }
+        return reservoir, stats
 
     def select_covering(self, candidates, n_select, level='pair'):
         if len(candidates) < n_select:
             raise ValueError(f"Pool insuficiente: {len(candidates)} < {n_select}")
+
+        MAX_COVER = 50000 if level == 'pair' else 20000
+        total_available = len(candidates)
+        print(f"\n🔧 COVERING ({level})")
+        print(f"   Entrada: {total_available:,}")
+        if total_available > MAX_COVER:
+            print(f"   MAX_COVER: {MAX_COVER:,} → subamostra")
+            working = random.sample(candidates, MAX_COVER)
+        else:
+            working = list(candidates)
+
+        t0 = time.time()
         r = 2 if level == 'pair' else 3
         covered = set()
         selected = []
+        selected_mains = set()
+        used_indices = set()
+
         for _ in range(n_select):
-            best_idx = -1
-            best_new = -1
-            for i, c in enumerate(candidates):
-                if c in selected:
+            best_idx, best_gain = -1, -1
+            for i, c in enumerate(working):
+                if i in used_indices:
                     continue
-                groups = set(combinations(sorted(c[0]), r))
-                new_groups = len(groups - covered)
-                if new_groups > best_new:
-                    best_new = new_groups
+                main_key = tuple(sorted(c[0]))
+                if main_key in selected_mains:
+                    continue
+                groups = set(combinations(main_key, r))
+                new = len(groups - covered)
+                if new > best_gain:
+                    best_gain = new
                     best_idx = i
             if best_idx == -1:
                 break
-            selected.append(candidates[best_idx])
-            covered.update(combinations(sorted(candidates[best_idx][0]), r))
+            selected.append(working[best_idx])
+            selected_mains.add(tuple(sorted(working[best_idx][0])))
+            covered.update(combinations(sorted(working[best_idx][0]), r))
+            used_indices.add(best_idx)
+
+        print(f"   Seleção: {time.time()-t0:.2f}s")
+        if len(selected) < n_select:
+            print(f"   ⚠️ Covering retornou {len(selected)}/{n_select} "
+                  f"(mains distintos insuficientes)")
         return selected
 
-    def optimize(self, n_games=5, n_candidates=50000, method='pair_covering'):
-        print(f"\n🧩 CARTEIRA: {n_games} jogos | método: {method}")
-        if self.fixed: print(f"   Fixas: {self.fixed}")
-        if self.semifixed: print(f"   Semifixas: {self.semifixed} (mín={self.min_semifixed}, máx={self.max_semifixed})")
-        if self.excluded: print(f"   Excluídas: {self.excluded}")
-        if self.range_pares: print(f"   Pares: {self.range_pares}")
-        if self.range_moldura: print(f"   Borda: {self.range_moldura}")
-        if self.range_primos: print(f"   Primos: {self.range_primos}")
-        if self.range_soma: print(f"   Soma: {self.range_soma}")
-        if self.range_amplitude: print(f"   Amplitude: {self.range_amplitude}")
-        if self.range_consecutivos: print(f"   Consecutivos: {self.range_consecutivos}")
+    def coverage_stats(self, portfolio):
+        pairs, triples = set(), set()
+        for main, _ in portfolio:
+            m = sorted(main)
+            for i in range(len(m)):
+                for j in range(i + 1, len(m)):
+                    pairs.add((m[i], m[j]))
+                    for k in range(j + 1, len(m)):
+                        triples.add((m[i], m[j], m[k]))
+        return {
+            'n_pairs': len(pairs), 'total_pairs': comb(TOTAL_MAIN, 2),
+            'n_triples': len(triples), 'total_triples': comb(TOTAL_MAIN, 3),
+        }
+
+    def optimize(self, n_games=5, n_candidates=50000, method='pair_covering',
+                 exact_universe=False, seed=None):
+        print(f"\n🧩 CARTEIRA: {n_games} jogos | {method} | pool={n_candidates:,}")
+        print(f"   Modo: {'ENUMERAÇÃO EXATA' if exact_universe else 'TENTATIVAS'}")
+        if self.fixed:     print(f"   Fixas: {self.fixed}")
+        if self.semifixed: print(f"   Semifixas: {self.semifixed} (min={self.min_semifixed}, max={self.max_semifixed})")
+        if self.excluded:  print(f"   Excluídas: {self.excluded}")
 
         t0 = time.time()
-        pool = self.generate_pool(n_candidates)
-        print(f"   Pool: {len(pool)} jogos")
+        if exact_universe:
+            pool, stats = self.enumerate_and_sample(n_candidates, seed=seed)
+            if not pool:
+                raise RuntimeError(f"Enumeração falhou: {stats}")
+
+            print(f"\n📊 UNIVERSO E POOL")
+            print(f"   Bruto mains:                       {stats['universe_main_raw']:>18,}")
+            print(f"   Efetivas mains (fixas/excl):       {stats['universe_main_eff']:>18,}")
+            print(f"   Efetivas mains (c/ semifixas):     {stats['universe_main_semi']:>18,}")
+            print(f"   Efetivas (main, trevo):            {stats['universe_pairs_semi']:>18,}")
+            print(f"   Válidas mains (pós-filtros):       {stats['n_valid_main']:>18,}")
+            print(f"   Válidas (main, trevo):             {stats['n_valid']:>18,}")
+            print(f"   Pool solicitado / obtido:          {stats['requested']:>18,} / {stats['obtained']:,}")
+            print(f"   Cobertura sobre válidos:           {stats['coverage_sample_over_valid']*100:.2f}%")
+
+            print(f"\n📊 REJEIÇÕES (ordem de avaliação; cada main creditado só ao 1º filtro)")
+            total_rej = sum(stats['rejections'].values())
+            for k, v in stats['rejections'].items():
+                if v > 0: print(f"   {k:<18} {v:>18,}")
+            print(f"   {'Total rejeitado':<18} {total_rej:>18,}")
+            print(f"   {'Aprovado':<18} {stats['n_valid_main']:>18,} mains "
+                  f"(× {stats['n_trevo_combos']} trevos = {stats['n_valid']:,} pares)")
+        else:
+            pool = self.generate_pool(n_candidates)
+            print(f"   Pool: {len(pool)} jogos")
+
         if len(pool) < n_games:
             raise RuntimeError(f"Pool insuficiente: {len(pool)} < {n_games}.")
 
@@ -322,39 +579,88 @@ class PortfolioOptimizer:
         else:
             portfolio = pool[:n_games]
 
+        cov = self.coverage_stats(portfolio)
+        print(f"   Cobertura: {cov['n_pairs']}/{cov['total_pairs']} pares, "
+              f"{cov['n_triples']}/{cov['total_triples']} trincas")
         print(f"✅ {len(portfolio)} jogos em {time.time()-t0:.1f}s")
         return portfolio
 
+    def _estimate_p_draw_mc(self, portfolio, n_sim=10000, seed=42):
+        """P(≥1 jogo premiado em um sorteio) via MC usando a carteira real."""
+        rng = np.random.default_rng(seed)
+        pm_list = [set(m) for m, _ in portfolio]
+        pt_list = [set(t) for _, t in portfolio]
+        wins = 0
+        for _ in range(n_sim):
+            main = set(int(x) for x in rng.choice(np.arange(1, TOTAL_MAIN+1), CHOOSE_MAIN, replace=False))
+            trevo = set(int(x) for x in rng.choice(np.arange(1, TOTAL_TREVO+1), CHOOSE_TREVO, replace=False))
+            for pm, pt in zip(pm_list, pt_list):
+                if (len(pm & main), len(pt & trevo)) in FAIXAS_PREMIADAS_SET:
+                    wins += 1
+                    break
+        return wins / n_sim
+
     def backtest(self, portfolio, test_draws):
-        n_success = total_premio = 0
-        total_custo = len(portfolio) * len(test_draws) * CUSTO_APOSTA
+        """
+        Backtest corrigido: separa métricas por aposta (p_bet) e por concurso (p_draw).
+        Lift usa p_draw vs MC teórico (captura dependência entre jogos da carteira).
+        A fórmula de independência é reportada apenas como REFERÊNCIA.
+        Prêmios: só os fixos (R$ 50/24/12/6). Variáveis NÃO fabricados.
+        """
+        bets_won = 0
+        draws_with_win = 0
+        total_premio_fixo = 0.0
+        premio_variavel_count = 0
         hit_counts = defaultdict(int)
 
         for draw in test_draws:
-            draw_main = set(draw['dezenas'])
-            draw_trevo = set(draw['trevos'])
+            dm = set(draw['dezenas']); dt = set(draw['trevos'])
+            draw_had_win = False
             for main, trevo in portfolio:
-                main_hits = len(draw_main & set(main))
-                trevo_hits = len(draw_trevo & set(trevo))
-                premio = PREMIO_VALORES.get((main_hits, trevo_hits), 0.0)
-                if premio > 0:
-                    n_success += 1
-                    total_premio += premio
-                    hit_counts[(main_hits, trevo_hits)] += 1
+                mh = len(dm & set(main))
+                th = len(dt & set(trevo))
+                key = (mh, th)
+                if key in FAIXAS_PREMIADAS_SET:
+                    bets_won += 1
+                    hit_counts[key] += 1
+                    draw_had_win = True
+                    v = FAIXAS_PREMIADAS[key]
+                    if v is not None:
+                        total_premio_fixo += v
+                    else:
+                        premio_variavel_count += 1
+            if draw_had_win:
+                draws_with_win += 1
 
-        prob = n_success / (len(portfolio) * len(test_draws)) if test_draws else 0
-        p_single = 0.0
-        for (m,t), _ in PREMIO_VALORES.items():
-            p_single += HYPE_PROBS_MAIN[m] * HYPE_PROBS_TREVO[t]
-        theo_prob = 1 - (1 - p_single)**len(portfolio)
+        n_bets_total = len(portfolio) * len(test_draws) if test_draws else 0
+        p_bet_emp = bets_won / n_bets_total if n_bets_total else 0.0
+        p_draw_emp = draws_with_win / len(test_draws) if test_draws else 0.0
+        p_draw_mc = self._estimate_p_draw_mc(portfolio, n_sim=10000, seed=42)
+        p_draw_indep = 1 - (1 - P_BET_WIN_THEORETICAL) ** len(portfolio)
+        custo_total = n_bets_total * CUSTO_APOSTA
 
         return {
-            'empirical': prob, 'theoretical': theo_prob,
-            'lift': prob / theo_prob if theo_prob > 0 else 1.0,
-            'n_test': len(test_draws), 'n_success': n_success,
-            'total_premio': total_premio, 'total_custo': total_custo,
-            'roi': (total_premio - total_custo) / total_custo * 100 if total_custo > 0 else 0,
-            'hit_distribution': dict(hit_counts)
+            # Por aposta
+            'p_bet_empirical': p_bet_emp,
+            'p_bet_theoretical': P_BET_WIN_THEORETICAL,
+            'lift_bet': p_bet_emp / P_BET_WIN_THEORETICAL if P_BET_WIN_THEORETICAL > 0 else 1.0,
+            'bets_won': bets_won,
+            # Por concurso
+            'p_draw_empirical': p_draw_emp,
+            'p_draw_theoretical_mc': p_draw_mc,
+            'p_draw_indep_reference': p_draw_indep,  # só referência
+            'lift_draw': p_draw_emp / p_draw_mc if p_draw_mc > 0 else 1.0,
+            'draws_with_win': draws_with_win,
+            # Totais
+            'n_test': len(test_draws),
+            'n_bets_total': n_bets_total,
+            'custo_total': custo_total,
+            'premio_fixo_total': total_premio_fixo,
+            'premio_variavel_count': premio_variavel_count,
+            'roi_fixo_apenas': (
+                (total_premio_fixo - custo_total) / custo_total * 100 if custo_total > 0 else 0.0
+            ),
+            'hit_distribution': dict(hit_counts),
         }
 
 # ============================================================
@@ -362,210 +668,154 @@ class PortfolioOptimizer:
 # ============================================================
 def extract_filter(dezenas, filter_name):
     d = sorted(dezenas)
-    if filter_name == 'pares':
-        return sum(1 for x in d if x % 2 == 0)
-    elif filter_name == 'moldura':
-        return sum(1 for x in d if x in MOLDURA)
-    elif filter_name == 'primos':
-        return sum(1 for x in d if x in PRIMES)
-    elif filter_name == 'soma':
-        return sum(d)
-    elif filter_name == 'consecutivos':
-        return sum(1 for i in range(len(d)-1) if d[i+1]-d[i] == 1)
-    elif filter_name == 'amplitude':
-        return max(d) - min(d)
+    if filter_name == 'pares': return sum(1 for x in d if x % 2 == 0)
+    if filter_name == 'moldura': return sum(1 for x in d if x in MOLDURA)
+    if filter_name == 'primos': return sum(1 for x in d if x in PRIMES)
+    if filter_name == 'soma': return sum(d)
+    if filter_name == 'consecutivos': return sum(1 for i in range(len(d)-1) if d[i+1]-d[i] == 1)
+    if filter_name == 'amplitude': return max(d) - min(d)
     return 0
 
 # ============================================================
-# RANKING PREDITIVO
+# RANKING PREDITIVO (com block permutation opcional)
 # ============================================================
 class PredictiveRanking:
     def __init__(self, contests):
         self.contests = contests
 
-    def rank_predictive_power(self, block_sizes=None, verbose=True):
-        if block_sizes is None:
-            block_sizes = [50, 100, 200, 500]
+    def _accuracy(self, series, block_size, strategy):
+        n_blocos = len(series) // block_size
+        if n_blocos < 3:
+            return None, 0
+        blocos = [series[i*block_size:(i+1)*block_size] for i in range(n_blocos)]
+        ac = tot = 0
+        for i in range(2, len(blocos)):
+            mp = np.mean(blocos[i-1]); mc = np.mean(blocos[i])
+            mh = np.mean(series[:(i-1)*block_size]) if (i-1)*block_size > 0 else mp
+            tot += 1
+            if strategy == 'reversao':
+                d = mp > mh
+                if (d and mc < mp) or (not d and mc > mp): ac += 1
+            else:
+                if (mp > mh and mc > mp) or (mp < mh and mc < mp): ac += 1
+        return (ac / tot * 100 if tot else 0.0), tot, ac
+
+    def _block_permutation(self, series, block_size, strategy, n_perm=200, seed=42):
+        rng = np.random.default_rng(seed)
+        n_blocos = len(series) // block_size
+        if n_blocos < 3:
+            return None
+        blocks = [series[i*block_size:(i+1)*block_size].copy() for i in range(n_blocos)]
+
+        obs_acc, _, _ = self._accuracy(series, block_size, strategy)
+        perm_accs = []
+        for _ in range(n_perm):
+            idx = rng.permutation(n_blocos)
+            perm_series = np.concatenate([blocks[i] for i in idx])
+            a, _, _ = self._accuracy(perm_series, block_size, strategy)
+            perm_accs.append(a)
+        perm_accs = np.array(perm_accs)
+        p = (1 + np.sum(perm_accs >= obs_acc)) / (n_perm + 1)
+        return p
+
+    def rank_predictive_power(self, block_sizes=None, verbose=True, block_permutations=0):
+        if block_sizes is None: block_sizes = [50, 100, 200, 500]
         filters = ['pares', 'moldura', 'primos', 'consecutivos', 'amplitude']
-        all_results = {}
-
-        for block_size in block_sizes:
+        out = {}
+        for bs in block_sizes:
             if verbose:
-                print(f"\n📊 BLOCOS DE {block_size} CONCURSOS")
-                print(f"{'Filtro':<15} {'Estratégia':<12} {'Precisão':<10} {'Acertos':<10} {'p-value':<10}")
-                print("-" * 60)
-
-            for filtro in filters:
-                series = np.array([extract_filter(c['dezenas'], filtro) for c in self.contests], dtype=float)
-                n_blocos = len(series) // block_size
-                if n_blocos < 3:
-                    continue
-                blocos = [series[i*block_size:(i+1)*block_size] for i in range(n_blocos)]
-
-                for strategy in ['reversao', 'tendencia']:
-                    acertos = 0
-                    total_testes = 0
-                    for i in range(2, len(blocos)):
-                        mean_prev = np.mean(blocos[i-1])
-                        mean_curr = np.mean(blocos[i])
-                        historical_mean = np.mean(series[:(i-1)*block_size]) if (i-1)*block_size > 0 else mean_prev
-                        total_testes += 1
-                        if strategy == 'reversao':
-                            predicted_down = mean_prev > historical_mean
-                            if predicted_down and mean_curr < mean_prev:
-                                acertos += 1
-                            elif not predicted_down and mean_curr > mean_prev:
-                                acertos += 1
-                        else:
-                            if mean_prev > historical_mean and mean_curr > mean_prev:
-                                acertos += 1
-                            elif mean_prev < historical_mean and mean_curr < mean_prev:
-                                acertos += 1
-
-                    accuracy = acertos / total_testes * 100 if total_testes > 0 else 0
-                    p_value = binomtest(acertos, total_testes, 0.5, alternative='greater').pvalue if total_testes > 0 else 1.0
-                    all_results[(filtro, strategy, block_size)] = {
-                        'accuracy': accuracy, 'acertos': acertos, 'total': total_testes, 'p_value': p_value
-                    }
+                print(f"\n📊 BLOCOS DE {bs} CONCURSOS")
+                hdr = f"{'Filtro':<15} {'Estrat':<10} {'Prec':<8} {'Acertos':<10} {'p_binom':<10}"
+                if block_permutations > 0: hdr += f" {'p_perm':<10}"
+                print(hdr)
+                print("-" * len(hdr))
+            for f in filters:
+                series = np.array([extract_filter(c['dezenas'], f) for c in self.contests], dtype=float)
+                for strat in ['reversao', 'tendencia']:
+                    acc, tot, ac = self._accuracy(series, bs, strat)
+                    if acc is None: continue
+                    p = binomtest(ac, tot, 0.5, alternative='greater').pvalue if tot else 1.0
+                    entry = {'accuracy': acc, 'acertos': ac, 'total': tot, 'p_value': p}
+                    if block_permutations > 0:
+                        p_perm = self._block_permutation(series, bs, strat, n_perm=block_permutations)
+                        entry['p_permutation'] = p_perm
+                    out[(f, strat, bs)] = entry
                     if verbose:
-                        sig = "🔍" if p_value < 0.05 else ("📊" if p_value < 0.15 else "  ")
-                        print(f"{filtro:<15} {strategy:<12} {accuracy:<10.1f}% {acertos}/{total_testes:<10} {p_value:<10.4f} {sig}")
-
-        return all_results
+                        sig = "🔍" if p < 0.05 else ("📊" if p < 0.15 else "  ")
+                        line = f"{f:<15} {strat:<10} {acc:<8.1f} {ac}/{tot:<8} {p:<10.4f}{sig}"
+                        if block_permutations > 0:
+                            line += f" {p_perm:<10.4f}"
+                        print(line)
+        return out
 
     def rank_dezenas_individual(self, block_sizes=None):
-        if block_sizes is None:
-            block_sizes = [100, 200, 500]
+        if block_sizes is None: block_sizes = [100, 200, 500]
         print(f"\n📊 PODER PREDITIVO DAS {TOTAL_MAIN} DEZENAS")
-        for block_size in block_sizes:
-            accuracies = []
-            for dezena in range(1, TOTAL_MAIN + 1):
-                series = np.array([1 if dezena in c['dezenas'] else 0 for c in self.contests], dtype=float)
-                n_blocos = len(series) // block_size
-                if n_blocos < 3:
-                    continue
-                blocos = [series[i*block_size:(i+1)*block_size] for i in range(n_blocos)]
-                acertos = 0
-                total = 0
-                for i in range(2, len(blocos)):
-                    freq_prev = np.mean(blocos[i-1])
-                    freq_curr = np.mean(blocos[i])
-                    freq_hist = np.mean(series[:(i-1)*block_size]) if (i-1)*block_size > 0 else freq_prev
-                    total += 1
-                    if freq_prev > freq_hist and freq_curr < freq_prev:
-                        acertos += 1
-                    elif freq_prev < freq_hist and freq_curr > freq_prev:
-                        acertos += 1
-                if total > 0:
-                    accuracies.append(acertos / total * 100)
-            if accuracies:
-                print(f"\n   Bloco {block_size}: média={np.mean(accuracies):.1f}%, "
-                      f"melhor={np.argmax(accuracies)+1} ({max(accuracies):.1f}%), "
-                      f"pior={np.argmin(accuracies)+1} ({min(accuracies):.1f}%)")
-        return None
+        for bs in block_sizes:
+            accs = []
+            for dz in range(1, TOTAL_MAIN + 1):
+                series = np.array([1 if dz in c['dezenas'] else 0 for c in self.contests], dtype=float)
+                acc, tot, _ = self._accuracy(series, bs, 'reversao')
+                if acc is not None: accs.append(acc)
+            if accs:
+                print(f"   Bloco {bs}: média={np.mean(accs):.1f}%, "
+                      f"max={max(accs):.1f}%, min={min(accs):.1f}%")
 
 # ============================================================
-# MONTE CARLO FWER
+# MC FWER (+1 corrigido)
 # ============================================================
 def monte_carlo_control(contests, n_simulations=1000, block_sizes=None):
-    if block_sizes is None:
-        block_sizes = [50, 100, 200]
+    if block_sizes is None: block_sizes = [50, 100, 200]
     n_concursos = len(contests)
     print(f"\n🎲 CONTROLE MONTE CARLO (FWER corrigido)")
-    print(f"   Simulações: {n_simulations}")
-    print(f"   Blocos testados: {block_sizes}\n")
-
     ranker_real = PredictiveRanking(contests)
     real_results = ranker_real.rank_predictive_power(block_sizes, verbose=False)
-    real_max_acc = max(res['accuracy'] for res in real_results.values())
-    real_max_key = max(real_results, key=lambda k: real_results[k]['accuracy'])
+    real_max = max(r['accuracy'] for r in real_results.values())
+    real_key = max(real_results, key=lambda k: real_results[k]['accuracy'])
 
-    sim_max_accs = []
-    sim_accuracies_by_key = defaultdict(list)
+    sim_max = []
+    sim_by = defaultdict(list)
+    for _ in tqdm(range(n_simulations), desc="MC"):
+        sim = [{
+            'dezenas': sorted(np.random.choice(range(1, TOTAL_MAIN+1), CHOOSE_MAIN, replace=False)),
+            'trevos':  sorted(np.random.choice(range(1, TOTAL_TREVO+1), CHOOSE_TREVO, replace=False)),
+        } for _ in range(n_concursos)]
+        res = PredictiveRanking(sim).rank_predictive_power(block_sizes, verbose=False)
+        sim_max.append(max(r['accuracy'] for r in res.values()))
+        for k, v in res.items():
+            sim_by[k].append(v['accuracy'])
 
-    for _ in tqdm(range(n_simulations), desc="Simulações Monte Carlo"):
-        sim_contests = []
-        for _ in range(n_concursos):
-            main = sorted(np.random.choice(range(1, TOTAL_MAIN + 1), CHOOSE_MAIN, replace=False))
-            trevos = sorted(np.random.choice(range(1, TOTAL_TREVO + 1), CHOOSE_TREVO, replace=False))
-            sim_contests.append({'dezenas': main, 'trevos': trevos})
-        ranker_sim = PredictiveRanking(sim_contests)
-        sim_results = ranker_sim.rank_predictive_power(block_sizes, verbose=False)
-        sim_max = max(res['accuracy'] for res in sim_results.values())
-        sim_max_accs.append(sim_max)
-        for key, res in sim_results.items():
-            sim_accuracies_by_key[key].append(res['accuracy'])
+    # CORRIGIDO: +1 para evitar p=0
+    p_global = (1 + float(np.sum(np.array(sim_max) >= real_max))) / (n_simulations + 1)
 
-    p_global = np.mean(np.array(sim_max_accs) >= real_max_acc)
-    p_global_str = f"<{1.0/n_simulations:.4f}" if p_global == 0.0 else f"{p_global:.4f}"
-
-    print(f"\n📊 COMPARAÇÃO REAL vs. MONTE CARLO")
-    print(f"{'Filtro':<15} {'Estratégia':<12} {'Bloco':<8} {'Real':<10} {'MC Médio':<10} {'MC Std':<10} {'Diferença':<10} {'p (MC)':<10}")
-    print("-" * 90)
-
-    for key, res_dict in sorted(real_results.items(), key=lambda x: x[1]['accuracy'], reverse=True):
-        filtro, strategy, block_size = key
-        real_acc = res_dict['accuracy']
-        sim_accs = sim_accuracies_by_key.get(key, [])
-        if not sim_accs:
-            continue
-        mean_sim = np.mean(sim_accs)
-        std_sim = np.std(sim_accs)
-        diff = real_acc - mean_sim
-        p_emp = np.mean(np.array(sim_accs) >= real_acc)
-        p_emp_str = f"<{1.0/len(sim_accs):.4f}" if p_emp == 0.0 else f"{p_emp:.4f}"
-        marker = " 🏆" if key == real_max_key else ""
-        print(f"{filtro:<15} {strategy:<12} {block_size:<8} {real_acc:<10.1f}% {mean_sim:<10.1f}% {std_sim:<10.1f} {diff:<10.1f}% {p_emp_str:<10}{marker}")
-
-    print(f"\n🌟 Melhor resultado real: {real_max_key} com acurácia de {real_max_acc:.1f}%")
-    print(f"   p‑global (FWER corrigido): {p_global_str}")
-    if p_global < 0.05:
-        print("   ✅ Evidência de sinal preditivo genuíno (p < 0.05)")
-    else:
-        print("   ❌ Sem evidência significativa — compatível com aleatoriedade")
-
-    return real_results, sim_accuracies_by_key
+    print(f"\n🌟 Melhor real: {real_key} = {real_max:.1f}%")
+    print(f"   p-global (+1): {p_global:.4f} {'🔍' if p_global < 0.05 else '❌'}")
+    print(f"\n⚠️ O MC testa ausência de estrutura temporal — NÃO demonstra ganho preditivo.")
+    return real_results, sim_by
 
 # ============================================================
 # TESTE CONCURSO A CONCURSO
 # ============================================================
 def test_concurso_a_concurso(contests, min_history=200):
-    print(f"\n🎯 TESTE CONCURSO A CONCURSO")
-    print(f"   Histórico mínimo: {min_history}")
-    filters = ['pares', 'moldura', 'primos', 'consecutivos', 'amplitude']
-
-    for filtro in filters:
-        series = np.array([extract_filter(c['dezenas'], filtro) for c in contests], dtype=float)
-        acertos_reversao = acertos_tendencia = total = 0
-
+    print(f"\n🎯 TESTE CONCURSO A CONCURSO (histórico mínimo={min_history})")
+    for f in ['pares', 'moldura', 'primos', 'consecutivos', 'amplitude']:
+        series = np.array([extract_filter(c['dezenas'], f) for c in contests], dtype=float)
+        ac_r = ac_t = tot = 0
         for t in range(min_history, len(contests) - 1):
-            current_val = series[t]
-            next_val = series[t+1]
-            history = series[:t]
-            if len(history) < 20:
-                continue
-            mean_short = np.mean(history[-20:])
-            mean_long = np.mean(history)
-            total += 1
-            pred_rev_down = mean_short > mean_long
-            if pred_rev_down and next_val < current_val:
-                acertos_reversao += 1
-            elif not pred_rev_down and next_val > current_val:
-                acertos_reversao += 1
-            if mean_short > mean_long and next_val > current_val:
-                acertos_tendencia += 1
-            elif mean_short < mean_long and next_val < current_val:
-                acertos_tendencia += 1
-
-        acc_rev = acertos_reversao / total * 100 if total > 0 else 0
-        acc_tend = acertos_tendencia / total * 100 if total > 0 else 0
-        p_rev = binomtest(acertos_reversao, total, 0.5, alternative='greater').pvalue if total > 0 else 1.0
-        p_tend = binomtest(acertos_tendencia, total, 0.5, alternative='greater').pvalue if total > 0 else 1.0
-        print(f"{filtro:<15}: Reversão={acc_rev:.1f}% ({acertos_reversao}/{total}, p={p_rev:.4f}) | "
-              f"Tendência={acc_tend:.1f}% ({acertos_tendencia}/{total}, p={p_tend:.4f})")
+            hist = series[:t]
+            if len(hist) < 20: continue
+            ms, ml = np.mean(hist[-20:]), np.mean(hist)
+            tot += 1
+            cur, nxt = series[t], series[t+1]
+            d = ms > ml
+            if (d and nxt < cur) or (not d and nxt > cur): ac_r += 1
+            if (ms > ml and nxt > cur) or (ms < ml and nxt < cur): ac_t += 1
+        if tot:
+            print(f"{f:<15}: Rev={ac_r/tot*100:.1f}% ({ac_r}/{tot}) | "
+                  f"Tend={ac_t/tot*100:.1f}% ({ac_t}/{tot})")
 
 # ============================================================
-# STRUCTURAL PREDICTOR
+# STRUCTURAL PREDICTOR (IPE clamp)
 # ============================================================
 class StructuralPredictor:
     def __init__(self, contests):
@@ -573,55 +823,45 @@ class StructuralPredictor:
 
     def predict_ranges(self, method='recent'):
         print(f"\n🔮 STRUCTURAL PREDICTOR (método: {method})")
-        filters_info = {
-            'pares': {'min': 0, 'max': 6},
-            'moldura': {'min': 0, 'max': 6},
-            'primos': {'min': 0, 'max': 6},
-            'soma': {'min': 21, 'max': 285},
-            'amplitude': {'min': 5, 'max': 49},
-            'consecutivos': {'min': 0, 'max': 5}
+        info = {
+            'pares': {'min': 0, 'max': 6}, 'moldura': {'min': 0, 'max': 6},
+            'primos': {'min': 0, 'max': 6}, 'soma': {'min': 21, 'max': 285},
+            'amplitude': {'min': 5, 'max': 49}, 'consecutivos': {'min': 0, 'max': 5},
         }
-        ranges = {}
-        for filtro, info in filters_info.items():
-            series = np.array([extract_filter(c['dezenas'], filtro) for c in self.contests], dtype=float)
+        r = {}
+        for f, i in info.items():
+            s = np.array([extract_filter(c['dezenas'], f) for c in self.contests], dtype=float)
             if method == 'recent':
-                recent = series[-50:]
-                mean_val = np.mean(recent)
-                low = max(info['min'], int(np.percentile(recent, 35)))
-                high = min(info['max'], int(np.percentile(recent, 65)))
-                ranges[filtro] = (low, high)
-                print(f"   {filtro:<15}: [{low}, {high}] (média={mean_val:.1f})")
-            elif method == 'ipe':
-                freq_short = np.mean(series[-20:])
-                freq_long = np.mean(series[-500:]) if len(series) >= 500 else np.mean(series)
-                ipe = (freq_short - freq_long) / freq_long * 100 if freq_long > 0 else 0.0
-                if ipe > 5:
-                    predicted = max(info['min'], int(freq_long))
-                    ranges[filtro] = (predicted - 1, predicted + 1)
-                elif ipe < -5:
-                    predicted = min(info['max'], int(freq_long) + 1)
-                    ranges[filtro] = (predicted - 1, predicted + 1)
-                else:
-                    ranges[filtro] = (int(freq_long) - 1, int(freq_long) + 1)
-                print(f"   {filtro:<15}: {ranges[filtro]} (IPE={ipe:+.1f}%)")
-        return ranges
+                rc = s[-50:]
+                lo = max(i['min'], int(np.percentile(rc, 35)))
+                hi = min(i['max'], int(np.percentile(rc, 65)))
+                r[f] = (lo, hi); print(f"   {f:<15}: [{lo}, {hi}]")
+            else:
+                fs = np.mean(s[-20:]); fl = np.mean(s[-500:]) if len(s) >= 500 else np.mean(s)
+                ipe = (fs - fl) / fl * 100 if fl > 0 else 0
+                pred = int(fl)
+                if ipe > 5:   pred = max(i['min'], pred)
+                elif ipe < -5: pred = min(i['max'], pred + 1)
+                # CLAMP aos limites
+                lo = max(i['min'], pred - 1)
+                hi = min(i['max'], pred + 1)
+                if lo > hi: lo, hi = i['min'], i['max']
+                r[f] = (lo, hi); print(f"   {f:<15}: [{lo}, {hi}] (IPE={ipe:+.1f}%)")
+        return r
 
 # ============================================================
-# WALK-FORWARD STRUCTURAL
+# WALK-FORWARD
 # ============================================================
 def walk_forward_structural(contests, train_size=500, test_size=50, step=50, excluded=None):
-    print(f"\n🔬 WALK‑FORWARD DO STRUCTURAL PREDICTOR")
-    print(f"   Treino: {train_size}, Teste: {test_size}, Passo: {step}")
-    if excluded:
-        print(f"   Excluídas: {excluded}")
+    print(f"\n🔬 WALK-FORWARD ESTRUTURAL")
+    print(f"   Treino={train_size} Teste={test_size} Passo={step}")
     results = []
     start = train_size
     while start + test_size <= len(contests):
-        train_data = contests[start-train_size:start]
-        test_data = contests[start:start+test_size]
-        predictor = StructuralPredictor(train_data)
-        ranges = predictor.predict_ranges(method='recent')
-        opt = PortfolioOptimizer(train_data, excluded=excluded,
+        train = contests[start-train_size:start]
+        test = contests[start:start+test_size]
+        ranges = StructuralPredictor(train).predict_ranges(method='recent')
+        opt = PortfolioOptimizer(train, excluded=excluded,
                                  range_pares=ranges.get('pares'),
                                  range_moldura=ranges.get('moldura'),
                                  range_primos=ranges.get('primos'),
@@ -629,248 +869,139 @@ def walk_forward_structural(contests, train_size=500, test_size=50, step=50, exc
                                  range_amplitude=ranges.get('amplitude'),
                                  range_consecutivos=ranges.get('consecutivos'))
         try:
-            portfolio = opt.optimize(5, 10000, method='pair_covering')
-            bt = opt.backtest(portfolio, test_data)
-            results.append({'start': start, 'lift': bt['lift'], 'roi': bt['roi'],
-                            'premios': sum(bt['hit_distribution'].values())})
-            print(f"   Janela {start}: lift={bt['lift']:.3f} | ROI={bt['roi']:+.1f}% | "
-                  f"Prêmios={sum(bt['hit_distribution'].values())}")
+            p = opt.optimize(5, 10000, method='pair_covering')
+            bt = opt.backtest(p, test)
+            results.append({'start': start, 'lift_draw': bt['lift_draw'], 'roi_fixo': bt['roi_fixo_apenas'],
+                            'draws_with_win': bt['draws_with_win']})
+            print(f"   Janela {start}: lift_draw={bt['lift_draw']:.3f} | "
+                  f"ROI_fixo={bt['roi_fixo_apenas']:+.1f}% | "
+                  f"concursos c/ prêmio={bt['draws_with_win']}/{bt['n_test']}")
         except Exception as e:
-            print(f"   Janela {start}: ERRO - {e}")
+            print(f"   Janela {start}: ERRO — {e}")
         start += step
     if results:
         print(f"\n📊 RESUMO:")
-        print(f"   Média lift: {np.mean([r['lift'] for r in results]):.3f}")
-        print(f"   Média ROI: {np.mean([r['roi'] for r in results]):.1f}%")
-        print(f"   Total de prêmios: {sum(r['premios'] for r in results)}")
+        print(f"   Média lift_draw: {np.mean([r['lift_draw'] for r in results]):.3f}")
+        print(f"   Média ROI_fixo:  {np.mean([r['roi_fixo'] for r in results]):+.1f}%")
     return results
 
 # ============================================================
-# BUSCA OOS E COMPARAÇÕES
+# BUSCA OOS E TRINCAS
 # ============================================================
-def search_best_fixed_oos(contests, n_fixed=3, top_n=20, train_size=3500, n_games=5, n_candidates=10000, method='pair_covering', excluded=None):
-    print(f"\n🔎 BUSCANDO MELHORES {n_fixed} FIXAS (OUT-OF-SAMPLE)")
-    if excluded:
-        print(f"   Excluídas: {excluded}")
-    train_data = contests[:train_size]
-    test_data = contests[train_size:]
+def search_best_fixed_oos(contests, n_fixed=3, top_n=20, train_size=3500,
+                          n_games=5, n_candidates=10000, method='pair_covering', excluded=None):
+    print(f"\n🔎 MELHORES {n_fixed} FIXAS (OUT-OF-SAMPLE)")
+    train = contests[:train_size]; test = contests[train_size:]
     candidates = []
-    for fixed_tuple in tqdm(combinations(range(1, TOTAL_MAIN + 1), n_fixed), desc="Filtrando"):
-        if excluded and any(x in fixed_tuple for x in excluded):
-            continue
-        fixed_set = set(fixed_tuple)
-        acertos = sum(1 for c in train_data if fixed_set.issubset(set(c['dezenas'])))
-        freq = acertos / len(train_data)
-        if freq >= 0.001:
-            candidates.append((fixed_tuple, freq, acertos))
+    for ft in tqdm(combinations(range(1, TOTAL_MAIN+1), n_fixed), desc="Treino"):
+        if excluded and any(x in ft for x in excluded): continue
+        fset = set(ft)
+        ac = sum(1 for c in train if fset.issubset(set(c['dezenas'])))
+        freq = ac / len(train)
+        if freq >= 0.001: candidates.append((ft, freq))
     candidates.sort(key=lambda x: x[1], reverse=True)
+
     results = []
-    for fixed_tuple, freq, acertos in tqdm(candidates[:200], desc="Backtest OOS"):
-        opt = PortfolioOptimizer(train_data, fixed=list(fixed_tuple), excluded=excluded)
+    for ft, freq in tqdm(candidates[:200], desc="Backtest"):
+        opt = PortfolioOptimizer(train, fixed=list(ft), excluded=excluded)
         try:
-            portfolio = opt.optimize(n_games, n_candidates, method=method)
-            bt = opt.backtest(portfolio, test_data)
-            results.append({'fixed': fixed_tuple, 'freq_treino': freq,
-                            'lift': bt['lift'], 'roi': bt['roi'],
-                            'premios': sum(bt['hit_distribution'].values())})
-        except:
-            continue
-    results.sort(key=lambda x: x['roi'], reverse=True)
-    print(f"\n🏆 TOP {top_n} FIXAS POR ROI (OUT-OF-SAMPLE):")
-    for i, res in enumerate(results[:top_n], 1):
-        print(f"{i:<5} {str(res['fixed']):<20} ROI={res['roi']:<10.1f}% Prêmios={res['premios']}")
+            p = opt.optimize(n_games, n_candidates, method=method)
+            bt = opt.backtest(p, test)
+            results.append({'fixed': ft, 'freq': freq,
+                            'lift_draw': bt['lift_draw'], 'roi_fixo': bt['roi_fixo_apenas']})
+        except: continue
+    results.sort(key=lambda x: x['roi_fixo'], reverse=True)
+    print(f"\n🏆 TOP {top_n} FIXAS (ROI fixo OOS):")
+    for i, r in enumerate(results[:top_n], 1):
+        print(f"{i:<5} {str(r['fixed']):<20} ROI_fixo={r['roi_fixo']:+.1f}% lift={r['lift_draw']:.3f}")
     return results
 
-def compare_trincas(contests, trinca1, trinca2, n_games=5, n_candidates=50000, method='pair_covering', excluded=None):
+
+def compare_trincas(contests, t1, t2, n_games=5, n_candidates=50000,
+                    method='pair_covering', excluded=None):
     print(f"\n⚔️ COMPARAÇÃO DE TRINCAS")
-    if excluded:
-        print(f"   Excluídas: {excluded}")
-    for i, trinca in enumerate([trinca1, trinca2], 1):
-        opt = PortfolioOptimizer(contests, fixed=list(trinca), excluded=excluded)
-        portfolio = opt.optimize(n_games, n_candidates, method=method)
-        bt = opt.backtest(portfolio, contests[-200:])
-        print(f"   Trinca {i} ({trinca}): Lift={bt['lift']:.2f}x | ROI={bt['roi']:+.1f}%")
+    for i, t in enumerate([t1, t2], 1):
+        opt = PortfolioOptimizer(contests, fixed=list(t), excluded=excluded)
+        p = opt.optimize(n_games, n_candidates, method=method)
+        bt = opt.backtest(p, contests[-200:])
+        print(f"   Trinca {i} ({t}): lift_draw={bt['lift_draw']:.3f} | "
+              f"ROI_fixo={bt['roi_fixo_apenas']:+.1f}% | "
+              f"concursos c/ prêmio={bt['draws_with_win']}/{bt['n_test']}")
 
 # ============================================================
-# OPÇÃO 13 – AUDITORIA DO FATOR DE ESCALA (v1.3)
-#   F_prev e F_next usam referências DIFERENTES (sem denominador compartilhado).
+# AUDITORIA FATOR DE ESCALA
 # ============================================================
 def audit_scale_factor(contests, window=50):
     sums = np.array([sum(c['dezenas']) for c in contests], dtype=float)
     n = len(sums)
     if n < window + 30:
-        print(f"⚠️  Histórico insuficiente ({n} < {window+30}).")
-        return None
-
+        print(f"⚠️ Histórico insuficiente ({n} < {window+30})."); return None
     F_prev_l, F_next_l, S_prev_l, S_next_l, idx_l = [], [], [], [], []
     for t in range(window + 1, n):
-        ref_prev = float(np.mean(sums[t - window - 1 : t - 1]))
-        ref_next = float(np.mean(sums[t - window     : t    ]))
-        if ref_prev <= 0 or ref_next <= 0:
-            continue
-        F_prev_l.append(sums[t - 1] / ref_prev)
-        F_next_l.append(sums[t]     / ref_next)
-        S_prev_l.append(sums[t - 1])
-        S_next_l.append(sums[t])
-        idx_l.append(t)
-
-    F_prev = np.array(F_prev_l)
-    F_next = np.array(F_next_l)
-    S_prev = np.array(S_prev_l)
-    S_next = np.array(S_next_l)
-    refs_next = np.array([np.mean(sums[t - window:t]) for t in idx_l])
+        ref_prev = float(np.mean(sums[t-window-1:t-1]))
+        ref_next = float(np.mean(sums[t-window:t]))
+        if ref_prev <= 0 or ref_next <= 0: continue
+        F_prev_l.append(sums[t-1]/ref_prev); F_next_l.append(sums[t]/ref_next)
+        S_prev_l.append(sums[t-1]); S_next_l.append(sums[t]); idx_l.append(t)
+    F_prev = np.array(F_prev_l); F_next = np.array(F_next_l)
+    S_prev = np.array(S_prev_l); S_next = np.array(S_next_l)
+    refs_next = np.array([np.mean(sums[t-window:t]) for t in idx_l])
     N = len(F_prev)
-
-    print(f"\n📐 AUDITORIA DO FATOR DE ESCALA (v1.3 — refs independentes)  janela = {window}")
-    print(f"   Observações válidas: {N}")
-    print(f"   F_prev: média={np.mean(F_prev):.4f} | dp={np.std(F_prev):.4f} | "
-          f"min={np.min(F_prev):.4f} | max={np.max(F_prev):.4f}")
-
-    pear  = pearsonr(F_prev, F_next)
-    spear = spearmanr(F_prev, F_next)
-    print(f"\n   Correlação  F_prev  vs  F_next:")
-    print(f"     Pearson   r = {pear.statistic:+.4f}  (p = {pear.pvalue:.4f})")
-    print(f"     Spearman  ρ = {spear.statistic:+.4f}  (p = {spear.pvalue:.4f})")
-
-    above_prev = F_prev > 1
-    above_next = F_next > 1
+    print(f"\n📐 FATOR DE ESCALA  janela = {window}  N = {N}")
+    pear  = pearsonr(F_prev, F_next); spear = spearmanr(F_prev, F_next)
+    print(f"   Pearson r = {pear.statistic:+.4f} (p = {pear.pvalue:.4f})")
+    print(f"   Spearman ρ = {spear.statistic:+.4f} (p = {spear.pvalue:.4f})")
+    above_prev = F_prev > 1; above_next = F_next > 1
     concord = int(np.sum(above_prev == above_next))
-    p_sign  = binomtest(concord, N, 0.5, alternative='two-sided').pvalue
-    print(f"\n   Concordância de estado (F>1 ⇔ próximo F>1):")
-    print(f"     {concord}/{N} = {concord/N*100:.1f}%  (binomial p = {p_sign:.4f})")
-
-    if np.sum(above_prev) > 0:
-        p_below_given_above = float(np.mean(F_next[above_prev] < 1.0))
-        print(f"     P(F_next < 1 | F_prev > 1) = {p_below_given_above:.4f}  (esperado se IID: ~0.5)")
-    if np.sum(~above_prev) > 0:
-        p_above_given_below = float(np.mean(F_next[~above_prev] > 1.0))
-        print(f"     P(F_next > 1 | F_prev < 1) = {p_above_given_below:.4f}  (esperado se IID: ~0.5)")
-
-    print(f"\n   Hipóteses concorrentes:")
+    p_sign = binomtest(concord, N, 0.5, alternative='two-sided').pvalue
+    print(f"   Concordância estado: {concord}/{N} = {concord/N*100:.1f}% (p = {p_sign:.4f})")
     if pear.pvalue < 0.05 and pear.statistic > 0:
-        print(f"     ✅ H1 PERSISTÊNCIA (r = {pear.statistic:+.3f}, p = {pear.pvalue:.4f})")
+        print(f"   ✅ H1 PERSISTÊNCIA")
     elif pear.pvalue < 0.05 and pear.statistic < 0:
-        print(f"     ✅ H2 REVERSÃO       (r = {pear.statistic:+.3f}, p = {pear.pvalue:.4f})")
+        print(f"   ✅ H2 REVERSÃO")
     else:
-        print(f"     ⚪ H3 INDEPENDÊNCIA não rejeitada (p = {pear.pvalue:.4f})")
-
-    pred_mean_hist = np.array([np.mean(sums[:t]) for t in idx_l])
-    pred_mean_mov  = refs_next.copy()
-    pred_median    = np.array([np.median(sums[t-window:t]) for t in idx_l])
-    pred_last      = S_prev.copy()
-    pred_rev05     = refs_next + 0.5 * (refs_next - S_prev)
-    pred_rev10     = refs_next + 1.0 * (refs_next - S_prev)
-
-    methods = {
-        'Média histórica':      pred_mean_hist,
-        'Média móvel':          pred_mean_mov,
-        'Mediana móvel':        pred_median,
-        'Último valor':         pred_last,
-        'Reversão 0.5 (vs mov)': pred_rev05,
-        'Reversão 1.0 (vs mov)': pred_rev10,
-    }
-
-    print(f"\n   📊 COMPARAÇÃO DE PREDITORES DA SOMA S_t (N = {N}):")
-    print(f"   {'Método':<24} {'MAE':>8} {'RMSE':>8} {'MAPE%':>8} {'Corr':>9}")
-    print("   " + "-" * 62)
-
-    results = {}
-    for name, pred in methods.items():
-        err  = np.abs(pred - S_next)
-        mae  = float(np.mean(err))
-        rmse = float(np.sqrt(np.mean(err ** 2)))
-        mape = float(np.mean(err / S_next) * 100)
-        corr = float(pearsonr(pred, S_next).statistic) if np.std(pred) > 0 else 0.0
-        results[name] = {'err': err, 'mae': mae, 'rmse': rmse, 'mape': mape, 'corr': corr}
-        print(f"   {name:<24} {mae:>8.2f} {rmse:>8.2f} {mape:>8.2f} {corr:>+9.3f}")
-
-    ref_key = 'Último valor'
-    ref_err = results[ref_key]['err']
-    print(f"\n   📊 WILCOXON pareado vs '{ref_key}':")
-    for name, r in results.items():
-        if name == ref_key:
-            continue
-        delta = ref_err - r['err']
-        if np.all(delta == 0):
-            continue
-        try:
-            _stat, p = wilcoxon(delta, alternative='greater')
-            sig = "✅" if p < 0.05 else ("📊" if p < 0.15 else "  ")
-            print(f"     {name:<24} Δmédio = {np.mean(delta):+7.2f}   p = {p:.4f}   {sig}")
-        except Exception as e:
-            print(f"     {name:<24} (erro: {e})")
-
-    return {'F_prev': F_prev, 'F_next': F_next, 'S_next': S_next, 'results': results}
+        print(f"   ⚪ H3 INDEPENDÊNCIA")
+    return {'F_prev': F_prev, 'F_next': F_next}
 
 # ============================================================
-# OPÇÃO 14 – AUDITORIA DO COEFICIENTE DE ESCALA γ  (v1.3 CORRIGIDA)
-#
-# Modelo:  Ŝ_t = R_t + γ·(S_(t-1) − R_t),  R_t = mean(S[t-w : t])
-#
-# Correções v1.3:
-#   • err_abs com target explícito (fim do broadcast 227 vs 379)
-#   • Sn[i_disc] / Sn[i_conf] / Sn[i_hold] aplicados consistentemente
-#   • IID MC reproduz o PROCEDIMENTO COMPLETO:
-#       escolhe γ* na descoberta sintética → mede Δ_OOS no holdout sintético
-#   • Reporta distribuição nula de γ* sob IID
+# AUDITORIA γ (sem KeyError; BH entre janelas)
 # ============================================================
 GAMMA_GRID = [-1.00, -0.75, -0.50, -0.25, 0.00, 0.25, 0.50, 0.75, 1.00, 1.25]
 WINDOWS_DEFAULT = [7, 10, 20, 30, 50, 100]
 
 
 def _gamma_experiment(sums, window, gamma_grid):
-    """
-    Executa UM experimento γ completo sobre uma série `sums` (real ou sintética).
-    Nenhum vazamento: cada predição em t usa apenas S[t-window : t].
-    """
     n = len(sums)
     idx_l, S_prev_l, S_next_l, ref_l = [], [], [], []
     for t in range(window + 1, n):
-        ref = float(np.mean(sums[t - window:t]))
-        if ref <= 0:
-            continue
-        idx_l.append(t)
-        S_prev_l.append(sums[t - 1])
-        S_next_l.append(sums[t])
-        ref_l.append(ref)
-
-    idx = np.asarray(idx_l, dtype=int)
-    Sp  = np.asarray(S_prev_l, dtype=float)
-    Sn  = np.asarray(S_next_l, dtype=float)
-    R   = np.asarray(ref_l,   dtype=float)
-    N   = len(idx)
-    if N < 50:
-        return None
-
-    n_disc = int(0.60 * N)
-    n_conf = int(0.20 * N)
-    i_disc = slice(0, n_disc)
-    i_conf = slice(n_disc, n_disc + n_conf)
+        ref = float(np.mean(sums[t-window:t]))
+        if ref <= 0: continue
+        idx_l.append(t); S_prev_l.append(sums[t-1])
+        S_next_l.append(sums[t]); ref_l.append(ref)
+    idx = np.asarray(idx_l, dtype=int); Sp = np.asarray(S_prev_l, dtype=float)
+    Sn  = np.asarray(S_next_l, dtype=float); R = np.asarray(ref_l, dtype=float)
+    N = len(idx)
+    if N < 50: return None
+    n_disc = int(0.60 * N); n_conf = int(0.20 * N)
+    i_disc = slice(0, n_disc); i_conf = slice(n_disc, n_disc+n_conf)
     i_hold = slice(n_disc + n_conf, N)
-
     preds = {g: R + g * (Sp - R) for g in gamma_grid}
     baselines = {
         'Média histórica': np.array([np.mean(sums[:t]) for t in idx]),
-        'Média móvel':     R.copy(),
-        'Mediana móvel':   np.array([np.median(sums[t - window:t]) for t in idx]),
+        'Média móvel':     R.copy(),   # ← γ=0 POR DEFINIÇÃO
+        'Mediana móvel':   np.array([np.median(sums[t-window:t]) for t in idx]),
         'Último valor':    Sp.copy(),
     }
-
     def mae(p, target):
-        return float(np.mean(np.abs(np.asarray(p, dtype=float)
-                                    - np.asarray(target, dtype=float))))
-
-    # γ* escolhido SÓ com a descoberta
+        return float(np.mean(np.abs(np.asarray(p, dtype=float) - np.asarray(target, dtype=float))))
     mae_disc_g = {g: mae(preds[g][i_disc], Sn[i_disc]) for g in gamma_grid}
     best_gamma = min(gamma_grid, key=lambda g: mae_disc_g[g])
-    best_key   = f'γ={best_gamma:+.2f}'
-
+    best_key = f'γ={best_gamma:+.2f}'
     phases = {}
     for phase, sl in [('disc', i_disc), ('conf', i_conf), ('hold', i_hold)]:
-        target_ph = Sn[sl]                              # ← ALVO ALINHADO
+        target_ph = Sn[sl]
         phase_mae = {name: mae(v[sl], target_ph) for name, v in baselines.items()}
-        for g in gamma_grid:
-            phase_mae[f'γ={g:+.2f}'] = mae(preds[g][sl], target_ph)
+        for g in gamma_grid: phase_mae[f'γ={g:+.2f}'] = mae(preds[g][sl], target_ph)
         phase_abs = {
             'Média histórica': np.abs(baselines['Média histórica'][sl] - target_ph),
             'Média móvel':     np.abs(baselines['Média móvel'][sl]     - target_ph),
@@ -878,426 +1009,557 @@ def _gamma_experiment(sums, window, gamma_grid):
             'Último valor':    np.abs(baselines['Último valor'][sl]    - target_ph),
             'γ*':              np.abs(preds[best_gamma][sl]            - target_ph),
         }
-        if 0.0 in gamma_grid:
-            phase_abs['γ=0'] = np.abs(preds[0.0][sl] - target_ph)
         phases[phase] = {'mae': phase_mae, 'abs_err': phase_abs}
-
-    return {
-        'N': N, 'n_disc': n_disc, 'n_conf': n_conf, 'n_hold': N - n_disc - n_conf,
-        'best_gamma': best_gamma, 'best_key': best_key, 'phases': phases,
-    }
+    return {'N': N, 'n_disc': n_disc, 'n_conf': n_conf, 'n_hold': N-n_disc-n_conf,
+            'best_gamma': best_gamma, 'best_key': best_key, 'phases': phases}
 
 
 def _iid_sums(n, rng):
-    """Gera n somas IID equivalentes a um sorteio uniforme 6-de-50."""
     out = np.empty(n, dtype=float)
     for i in range(n):
-        s = rng.choice(np.arange(1, TOTAL_MAIN + 1), size=CHOOSE_MAIN, replace=False)
+        s = rng.choice(np.arange(1, TOTAL_MAIN+1), size=CHOOSE_MAIN, replace=False)
         out[i] = float(np.sum(s))
     return out
+
+
+def _bh_adjust(p_values):
+    """Benjamini-Hochberg."""
+    p = np.asarray(p_values, dtype=float)
+    n = len(p)
+    if n == 0: return p
+    order = np.argsort(p)
+    ranks = np.empty(n, dtype=int); ranks[order] = np.arange(1, n + 1)
+    adj = p * n / ranks
+    for i in range(n - 2, -1, -1):
+        idx_i, idx_next = order[i], order[i + 1]
+        adj[idx_i] = min(adj[idx_i], adj[idx_next])
+    return np.clip(adj, 0.0, 1.0)
 
 
 def audit_gamma_coefficient(contests, windows=None, gamma_grid=None, iid_mc=200):
     if windows is None:    windows = WINDOWS_DEFAULT
     if gamma_grid is None: gamma_grid = GAMMA_GRID
-
     sums = np.asarray([sum(c['dezenas']) for c in contests], dtype=float)
     n_real = len(sums)
 
-    print(f"\n📐 AUDITORIA DO COEFICIENTE DE ESCALA γ  (v1.3)")
+    print(f"\n📐 AUDITORIA γ — v1.5")
     print(f"   Modelo: Ŝ_t = R_t + γ·(S_(t-1) − R_t),  R_t = mean(S[t-w : t])")
     print(f"   γ grid: {gamma_grid}")
-    print(f"   Janelas: {windows}")
-    print(f"   Split: 60% descoberta | 20% confirmação | 20% holdout")
-    print(f"   IID MC por janela: {iid_mc} réplicas\n")
+    print(f"   Split 60/20/20 | IID MC por janela: {iid_mc}")
+    print(f"   E[S] teórico = {CHOOSE_MAIN*(TOTAL_MAIN+1)/2:.2f}")
+    print(f"   E[S] amostral = {np.mean(sums):.2f} | SD = {np.std(sums):.2f}")
 
-    print(f"   📌 Estatísticas da soma S_t (real):")
-    print(f"      E[S] teórico (uniforme 6/50) = {CHOOSE_MAIN*(TOTAL_MAIN+1)/2:.2f}")
-    print(f"      E[S] amostral                = {np.mean(sums):.2f}")
-    print(f"      SD  amostral                 = {np.std(sums):.2f}")
-    print(f"      MAE esperado IID (média)     ≈ SD·sqrt(2/π) = "
-          f"{np.std(sums)*np.sqrt(2/np.pi):.2f}\n")
-
-    # ---------- 1) Execução real ----------
     reais = {}
     for w in windows:
         r = _gamma_experiment(sums, w, gamma_grid)
-        if r is not None:
-            reais[w] = r
+        if r is not None: reais[w] = r
     if not reais:
-        print("⚠️  Nenhuma janela produziu amostra válida.")
-        return None
+        print("⚠️ Nenhuma janela válida."); return None
 
-    # ---------- 2) Tabela por janela ----------
-    print("=" * 100)
-    print("   RESULTADOS REAIS  (MAE por fase)")
-    print("=" * 100)
-    header = (f"{'Jan':<5} {'Fase':<11} {'N':<5} "
-              f"{'MHist':<8} {'MMov':<8} {'Med':<8} {'Últ':<8} "
-              f"{'γ*':<7} {'MAE(γ*)':<8}")
-    print(header)
-    print("-" * len(header))
-    for w, r in reais.items():
-        for phase, label in [('disc', 'Descoberta'),
-                             ('conf', 'Confirmação'),
-                             ('hold', 'Holdout')]:
-            ph = r['phases'][phase]
-            n_ph = {'disc': r['n_disc'],
-                    'conf': r['n_conf'],
-                    'hold': r['n_hold']}[phase]
-            mh = ph['mae']['Média histórica']
-            mm = ph['mae']['Média móvel']
-            md = ph['mae']['Mediana móvel']
-            ul = ph['mae']['Último valor']
-            gk = r['best_key']
-            mg = ph['mae'][gk]
-            print(f"{w:<5} {label:<11} {n_ph:<5} "
-                  f"{mh:<8.2f} {mm:<8.2f} {md:<8.2f} {ul:<8.2f} "
-                  f"{r['best_gamma']:<+7.2f} {mg:<8.2f}")
-        print("-" * len(header))
-
-    # ---------- 3) Veredito OOS ----------
+    # ---------- Veredito OOS (com BH entre janelas) ----------
     print("\n" + "=" * 100)
     print("   VEREDITO OOS — γ* (congelado na descoberta) vs baselines no HOLDOUT")
     print("=" * 100)
-
+    window_pvals = []
     for w, r in reais.items():
-        ph = r['phases']['hold']
-        gk = r['best_key']
-        mae_g  = ph['mae'][gk]
-        mae_0  = ph['mae'].get('γ=0.00', ph['mae']['Média móvel'])
-        mae_mm = ph['mae']['Média móvel']
+        ph = r['phases']['hold']; gk = r['best_key']
+        mae_g = ph['mae'][gk]
+        mae_mm = ph['mae']['Média móvel']       # γ=0 POR DEFINIÇÃO
         mae_mh = ph['mae']['Média histórica']
         mae_ul = ph['mae']['Último valor']
 
-        def _wil(a, b):
-            d = a - b
-            if np.all(d == 0):
-                return 1.0
-            try:
-                return wilcoxon(d, alternative='greater').pvalue
-            except Exception:
-                return 1.0
+        abs_0 = ph['abs_err']['Média móvel']
+        abs_g = ph['abs_err']['γ*']
+        if np.all(abs_0 - abs_g == 0):
+            p_vs_0 = 1.0
+        else:
+            try: p_vs_0 = wilcoxon(abs_0, abs_g, alternative='greater').pvalue
+            except: p_vs_0 = 1.0
+        window_pvals.append((w, p_vs_0))
 
-        p_vs_0  = _wil(ph['abs_err']['γ=0'],           ph['abs_err']['γ*'])
-        p_vs_ul = _wil(ph['abs_err']['Último valor'], ph['abs_err']['γ*'])
-        delta_oos = mae_0 - mae_g
-
+        delta_oos = mae_mm - mae_g
         print(f"\n   Janela {w:>3}:  N={r['N']}  γ* = {r['best_gamma']:+.2f}")
-        print(f"      MAE holdout — γ*: {mae_g:.2f} | γ=0: {mae_0:.2f} | "
-              f"MMov: {mae_mm:.2f} | MHist: {mae_mh:.2f} | Últ: {mae_ul:.2f}")
+        print(f"      MAE holdout — γ*: {mae_g:.2f} | γ=0 (MMov): {mae_mm:.2f} | "
+              f"MHist: {mae_mh:.2f} | Últ: {mae_ul:.2f}")
         print(f"      Δ_OOS (γ=0 − γ*): {delta_oos:+.3f}   "
-              f"(Wilcoxon γ* < γ=0: p = {p_vs_0:.4f})")
-        print(f"      Δ   (Últ − γ*):   {mae_ul - mae_g:+.3f}   "
-              f"(Wilcoxon γ* < Últ:  p = {p_vs_ul:.4f})")
-
+              f"(Wilcoxon: p_raw = {p_vs_0:.4f})")
         if r['best_gamma'] == 0.0:
-            print(f"      → γ* = 0  ⇒  o vencedor é a própria Média Móvel "
-                  f"(nenhuma informação além do baseline).")
-        elif delta_oos > 0 and p_vs_0 < 0.05:
-            print(f"      → ✅ γ* ≠ 0 com vantagem significativa OOS (p < 0.05).")
-        elif delta_oos > 0 and p_vs_0 < 0.15:
-            print(f"      → 📊 γ* ≠ 0 com vantagem marginal OOS (p < 0.15).")
-        else:
-            print(f"      → ⚪ Sem evidência de vantagem OOS de γ* sobre γ=0.")
+            print(f"      → γ* = 0 (vencedor é a própria Média Móvel).")
+        elif delta_oos > 0:
+            print(f"      → Δ_OOS > 0 (ver p_adj abaixo).")
 
-    # ---------- 4) IID MC reproduzindo o procedimento completo ----------
+    # BH entre janelas
+    if len(window_pvals) > 1:
+        p_raw_arr = np.array([p for _, p in window_pvals])
+        p_adj_arr = _bh_adjust(p_raw_arr)
+        print("\n" + "=" * 100)
+        print("   CORREÇÃO BH ENTRE JANELAS")
+        print("=" * 100)
+        for (w, p_raw), p_adj in zip(window_pvals, p_adj_arr):
+            sig = "🔍" if p_adj < 0.05 else ("📊" if p_adj < 0.15 else "  ")
+            print(f"   Janela {w:>3}: p_raw = {p_raw:.4f} | p_adj (BH) = {p_adj:.4f} {sig}")
+
+    # ---------- IID MC ----------
     print("\n" + "=" * 100)
-    print(f"   BASELINE IID MONTE CARLO  ({iid_mc} réplicas/janela, procedimento completo)")
+    print(f"   BASELINE IID MONTE CARLO ({iid_mc} réplicas/janela)")
     print("=" * 100)
-    print("   Para cada réplica sintética: mesma escolha de γ* na descoberta, "
-          "mesma avaliação no holdout.")
-    print("   A distribuição nula de Δ_OOS e de γ* é diretamente comparável "
-          "ao resultado real.\n")
-
     rng = np.random.default_rng(20250911)
-
     for w, r_real in reais.items():
-        mae0_real = r_real['phases']['hold']['mae'].get(
-            'γ=0.00', r_real['phases']['hold']['mae']['Média móvel'])
+        mae0_real = r_real['phases']['hold']['mae']['Média móvel']
         maeg_real = r_real['phases']['hold']['mae'][r_real['best_key']]
-        delta_oos_real = mae0_real - maeg_real
-
-        delta_oos_sim = []
-        gamma_choosen_sim = defaultdict(int)
-
+        d_real = mae0_real - maeg_real
+        d_sims = []
+        g_choices = defaultdict(int)
         for _ in range(iid_mc):
-            sim_sums = _iid_sums(n_real, rng)
-            sim_r = _gamma_experiment(sim_sums, w, gamma_grid)
-            if sim_r is None:
-                continue
-            ph_hold = sim_r['phases']['hold']
-            mae0 = ph_hold['mae'].get('γ=0.00', ph_hold['mae']['Média móvel'])
-            maeg = ph_hold['mae'][sim_r['best_key']]
-            delta_oos_sim.append(mae0 - maeg)
-            gamma_choosen_sim[sim_r['best_gamma']] += 1
-
-        delta_oos_sim = np.asarray(delta_oos_sim, dtype=float)
-        if len(delta_oos_sim) == 0:
-            continue
-
-        p_emp = float(np.mean(delta_oos_sim >= delta_oos_real))
-
-        top = sorted(gamma_choosen_sim.items(), key=lambda kv: -kv[1])[:5]
+            sim = _gamma_experiment(_iid_sums(n_real, rng), w, gamma_grid)
+            if sim is None: continue
+            mae0 = sim['phases']['hold']['mae']['Média móvel']
+            maeg = sim['phases']['hold']['mae'][sim['best_key']]
+            d_sims.append(mae0 - maeg)
+            g_choices[sim['best_gamma']] += 1
+        if not d_sims: continue
+        d_sims = np.asarray(d_sims)
+        p_emp = (1 + np.sum(d_sims >= d_real)) / (len(d_sims) + 1)
+        top = sorted(g_choices.items(), key=lambda kv: -kv[1])[:5]
         top_str = " | ".join(f"{g:+.2f}:{c}" for g, c in top)
-
-        print(f"   Janela {w:>3}: Δ_OOS real = {delta_oos_real:+.3f} | "
-              f"IID: média={np.mean(delta_oos_sim):+.3f} "
-              f"sd={np.std(delta_oos_sim):.3f} | p_emp = {p_emp:.4f}")
-        print(f"      γ* mais frequentes sob IID: {top_str}")
+        print(f"   Janela {w:>3}: Δ_OOS real = {d_real:+.3f} | IID: "
+              f"média={np.mean(d_sims):+.3f} sd={np.std(d_sims):.3f} | p_emp = {p_emp:.4f}")
+        print(f"      γ* mais frequentes IID: {top_str}")
         if p_emp < 0.05:
-            print(f"      → ✅ Δ_OOS real > IID em {1-p_emp:.1%} das réplicas — sinal genuíno.")
+            print(f"      → ✅ Δ_OOS real > IID em {1-p_emp:.1%} das réplicas.")
         else:
-            print(f"      → ⚪ Δ_OOS real compatível com IID (p_emp = {p_emp:.3f} ≥ 0.05).")
-
+            print(f"      → ⚪ Compatível com IID (p = {p_emp:.3f}).")
     return reais
 
 # ============================================================
-# INTERFACE PRINCIPAL
+# MÓDULO 5 — AUDITORIA DE INTEGRIDADE
 # ============================================================
+def integrity_audit():
+    print("=" * 70)
+    print("🔬 AUDITORIA DE INTEGRIDADE — v1.5")
+    print("=" * 70)
+    errors = []
+
+    # [1] Fórmulas de combinatória
+    print("\n[1] Fórmulas de universo")
+    u6 = comb(50, 6)
+    up = u6 * comb(6, 2)
+    print(f"   C(50,6)         = {u6:,}      [esperado: 15.890.700]")
+    print(f"   C(50,6)·C(6,2)  = {up:,}      [esperado: 238.360.500]")
+    if u6 != 15_890_700 or up != 238_360_500:
+        errors.append("[1] Fórmulas de combinatória erradas.")
+    else:
+        print("   ✅ OK")
+
+    # [2] Enumeração com todas fixas (universo=1, pares=15)
+    print("\n[2] Enumeração com 6 fixas → universo_main=1, pares=15")
+    opt = PortfolioOptimizer([], fixed=[1,2,3,4,5,6])
+    pool, stats = opt.enumerate_and_sample(20, seed=42)
+    ok = (stats['n_valid_main'] == 1 and stats['n_valid'] == 15 and len(pool) == 15)
+    print(f"   n_valid_main = {stats['n_valid_main']} [esperado: 1]")
+    print(f"   n_valid      = {stats['n_valid']}    [esperado: 15]")
+    print("   ✅ OK" if ok else "   ❌ FALHA")
+    if not ok: errors.append("[2] Enumeração com 6 fixas.")
+
+    # [3] Semifixas impossíveis (min > 0, semifixas vazio)
+    print("\n[3] Semifixas impossíveis (min=2, lista vazia)")
+    try:
+        _ = PortfolioOptimizer([], semifixed=[], min_semifixed=2, max_semifixed=2)
+        print("   ❌ NÃO detectou impossível")
+        errors.append("[3] Semifixas impossíveis não detectadas.")
+    except ValueError as e:
+        print(f"   ✅ Detectado: {e}")
+
+    # [4] Semifixas com faixa [1,2]
+    print("\n[4] Semifixas [1,2,3] com min=1, max=2")
+    opt = PortfolioOptimizer([], semifixed=[1,2,3], min_semifixed=1, max_semifixed=2)
+    pool, stats = opt.enumerate_and_sample(100, seed=42)
+    ok = all(1 <= len(set(g[0]) & {1,2,3}) <= 2 for g in pool)
+    print(f"   Todos os jogos do pool respeitam semi ∈ [1,2]: {ok}")
+    print("   ✅ OK" if ok else "   ❌ FALHA")
+    if not ok: errors.append("[4] Semifixas faixa.")
+
+    # [5] Covering não repete mains
+    print("\n[5] Covering sem repetir mains")
+    games = [
+        ([1,2,3,4,5,6], [1,2]),
+        ([1,2,3,4,5,6], [3,4]),   # mesmo main
+        ([7,8,9,10,11,12], [1,2]),
+        ([13,14,15,16,17,18], [3,4]),
+    ]
+    opt = PortfolioOptimizer([])
+    sel = opt.select_covering(games, 3, level='pair')
+    mains = set(tuple(sorted(g[0])) for g in sel)
+    ok = (len(sel) == 3 and len(mains) == 3)
+    print(f"   Selecionados {len(sel)} jogos, mains únicos: {len(mains)}")
+    print("   ✅ OK" if ok else "   ❌ FALHA")
+    if not ok: errors.append("[5] Covering duplicata.")
+
+    # [6] Uniformidade do reservoir
+    print("\n[6] Uniformidade do reservoir (universo completo)")
+    opt = PortfolioOptimizer([], excluded=list(range(9, 51)))   # livres 1..8, C(8,6)=28
+    pool, stats = opt.enumerate_and_sample(28 * 15, seed=42)    # universe = 28*15 = 420
+    mains = set(tuple(sorted(g[0])) for g in pool)
+    ok = (len(mains) == 28 and len(pool) == 420)
+    print(f"   Mains distintos: {len(mains)}/28 | pares: {len(pool)}/420")
+    print("   ✅ OK" if ok else "   ❌ FALHA")
+    if not ok: errors.append("[6] Uniformidade.")
+
+    # [7] Backtest: unidades separadas
+    print("\n[7] Backtest separa p_bet e p_draw (3+2 = R$50)")
+    opt = PortfolioOptimizer([])
+    portfolio = [([1,2,3,4,5,6], [1,2])]
+    draws = [{'dezenas': [1,2,3,7,8,9], 'trevos': [1,2]}]   # 3+2
+    bt = opt.backtest(portfolio, draws)
+    ok = (abs(bt['p_bet_empirical'] - 1.0) < 1e-9
+          and abs(bt['p_draw_empirical'] - 1.0) < 1e-9
+          and abs(bt['premio_fixo_total'] - 50.0) < 1e-9)
+    print(f"   p_bet_emp = {bt['p_bet_empirical']:.4f}   [esperado: 1.0]")
+    print(f"   p_draw_emp = {bt['p_draw_empirical']:.4f}  [esperado: 1.0]")
+    print(f"   prêmio_fixo = R$ {bt['premio_fixo_total']:.2f}  [esperado: 50.00]")
+    print("   ✅ OK" if ok else "   ❌ FALHA")
+    if not ok: errors.append("[7] Backtest unidades.")
+
+    # [8] Reprodutibilidade por seed
+    print("\n[8] Reprodutibilidade por seed")
+    opt = PortfolioOptimizer([], fixed=[10, 20])
+    p1, _ = opt.enumerate_and_sample(50, seed=123)
+    p2, _ = opt.enumerate_and_sample(50, seed=123)
+    ok = (p1 == p2)
+    print(f"   Duas execuções (seed=123) idênticas: {ok}")
+    print("   ✅ OK" if ok else "   ❌ FALHA")
+    if not ok: errors.append("[8] Reprodutibilidade.")
+
+    # ---------- Veredito ----------
+    print("\n" + "=" * 70)
+    if not errors:
+        print("✅ TODAS AS AUDITORIAS PASSARAM")
+    else:
+        print(f"❌ {len(errors)} FALHA(S):")
+        for e in errors: print(f"   • {e}")
+    print("=" * 70)
+    return len(errors) == 0
+
+# ============================================================
+# MENU
+# ============================================================
+def _ask_structural_ranges():
+    r = {}
+    print("   Faixas estruturais (ENTER para pular)")
+    for key, label in [('range_pares', 'Pares'), ('range_moldura', 'Borda'),
+                       ('range_primos', 'Primos'), ('range_soma', 'Soma'),
+                       ('range_amplitude', 'Amplitude'), ('range_consecutivos', 'Consec.')]:
+        try:
+            v = input(f"   {label} min,max: ").strip()
+            r[key] = tuple(int(x) for x in v.split(',')) if v else None
+        except:
+            r[key] = None
+    return r
+
+
+def _ask_inputs_validated():
+    try:
+        fs = input("\n   Fixas (ex: 10 20 30 ou ENTER): ").strip()
+        fixed = [int(x) for x in fs.split()] if fs else []
+        ss = input("   Semifixas (ex: 5 15 25 ou ENTER): ").strip()
+        semifixed = [int(x) for x in ss.split()] if ss else []
+        es = input("   Excluídas (ex: 7 13 27 ou ENTER): ").strip()
+        excluded = [int(x) for x in es.split()] if es else []
+        if semifixed:
+            mn = int(input(f"   Mín semi [0-{len(semifixed)}]: ").strip() or "0")
+            mx = int(input(f"   Máx semi [0-{len(semifixed)}]: ").strip() or str(len(semifixed)))
+        else:
+            mn = int(input("   Mín semi (ENTER=0): ").strip() or "0")
+            mx_s = input("   Máx semi (ENTER=0): ").strip()
+            mx = int(mx_s) if mx_s else None
+        fixed, semifixed, excluded = validate_inputs(fixed, semifixed, excluded, mn, mx)
+        return fixed, semifixed, excluded, mn, mx
+    except ValueError as e:
+        print(f"❌ {e}")
+        return None
+
+
 def main():
-    print("="*70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA +MILIONÁRIA – v1.3")
-    print("   FWER + WALK-FORWARD + FATOR DE ESCALA + γ (corrigido)")
-    print("="*70)
+    print("=" * 70)
+    print("🔬 LABORATÓRIO +MILIONÁRIA – v1.5")
+    print("   Módulos 1–5: validação, backtest corrigido, prêmios oficiais,")
+    print("   estatística com MC, auditoria de integridade.")
+    print("=" * 70)
     contests = load_all_contests('resultados_maismilionaria.csv')
     if not contests:
-        print("❌ Arquivo 'resultados_maismilionaria.csv' não encontrado.")
-        return
-    print(f"\n📂 {len(contests)} concursos")
-    print(f"📌 Último: {contests[-1]['concurso']} - {contests[-1]['dezenas']} | Trevos: {contests[-1]['trevos']}")
+        print("❌ 'resultados_maismilionaria.csv' não encontrado."); return
+    print(f"\n📂 {len(contests)} concursos | último: {contests[-1]['concurso']}")
+    print(f"📌 Dezenas: {contests[-1]['dezenas']} | Trevos: {contests[-1]['trevos']}")
+    print(f"💰 Custo/aposta: R$ {CUSTO_APOSTA:.2f} | P(aposta premiada): {P_BET_WIN_THEORETICAL:.6f}")
 
     while True:
         print("\nOpções:")
-        print("1. Gerar carteira personalizada")
-        print("2. Walk‑forward condicional simples")
-        print("3. Backtest nos últimos 200 concursos")
-        print("4. Buscar melhores fixas (out‑of‑sample)")
-        print("5. Comparar duas trincas")
-        print("6. Ranking de poder preditivo (reversão vs tendência)")
-        print("7. Poder preditivo das 50 dezenas")
-        print("8. Structural Predictor (previsão de faixas)")
-        print("9. Gerar carteira com previsões estruturais")
-        print("10. Controle Monte Carlo (FWER corrigido)")
-        print("11. Teste preditivo concurso a concurso (corrigido)")
-        print("12. Walk‑forward do Structural Predictor")
-        print("13. Auditoria do Fator de Escala (v1.3, refs independentes)")
-        print("14. Auditoria do Coeficiente γ  (v1.3, 60/20/20 + grid + IID)")
-        print("0. Sair")
+        print("1.  Gerar carteira personalizada")
+        print("2.  Walk-forward condicional")
+        print("3.  Backtest (200 concursos)")
+        print("4.  Buscar fixas OOS")
+        print("5.  Comparar trincas")
+        print("6.  Ranking preditivo (binomial + block permutation opcional)")
+        print("7.  Poder preditivo das 50 dezenas")
+        print("8.  Structural Predictor")
+        print("9.  Carteira com previsões estruturais")
+        print("10. Monte Carlo FWER")
+        print("11. Teste concurso a concurso")
+        print("12. Walk-forward estrutural")
+        print("13. Auditoria do Fator de Escala")
+        print("14. Auditoria do Coeficiente γ")
+        print("15. ⚙️  AUDITORIA DE INTEGRIDADE (Módulo 5)")
+        print("0.  Sair")
         op = input("Escolha: ").strip()
 
         if op == '1':
-            fixed_str = input("\n   Dezenas fixas (ex: 10 20 30 ou ENTER): ").strip()
-            fixed = [int(x) for x in fixed_str.split()] if fixed_str else []
-            semifixed_str = input("   Dezenas semifixas (ex: 5 15 25 35 45 ou ENTER): ").strip()
-            semifixed = [int(x) for x in semifixed_str.split()] if semifixed_str else []
-            excl_str = input("   Dezenas excluídas (ex: 7 13 27 ou ENTER): ").strip()
-            excluded = [int(x) for x in excl_str.split()] if excl_str else []
-            if semifixed:
-                try:
-                    min_semifixed = int(input(f"   Mínimo de semifixas [0-{len(semifixed)}]: ").strip() or "0")
-                    max_semifixed = int(input(f"   Máximo de semifixas [0-{len(semifixed)}]: ").strip() or str(len(semifixed)))
-                except:
-                    min_semifixed = 0
-                    max_semifixed = len(semifixed)
-            else:
-                min_semifixed = 0
-                max_semifixed = None
-            print("   Faixas estruturais (ENTER para pular)")
+            parsed = _ask_inputs_validated()
+            if not parsed: continue
+            fixed, semifixed, excluded, mn, mx = parsed
+            ranges = _ask_structural_ranges()
+            print("\n   Modo: [1] Tentativas [2] Universo exato")
+            modo = input("   Escolha [1]: ").strip() or "1"
+            exact = (modo == '2')
             try:
-                pares_str = input("   Pares min,max (ex: 2,4): ").strip()
-                range_pares = tuple(int(x) for x in pares_str.split(',')) if pares_str else None
-            except: range_pares = None
-            try:
-                moldura_str = input("   Borda min,max (ex: 1,3): ").strip()
-                range_moldura = tuple(int(x) for x in moldura_str.split(',')) if moldura_str else None
-            except: range_moldura = None
-            try:
-                primos_str = input("   Primos min,max (ex: 1,3): ").strip()
-                range_primos = tuple(int(x) for x in primos_str.split(',')) if primos_str else None
-            except: range_primos = None
-            metodo = input("\n   Método [1. Pair, 2. Triple]: ").strip() or "1"
+                pool = int(input(f"   Tamanho do pool [{'50000' if exact else '50000'}]: ").strip() or "50000")
+            except: pool = 50000
+            metodo = input("   Método [1. Pair, 2. Triple]: ").strip() or "1"
             method = 'pair_covering' if metodo == '1' else 'triple_covering'
-            opt = PortfolioOptimizer(contests, fixed=fixed, semifixed=semifixed,
-                                     min_semifixed=min_semifixed, max_semifixed=max_semifixed,
-                                     excluded=excluded, range_pares=range_pares,
-                                     range_moldura=range_moldura, range_primos=range_primos)
-            portfolio = opt.optimize(5, 50000, method=method)
+            try:
+                opt = PortfolioOptimizer(contests, fixed=fixed, semifixed=semifixed,
+                                         min_semifixed=mn, max_semifixed=mx,
+                                         excluded=excluded, **ranges)
+                portfolio = opt.optimize(5, pool, method=method, exact_universe=exact)
+            except (ValueError, RuntimeError) as e:
+                print(f"❌ {e}"); continue
             for i, (main, trevo) in enumerate(portfolio, 1):
                 p = sum(1 for x in main if x % 2 == 0)
                 pr = sum(1 for x in main if x in PRIMES)
                 m = sum(1 for x in main if x in MOLDURA)
-                print(f" {i}. Main: {main} | Trevos: {trevo} | P:{p} Pr:{pr} Borda:{m}")
+                print(f" {i}. Main:{main} | Trevos:{trevo} | P:{p} Pr:{pr} Borda:{m}")
             if len(contests) > 200:
                 bt = opt.backtest(portfolio, contests[-200:])
-                print(f"\n🔬 BACKTEST (200): Lift={bt['lift']:.2f}x | ROI={bt['roi']:+.1f}%")
+                print(f"\n🔬 BACKTEST (200) — por aposta:")
+                print(f"   p_bet_emp    = {bt['p_bet_empirical']:.6f}  |  "
+                      f"p_bet_teo = {bt['p_bet_theoretical']:.6f}  |  "
+                      f"lift = {bt['lift_bet']:.3f}")
+                print(f"\n🔬 BACKTEST (200) — por concurso:")
+                print(f"   p_draw_emp   = {bt['p_draw_empirical']:.4f}  |  "
+                      f"p_draw_mc = {bt['p_draw_theoretical_mc']:.4f}  |  "
+                      f"lift = {bt['lift_draw']:.3f}")
+                print(f"   p_draw_indep = {bt['p_draw_indep_reference']:.4f}  "
+                      f"(referência; NÃO usar como lift)")
+                print(f"\n💰 Financeiro (só prêmios fixos):")
+                print(f"   Prêmios fixos = R$ {bt['premio_fixo_total']:.2f} | "
+                      f"Variáveis (contagem) = {bt['premio_variavel_count']}")
+                print(f"   Custo total   = R$ {bt['custo_total']:.2f} | "
+                      f"ROI_fixo = {bt['roi_fixo_apenas']:+.2f}%")
+                print(f"   ⚠️ Prêmios variáveis NÃO contabilizados.")
 
         elif op == '2':
-            fixed_str = input("\n   Fixas (ex: 10 20 30): ").strip()
-            fixed = [int(x) for x in fixed_str.split()] if fixed_str else []
-            excl_str = input("   Excluídas (ex: 7 13 27 ou ENTER): ").strip()
-            excluded = [int(x) for x in excl_str.split()] if excl_str else []
-            metodo = input("   Método [1. Pair, 2. Triple]: ").strip() or "1"
+            fs = input("\n   Fixas (ENTER pular): ").strip()
+            try:
+                fixed = [int(x) for x in fs.split()] if fs else []
+                fixed = validate_numbers(fixed, 'fixas')
+            except ValueError as e:
+                print(f"❌ {e}"); continue
+            es = input("   Excluídas (ENTER pular): ").strip()
+            try:
+                excluded = [int(x) for x in es.split()] if es else []
+                excluded = validate_numbers(excluded, 'excluídas')
+            except ValueError as e:
+                print(f"❌ {e}"); continue
+            metodo = input("   Método [1/2]: ").strip() or "1"
             method = 'pair_covering' if metodo == '1' else 'triple_covering'
-            results = []
+            lifts = []
             for w in range(8):
-                test_end = len(contests) - w * 50
-                test_start = test_end - 50
-                train_end = test_start
-                train_start = max(0, train_end - 400)
-                if train_start >= train_end or test_start >= test_end: continue
-                opt = PortfolioOptimizer(contests[train_start:train_end], fixed=fixed, excluded=excluded)
-                portfolio = opt.optimize(5, 10000, method=method)
-                bt = opt.backtest(portfolio, contests[test_start:test_end])
-                results.append({'lift': bt['lift'], 'roi': bt['roi']})
-                print(f"   Janela {w}: lift={bt['lift']:.3f} | ROI={bt['roi']:+.1f}%")
-            if results:
-                print(f"\n📊 Média lift: {np.mean([r['lift'] for r in results]):.3f}")
+                te = len(contests) - w * 50
+                ts = te - 50
+                t_start = max(0, ts - 400)
+                if t_start >= ts or ts >= te: continue
+                try:
+                    opt = PortfolioOptimizer(contests[t_start:ts], fixed=fixed, excluded=excluded)
+                    p = opt.optimize(5, 10000, method=method)
+                    bt = opt.backtest(p, contests[ts:te])
+                    lifts.append(bt['lift_draw'])
+                    print(f"   Janela {w}: lift_draw={bt['lift_draw']:.3f} | "
+                          f"ROI_fixo={bt['roi_fixo_apenas']:+.1f}% | "
+                          f"concursos c/ prêmio={bt['draws_with_win']}/{bt['n_test']}")
+                except Exception as e:
+                    print(f"   Janela {w}: {e}")
+            if lifts:
+                print(f"\n📊 Média lift_draw: {np.mean(lifts):.3f}")
 
         elif op == '3':
-            fixed_str = input("\n   Fixas (ENTER para pular): ").strip()
-            fixed = [int(x) for x in fixed_str.split()] if fixed_str else []
-            excl_str = input("   Excluídas (ENTER para pular): ").strip()
-            excluded = [int(x) for x in excl_str.split()] if excl_str else []
-            metodo = input("   Método [1. Pair, 2. Triple]: ").strip() or "1"
+            fs = input("\n   Fixas (ENTER pular): ").strip()
+            try:
+                fixed = [int(x) for x in fs.split()] if fs else []
+                fixed = validate_numbers(fixed, 'fixas')
+                es = input("   Excluídas (ENTER pular): ").strip()
+                excluded = [int(x) for x in es.split()] if es else []
+                excluded = validate_numbers(excluded, 'excluídas')
+            except ValueError as e:
+                print(f"❌ {e}"); continue
+            metodo = input("   Método [1/2]: ").strip() or "1"
             method = 'pair_covering' if metodo == '1' else 'triple_covering'
-            opt = PortfolioOptimizer(contests, fixed=fixed, excluded=excluded)
-            portfolio = opt.optimize(5, 50000, method=method)
-            bt = opt.backtest(portfolio, contests[-200:])
-            print(f"\n🔬 BACKTEST (200): Lift={bt['lift']:.2f}x | ROI={bt['roi']:+.1f}%")
-            print(f"   Distribuição de prêmios: {bt['hit_distribution']}")
+            print("\n   Modo: [1] Tentativas [2] Universo exato")
+            modo = input("   Escolha [1]: ").strip() or "1"
+            exact = (modo == '2')
+            try:
+                pool = int(input("   Pool [50000]: ").strip() or "50000")
+            except: pool = 50000
+            try:
+                opt = PortfolioOptimizer(contests, fixed=fixed, excluded=excluded)
+                portfolio = opt.optimize(5, pool, method=method, exact_universe=exact)
+                bt = opt.backtest(portfolio, contests[-200:])
+                print(f"\n📊 p_bet_emp={bt['p_bet_empirical']:.6f} lift_bet={bt['lift_bet']:.3f}")
+                print(f"   p_draw_emp={bt['p_draw_empirical']:.4f} "
+                      f"p_draw_mc={bt['p_draw_theoretical_mc']:.4f} "
+                      f"lift_draw={bt['lift_draw']:.3f}")
+                print(f"   p_draw_indep(ref)={bt['p_draw_indep_reference']:.4f}")
+                print(f"   ROI_fixo={bt['roi_fixo_apenas']:+.2f}% (R$ {bt['premio_fixo_total']:.2f} em prêmios fixos)")
+                print(f"   Hit_dist: {dict(sorted(bt['hit_distribution'].items()))}")
+            except Exception as e:
+                print(f"❌ {e}")
 
         elif op == '4':
             try:
-                n_fixed = int(input("\n   Quantas fixas (2,3,4): ").strip())
+                n_fixed = int(input("\n   Fixas (2-4): ").strip())
                 if n_fixed not in [2,3,4]: continue
             except: continue
-            top_n = int(input("   Resultados [20]: ").strip() or "20")
-            train_size = int(input("   Tamanho treino [3500]: ").strip() or "3500")
-            excl_str = input("   Excluídas (ENTER para pular): ").strip()
-            excluded = [int(x) for x in excl_str.split()] if excl_str else []
-            metodo = input("   Método [1. Pair, 2. Triple]: ").strip() or "1"
+            try:
+                top_n = int(input("   Top N [20]: ").strip() or "20")
+                train_size = int(input("   Treino [3500]: ").strip() or "3500")
+            except: continue
+            es = input("   Excluídas (ENTER pular): ").strip()
+            try:
+                excluded = [int(x) for x in es.split()] if es else []
+                excluded = validate_numbers(excluded, 'excluídas')
+            except ValueError as e:
+                print(f"❌ {e}"); continue
+            metodo = input("   Método [1/2]: ").strip() or "1"
             method = 'pair_covering' if metodo == '1' else 'triple_covering'
-            search_best_fixed_oos(contests, n_fixed, top_n, train_size, method=method, excluded=excluded)
+            search_best_fixed_oos(contests, n_fixed, top_n, train_size,
+                                  method=method, excluded=excluded)
 
         elif op == '5':
-            trinca1_str = input("\n   Trinca 1: ").strip()
-            trinca2_str = input("   Trinca 2: ").strip()
-            excl_str = input("   Excluídas (ENTER para pular): ").strip()
-            excluded = [int(x) for x in excl_str.split()] if excl_str else []
+            t1s = input("\n   Trinca 1: ").strip()
+            t2s = input("   Trinca 2: ").strip()
             try:
-                trinca1 = tuple(int(x) for x in trinca1_str.split())
-                trinca2 = tuple(int(x) for x in trinca2_str.split())
-                if len(trinca1)!=3 or len(trinca2)!=3: continue
-            except: continue
-            compare_trincas(contests, trinca1, trinca2, excluded=excluded)
+                t1 = validate_numbers([int(x) for x in t1s.split()], 'trinca1')
+                t2 = validate_numbers([int(x) for x in t2s.split()], 'trinca2')
+                if len(t1) != 3 or len(t2) != 3: continue
+            except ValueError as e:
+                print(f"❌ {e}"); continue
+            compare_trincas(contests, tuple(t1), tuple(t2))
 
         elif op == '6':
-            blocos_str = input("\n   Tamanhos de bloco [50,100,200,500]: ").strip()
+            bs = input("\n   Blocos [50,100,200,500]: ").strip()
             try:
-                block_sizes = [int(x) for x in blocos_str.split(',')] if blocos_str else [50,100,200,500]
-            except: block_sizes = [50,100,200,500]
-            ranker = PredictiveRanking(contests)
-            ranker.rank_predictive_power(block_sizes)
+                blocks = [int(x) for x in bs.split(',')] if bs else [50,100,200,500]
+            except: blocks = [50,100,200,500]
+            try:
+                bp = int(input("   Block permutations (0=off) [0]: ").strip() or "0")
+            except: bp = 0
+            PredictiveRanking(contests).rank_predictive_power(blocks, block_permutations=bp)
 
         elif op == '7':
-            blocos_str = input("\n   Tamanhos de bloco [100,200,500]: ").strip()
+            bs = input("\n   Blocos [100,200,500]: ").strip()
             try:
-                block_sizes = [int(x) for x in blocos_str.split(',')] if blocos_str else [100,200,500]
-            except: block_sizes = [100,200,500]
-            ranker = PredictiveRanking(contests)
-            ranker.rank_dezenas_individual(block_sizes)
+                blocks = [int(x) for x in bs.split(',')] if bs else [100,200,500]
+            except: blocks = [100,200,500]
+            PredictiveRanking(contests).rank_dezenas_individual(blocks)
 
         elif op == '8':
-            print("\n   Método: 1. Recente (50 concursos)  2. IPE")
-            metodo = input("   Escolha [1]: ").strip() or "1"
-            method = 'recent' if metodo == '1' else 'ipe'
-            predictor = StructuralPredictor(contests)
-            predictor.predict_ranges(method=method)
+            m = 'recent' if (input("   [1] Recente [2] IPE: ").strip() or "1") == "1" else 'ipe'
+            StructuralPredictor(contests).predict_ranges(method=m)
 
         elif op == '9':
-            predictor = StructuralPredictor(contests)
-            ranges = predictor.predict_ranges(method='recent')
-            print("\n   Dezenas fixas sugeridas: 10 20 30")
-            fixed_str = input("   Digite as dezenas fixas (ENTER p/ sugestão): ").strip()
-            fixed = [int(x) for x in fixed_str.split()] if fixed_str else [10, 20, 30]
-            print(f"   Fixas utilizadas: {fixed}")
-            excl_str = input("   Excluídas (ENTER para pular): ").strip()
-            excluded = [int(x) for x in excl_str.split()] if excl_str else []
-            gerar = input("   Gerar carteira? (s/n): ").strip().lower()
+            ranges = StructuralPredictor(contests).predict_ranges(method='recent')
+            fixed = [10, 20, 30]
+            print(f"\n   Fixas sugeridas: {fixed}")
+            es = input("   Excluídas (ENTER pular): ").strip()
+            try:
+                excluded = [int(x) for x in es.split()] if es else []
+                excluded = validate_numbers(excluded, 'excluídas')
+            except ValueError as e:
+                print(f"❌ {e}"); continue
+            gerar = input("   Gerar? (s/n): ").strip().lower()
             if gerar == 's':
-                metodo = input("   Método [1. Pair, 2. Triple]: ").strip() or "1"
-                method = 'pair_covering' if metodo == '1' else 'triple_covering'
-                opt = PortfolioOptimizer(contests, fixed=fixed, excluded=excluded,
-                                         range_pares=ranges.get('pares'),
-                                         range_moldura=ranges.get('moldura'),
-                                         range_primos=ranges.get('primos'),
-                                         range_soma=ranges.get('soma'),
-                                         range_amplitude=ranges.get('amplitude'),
-                                         range_consecutivos=ranges.get('consecutivos'))
-                portfolio = opt.optimize(5, 50000, method=method)
-                for i, (main, trevo) in enumerate(portfolio, 1):
-                    p = sum(1 for x in main if x%2==0); pr = sum(1 for x in main if x in PRIMES); m = sum(1 for x in main if x in MOLDURA)
-                    print(f" {i}. Main: {main} | Trevos: {trevo} | P:{p} Pr:{pr} Borda:{m}")
-                if len(contests) > 200:
-                    bt = opt.backtest(portfolio, contests[-200:])
-                    print(f"\n🔬 BACKTEST: Lift={bt['lift']:.2f}x | ROI={bt['roi']:+.1f}%")
+                try:
+                    opt = PortfolioOptimizer(
+                        contests, fixed=fixed, excluded=excluded,
+                        range_pares=ranges.get('pares'),
+                        range_moldura=ranges.get('moldura'),
+                        range_primos=ranges.get('primos'),
+                        range_soma=ranges.get('soma'),
+                        range_amplitude=ranges.get('amplitude'),
+                        range_consecutivos=ranges.get('consecutivos'),
+                    )
+                    portfolio = opt.optimize(5, 50000, method='pair_covering')
+                    for i, (main, trevo) in enumerate(portfolio, 1):
+                        p = sum(1 for x in main if x%2==0)
+                        pr = sum(1 for x in main if x in PRIMES)
+                        m = sum(1 for x in main if x in MOLDURA)
+                        print(f" {i}. Main:{main} | Trevos:{trevo} | P:{p} Pr:{pr} Borda:{m}")
+                    if len(contests) > 200:
+                        bt = opt.backtest(portfolio, contests[-200:])
+                        print(f"\n🔬 p_draw_emp={bt['p_draw_empirical']:.4f} "
+                              f"lift={bt['lift_draw']:.3f} ROI_fixo={bt['roi_fixo_apenas']:+.1f}%")
+                except Exception as e:
+                    print(f"❌ {e}")
 
         elif op == '10':
-            try:
-                n_sim = int(input("\n   Número de simulações [1000]: ").strip() or "1000")
-            except: n_sim = 1000
-            blocos_str = input("   Blocos [50,100,200]: ").strip()
-            try:
-                block_sizes = [int(x) for x in blocos_str.split(',')] if blocos_str else [50,100,200]
-            except: block_sizes = [50,100,200]
-            monte_carlo_control(contests, n_sim, block_sizes)
+            try: ns = int(input("\n   Simulações [1000]: ").strip() or "1000")
+            except: ns = 1000
+            bs = input("   Blocos [50,100,200]: ").strip()
+            try: blocks = [int(x) for x in bs.split(',')] if bs else [50,100,200]
+            except: blocks = [50,100,200]
+            monte_carlo_control(contests, ns, blocks)
 
         elif op == '11':
-            try:
-                min_hist = int(input("\n   Histórico mínimo [200]: ").strip() or "200")
-            except: min_hist = 200
-            test_concurso_a_concurso(contests, min_hist)
+            try: mh = int(input("\n   Histórico mínimo [200]: ").strip() or "200")
+            except: mh = 200
+            test_concurso_a_concurso(contests, mh)
 
         elif op == '12':
             try:
-                train_size = int(input("\n   Tamanho do treino [500]: ").strip() or "500")
-                test_size = int(input("   Tamanho do teste [50]: ").strip() or "50")
-                step = int(input("   Passo [50]: ").strip() or "50")
-            except:
-                train_size, test_size, step = 500, 50, 50
-            excl_str = input("   Excluídas (ENTER para pular): ").strip()
-            excluded = [int(x) for x in excl_str.split()] if excl_str else []
-            walk_forward_structural(contests, train_size, test_size, step, excluded=excluded)
+                ts = int(input("\n   Treino [500]: ").strip() or "500")
+                te = int(input("   Teste [50]: ").strip() or "50")
+                st = int(input("   Passo [50]: ").strip() or "50")
+            except: ts, te, st = 500, 50, 50
+            es = input("   Excluídas (ENTER pular): ").strip()
+            try:
+                excluded = [int(x) for x in es.split()] if es else []
+                excluded = validate_numbers(excluded, 'excluídas')
+            except ValueError as e:
+                print(f"❌ {e}"); continue
+            walk_forward_structural(contests, ts, te, st, excluded=excluded)
 
         elif op == '13':
-            try:
-                win = int(input("\n   Janela da média móvel [50]: ").strip() or "50")
-            except ValueError:
-                win = 50
+            try: win = int(input("\n   Janela [50]: ").strip() or "50")
+            except: win = 50
             audit_scale_factor(contests, window=win)
 
         elif op == '14':
             jan_str = input(f"\n   Janelas [{' '.join(map(str, WINDOWS_DEFAULT))}]: ").strip()
-            try:
-                windows = [int(x) for x in jan_str.split()] if jan_str else WINDOWS_DEFAULT
-            except:
-                windows = WINDOWS_DEFAULT
+            try: windows = [int(x) for x in jan_str.split()] if jan_str else WINDOWS_DEFAULT
+            except: windows = WINDOWS_DEFAULT
             gam_str = input(f"   γ grid [{' '.join(map(str, GAMMA_GRID))}]: ").strip()
-            try:
-                gamma_grid = [float(x) for x in gam_str.split()] if gam_str else GAMMA_GRID
-            except:
-                gamma_grid = GAMMA_GRID
-            try:
-                iid_mc = int(input("   Amostras IID MC [1000]: ").strip() or "1000")
-            except:
-                iid_mc = 1000
+            try: gamma_grid = [float(x) for x in gam_str.split()] if gam_str else GAMMA_GRID
+            except: gamma_grid = GAMMA_GRID
+            try: iid_mc = int(input("   IID MC [200]: ").strip() or "200")
+            except: iid_mc = 200
             audit_gamma_coefficient(contests, windows=windows, gamma_grid=gamma_grid, iid_mc=iid_mc)
+
+        elif op == '15':
+            integrity_audit()
 
         elif op == '0':
             break
         else:
             print("Opção inválida.")
+
 
 if __name__ == "__main__":
     main()
