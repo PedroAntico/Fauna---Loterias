@@ -2,22 +2,35 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v49.7.0
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v49.8.0
+
+EVOLUÇÃO DO v49.7.0:
+✅ Módulo de ATRASO DE COMBINAÇÕES (k=3..6) — menu 16
+✅ CombinationDelayAnalyzer: z-score, %ile normal, tendência 30/100
+✅ Welford incremental para mean/var (sem armazenar gaps)
+✅ rank_combination_delays: ranking por z_score / delay / ratio / max_ratio
+✅ Exportação CSV opcional
+✅ Aviso estatístico explícito: atraso NÃO é previsão
 
 EVOLUÇÃO DO v49.6.0:
 ✅ Joint Pair+Triple: score marginal log-utility para pares E trincas
 ✅ Concentração de pares e trincas calibrada (95º percentil do pool)
-✅ Scorer classes isoladas: AdaptivePairScorer, AdaptiveTripleScorer,
-   ExposureScorer, StructureScorer
 ✅ Exposição normalizada: −2·Σ(c_d − t_d) / (18·n_games) → [−1,+1]
 ✅ Índices compactos (PAIR_INDEX/TRIPLE_INDEX + dict) pré-computados
 ✅ Busca local CONJUNTA por substituição, aceita só se score global melhora
 ✅ Experimento 4 braços (A clássico, B adaptive pair, C joint, D full)
-✅ Sem histórico de trincas individuais (2300 alvos = ruído)
+
+EVOLUÇÃO DO v49.5.0:
+✅ Amostragem de semifixas corrigida (weighted k DENTRO do retry loop)
+✅ HistoricalProfile: regularização POR JANELA, depois mistura
+✅ Score adaptativo NORMALIZADO
+✅ Pair covering adaptativo usa log utility Σ log(1+c_p)
+✅ target_counts extraído do pool válido
+✅ backtest_vs_null aceita candidate_pool
 """
 
 import numpy as np
-from scipy.stats import hypergeom, binomtest, ttest_rel
+from scipy.stats import hypergeom, binomtest, ttest_rel, norm as _norm
 from collections import defaultdict
 from itertools import combinations, permutations
 import os, random, time, warnings
@@ -55,7 +68,7 @@ BITMASK_CACHE = BitmaskCache()
 mask_intersection = lambda m1, m2: (m1 & m2).bit_count()
 
 # ============================================================
-# PRÉ-COMPUTAÇÃO DE PARES E TRINCAS (bitmask para covering clássico)
+# PRÉ-COMPUTAÇÃO DE PARES E TRINCAS
 # ============================================================
 PAIR_BIT = [[0] * 25 for _ in range(25)]
 _idx = 0
@@ -80,9 +93,6 @@ for i in range(25):
             TRIPLE_BIT[k][j][i] = bit
             _idx += 1
 
-# ============================================================
-# v49.7 — ÍNDICES COMPACTOS (dict + array) PARA JOINT OPTIMIZER
-# ============================================================
 PAIR_DICT = {}
 _idx = 0
 for i in range(25):
@@ -90,7 +100,7 @@ for i in range(25):
         PAIR_DICT[(i, j)] = _idx
         PAIR_DICT[(j, i)] = _idx
         _idx += 1
-N_PAIRS = _idx  # 300
+N_PAIRS = _idx
 
 TRIPLE_DICT = {}
 _idx = 0
@@ -98,12 +108,11 @@ for i, j, k in combinations(range(25), 3):
     for perm in permutations((i, j, k)):
         TRIPLE_DICT[perm] = _idx
     _idx += 1
-N_TRIPLES = _idx  # 2300
+N_TRIPLES = _idx
 
-# escala teórica de utilidade log máxima
-PAIR_UTIL_MAX_PER_GAME = 105 * LOG2     # ≈ 72.8
-TRIPLE_UTIL_MAX_PER_GAME = 455 * LOG2   # ≈ 315.4
-STRUCTURE_SCALE = 105 * 0.1             # ~10.5
+PAIR_UTIL_MAX_PER_GAME = 105 * LOG2
+TRIPLE_UTIL_MAX_PER_GAME = 455 * LOG2
+STRUCTURE_SCALE = 105 * 0.1
 
 
 def _pairs_mask(game):
@@ -129,14 +138,6 @@ def _triples_mask(game):
 
 
 def _precompute_cand_indices(pool):
-    """
-    Gera arrays compactos:
-      cand_pair_idx  : (n, 105) int16  — índice de cada par no array global
-      cand_triple_idx: (n, 455) int16  — índice de cada trinca
-      cand_dezena_idx: (n, 15)  int8   — dezenas 0-indexed
-
-    Dict lookups são ~5× mais rápidos que numpy 3D scalar lookup em Python.
-    """
     n_cand = len(pool)
     cp = np.zeros((n_cand, 105), dtype=np.int16)
     ct = np.zeros((n_cand, 455), dtype=np.int16)
@@ -159,7 +160,6 @@ def _precompute_cand_indices(pool):
 
 
 def _compute_target_counts(pool, n_games):
-    """target_counts[d] = E[contagem de d na carteira] sobre o POOL VÁLIDO."""
     counts = np.zeros(25)
     for g in pool:
         for d in g:
@@ -179,7 +179,6 @@ def load_criteria_games(filename='jogos_criterios.txt'):
     path = os.path.join(base_dir, filename)
     if not os.path.exists(path):
         raise FileNotFoundError(f"Arquivo de critérios não encontrado: {path}")
-
     games = []
     with open(path, 'r', encoding='utf-8') as f:
         for line in f:
@@ -191,16 +190,13 @@ def load_criteria_games(filename='jogos_criterios.txt'):
                 and len(set(nums)) == len(nums)
                 and all(1 <= x <= 25 for x in nums)):
                 games.append(sorted(nums))
-
     if not games:
         raise ValueError("Nenhum jogo critério válido encontrado.")
-
     CRITERIA_GAMES = games
     CRITERIA_MASKS = []
     for g in games:
         mask = BITMASK_CACHE.get_mask(g)
         CRITERIA_MASKS.append((mask, 14 if len(g) == 19 else 13))
-
     print("\n📋 JOGOS CRITÉRIOS CARREGADOS")
     print(f"   Total: {len(games)}")
     for sz in (19, 18, 17, 16):
@@ -323,17 +319,14 @@ def portfolio_metrics(portfolio):
             pair_counts[(a, b)] += 1
         for t in combinations(gs, 3):
             triple_counts[t] += 1
-
     n_distinct_pairs = len(pair_counts)
     n_distinct_triples = len(triple_counts)
     total_pair_inc = sum(pair_counts.values())
     total_triple_inc = sum(triple_counts.values())
-
     overlaps = []
     for i in range(len(portfolio)):
         for j in range(i + 1, len(portfolio)):
             overlaps.append(len(set(portfolio[i]) & set(portfolio[j])))
-
     return {
         'n_distinct_pairs': n_distinct_pairs,
         'n_distinct_triples': n_distinct_triples,
@@ -446,7 +439,7 @@ def backtest_portfolio(portfolio, test_draws):
             'hit_distribution': hit_counts}
 
 # ============================================================
-# GERADOR BRUTO (v49.6: weighted k DENTRO do retry)
+# GERADOR BRUTO
 # ============================================================
 class LooseGenerator:
     def generate_one(self, fixed=None, semifixed=None, min_semifixed=0, max_semifixed=None,
@@ -490,7 +483,6 @@ class LooseGenerator:
                 weights.append(0)
         if sum(weights) == 0:
             return None
-        # v49.6: weighted k DENTRO do retry (rejection uniforme)
         for _ in range(200):
             n_semi = random.choices(ks_list, weights=weights, k=1)[0]
             n_rest = n_free - n_semi
@@ -517,7 +509,7 @@ class LooseGenerator:
         return None
 
 # ============================================================
-# PERFIL HISTÓRICO (v49.6: regulariza POR JANELA)
+# PERFIL HISTÓRICO REGULARIZADO
 # ============================================================
 class HistoricalProfile:
     WINDOWS = (30, 100, 300)
@@ -574,10 +566,9 @@ class HistoricalProfile:
             print(f"     {idx+1:2d}: {self.dezena_freq[idx]:.3f} ({dev[idx]:+.3f})")
 
 # ============================================================
-# v49.7 — SCORER CLASSES
+# SCORER CLASSES
 # ============================================================
 class AdaptivePairScorer:
-    """Utilidade log marginal (retorno decrescente) + penalidade de concentração."""
     def __init__(self, lambda_conc=0.05, c_max=None):
         self.lambda_conc = lambda_conc
         self.c_max = c_max
@@ -588,13 +579,11 @@ class AdaptivePairScorer:
         if self.c_max is not None:
             after = np.maximum(0, vals + 1 - self.c_max) ** 2
             before = np.maximum(0, vals - self.c_max) ** 2
-            conc = (after - before).sum()
-            log_gain -= self.lambda_conc * conc
+            log_gain -= self.lambda_conc * (after - before).sum()
         return log_gain
 
 
 class AdaptiveTripleScorer:
-    """Mesma lógica para trincas, sem histórico."""
     def __init__(self, lambda_conc=0.01, c_max=None):
         self.lambda_conc = lambda_conc
         self.c_max = c_max
@@ -605,13 +594,11 @@ class AdaptiveTripleScorer:
         if self.c_max is not None:
             after = np.maximum(0, vals + 1 - self.c_max) ** 2
             before = np.maximum(0, vals - self.c_max) ** 2
-            conc = (after - before).sum()
-            log_gain -= self.lambda_conc * conc
+            log_gain -= self.lambda_conc * (after - before).sum()
         return log_gain
 
 
 class ExposureScorer:
-    """−2·Σ(c_d − t_d) / (18·n_games) → [−1, +1]."""
     def __init__(self, target_counts, n_games):
         self.target = target_counts
         self.scale = 18.0 * n_games
@@ -622,7 +609,6 @@ class ExposureScorer:
 
 
 class StructureScorer:
-    """Σ (pair_freq − 0.35) sobre pares do candidato, normalizado."""
     def __init__(self, profile, n_games):
         self.scale = STRUCTURE_SCALE * n_games
         if profile is not None:
@@ -641,17 +627,10 @@ class StructureScorer:
                 s += self.bonus[gs[a], gs[b]]
         return s / self.scale
 
-
 # ============================================================
-# v49.7 — JOINT PORTFOLIO OPTIMIZER
+# JOINT PORTFOLIO OPTIMIZER
 # ============================================================
 class JointPortfolioOptimizer:
-    """
-    Greedy conjunto Pair+Triple+Exposure+Structure com utilidade marginal.
-
-    Pesos default = v49.7 spec:
-        pair=0.40, triple=0.35, exposure=0.15, structure=0.10
-    """
     def __init__(self, pool, n_games, profile=None,
                  precomputed_base=None, seed=None,
                  lambda_pair_conc=0.05, lambda_triple_conc=0.01,
@@ -781,7 +760,6 @@ class JointPortfolioOptimizer:
 
         eu = -np.sum((dc - self.target_counts) ** 2) / (
             2.0 * 15.0 * 0.6 * self.n_games)
-
         su = sum(self.structure_scorer.static_gain(g) for g in portfolio)
 
         return (weights.get('pair', 0.0) * pu
@@ -822,7 +800,7 @@ class JointPortfolioOptimizer:
         return best
 
 # ============================================================
-# PORTFOLIO OPTIMIZER (v49.6 mantido + método joint)
+# PORTFOLIO OPTIMIZER
 # ============================================================
 class PortfolioOptimizer:
     def __init__(self, contests, fixed=None, semifixed=None,
@@ -858,21 +836,6 @@ class PortfolioOptimizer:
              "min": g["min"], "max": g["max"]}
             for g in (groups or [])
         ]
-
-    def _effective_universe_with_semifixas(self):
-        fixed_set = set(self.fixed); excl_set = set(self.excluded)
-        semi_set = set(self.semifixed) - fixed_set - excl_set
-        free = set(range(1, 26)) - fixed_set - excl_set
-        non_semi_free = free - semi_set
-        s = len(semi_set); f = len(non_semi_free); n_free = 15 - len(fixed_set)
-        if n_free < 0:
-            return 0
-        min_k = max(0, self.min_semifixed)
-        max_k = s if self.max_semifixed is None else min(self.max_semifixed, s)
-        lo = max(min_k, n_free - f, 0); hi = min(max_k, n_free, s)
-        if lo > hi:
-            return 0
-        return sum(comb(s, k) * comb(f, n_free - k) for k in range(lo, hi + 1))
 
     def generate_pool(self, n_candidates):
         pool, seen = [], set()
@@ -1037,7 +1000,7 @@ class PortfolioOptimizer:
                  joint_weights=None):
         print(f"\n🧩 CARTEIRA: {n_games} jogos | {method} | pool={n_candidates:,}")
         if exact_universe:
-            raise NotImplementedError("Enumeração exata mantida apenas no v49.6")
+            raise NotImplementedError("Enumeração exata requer v49.6")
         pool = self.generate_pool(n_candidates)
         if len(pool) < n_games:
             raise RuntimeError(f"Pool insuficiente: {len(pool)} < {n_games}.")
@@ -1189,7 +1152,7 @@ def input_pool_size(default=600000):
         return default
 
 # ============================================================
-# ANÁLISE (PredictiveRanking, etc.) — inalterado
+# ANÁLISE ESTRUTURAL
 # ============================================================
 def extract_filter(dz, name):
     d = sorted(dz)
@@ -1266,8 +1229,270 @@ class StructuralPredictor:
         return r
 
 # ============================================================
-# v49.7 — EXPERIMENTO 4 BRAÇOS
+# v49.8 — RANKING DE ATRASO DE COMBINAÇÕES (k=3..6)
 # ============================================================
+class CombinationDelayAnalyzer:
+    """
+    Analisa atraso de combinações de k dezenas (k ∈ {3,4,5,6}).
+
+    Para cada combinação que apareceu ao menos 1x:
+      count, first_seen, last_seen, current_delay
+      mean_gap (média empírica dos intervalos entre aparições)
+      std_gap  (desvio-padrão empírico dos intervalos)
+      max_gap  (maior intervalo já observado)
+      z_score  = (current_delay - mean_gap) / std_gap
+      percentile_approx via CDF normal
+
+    ⚠️  Atraso NÃO é previsão. A probabilidade de uma combinação
+        aparecer em um concurso justo é SEMPRE P_k, independente do atraso.
+        O sorteio não compensa atraso.
+    """
+
+    NAMES = {3: 'TRINCAS', 4: 'QUADRAS', 5: 'QUINAS', 6: 'SENAS'}
+
+    def __init__(self, contests, k=3, trend_windows=(30, 100)):
+        assert 3 <= k <= 6, "k deve ser 3, 4, 5 ou 6"
+        self.k = k
+        self.contests = contests
+        self.n_contests = len(contests)
+        self.trend_windows = trend_windows
+        self.contests_sets = [set(c['dezenas']) for c in contests]
+        self.p_theoretical = comb(25 - k, 15 - k) / comb(25, 15)
+        self.theoretical_gap = 1.0 / self.p_theoretical
+        self.stats = {}
+        t0 = time.time()
+        self._fit()
+        self.fit_time = time.time() - t0
+
+    def _fit(self):
+        stats = self.stats
+        k = self.k
+        for idx, c in enumerate(self.contests):
+            dz = sorted(c['dezenas'])
+            for combo in combinations(dz, k):
+                s = stats.get(combo)
+                if s is None:
+                    stats[combo] = {
+                        'count': 1, 'first_seen': idx, 'last_seen': idx,
+                        'max_gap': 0, 'gap_count': 0,
+                        'mean_gap': 0.0, 'M2': 0.0,
+                    }
+                else:
+                    gap = idx - s['last_seen']
+                    s['count'] += 1
+                    s['gap_count'] += 1
+                    gc = s['gap_count']
+                    delta = gap - s['mean_gap']
+                    s['mean_gap'] += delta / gc
+                    s['M2'] += delta * (gap - s['mean_gap'])
+                    if gap > s['max_gap']:
+                        s['max_gap'] = gap
+                    s['last_seen'] = idx
+
+    def current_delay(self, s):
+        return self.n_contests - 1 - s['last_seen']
+
+    def std_gap(self, s):
+        if s['gap_count'] < 2:
+            return None
+        return (s['M2'] / (s['gap_count'] - 1)) ** 0.5
+
+    def z_score(self, s):
+        sd = self.std_gap(s)
+        if sd is None or sd == 0:
+            return None
+        return (self.current_delay(s) - s['mean_gap']) / sd
+
+    def percentile_approx(self, s):
+        z = self.z_score(s)
+        if z is None:
+            return None
+        return float(_norm.cdf(z) * 100)
+
+    def trend(self, combo):
+        combo_set = set(combo)
+        out = {}
+        for w in self.trend_windows:
+            if w > self.n_contests:
+                continue
+            n_w = min(w, self.n_contests)
+            start = self.n_contests - n_w
+            obs = sum(1 for cs in self.contests_sets[start:] if combo_set <= cs)
+            exp = self.p_theoretical * n_w
+            sd = (exp * (1 - self.p_theoretical)) ** 0.5
+            z = (obs - exp) / sd if sd > 0 else 0.0
+            arrow = '↑' if z >= 2 else ('↓' if z <= -2 else '→')
+            out[w] = {'observed': obs, 'expected': exp, 'z': z, 'arrow': arrow}
+        return out
+
+    def rank(self, method='z_score', top_n=20, min_count=2):
+        rows = []
+        for combo, s in self.stats.items():
+            if s['count'] < min_count:
+                continue
+            d = self.current_delay(s)
+            if method == 'z_score':
+                score = self.z_score(s)
+            elif method == 'delay':
+                score = d
+            elif method == 'ratio':
+                score = d / self.theoretical_gap
+            elif method == 'max_ratio':
+                score = d / s['max_gap'] if s['max_gap'] > 0 else None
+            else:
+                raise ValueError(f"method inválido: {method}")
+            if score is None:
+                continue
+            rows.append((score, combo, s, d))
+        rows.sort(key=lambda r: r[0], reverse=True)
+        return rows[:top_n]
+
+    def summary(self):
+        total = comb(25, self.k)
+        return {
+            'k': self.k, 'total_possible': total,
+            'appeared_at_least_once': len(self.stats),
+            'never_appeared': total - len(self.stats),
+            'p_theoretical': self.p_theoretical,
+            'theoretical_gap': self.theoretical_gap,
+            'n_contests': self.n_contests, 'fit_time': self.fit_time,
+        }
+
+    def distribution_summary(self):
+        if not self.stats:
+            return None
+        arr = np.array([self.current_delay(s) for s in self.stats.values()])
+        return {
+            'n': len(arr), 'mean': float(arr.mean()), 'std': float(arr.std()),
+            'min': int(arr.min()), 'max': int(arr.max()),
+            'p25': int(np.percentile(arr, 25)), 'p50': int(np.percentile(arr, 50)),
+            'p75': int(np.percentile(arr, 75)), 'p90': int(np.percentile(arr, 90)),
+            'p95': int(np.percentile(arr, 95)),
+        }
+
+
+def rank_combination_delays(contests, ks=(3, 4, 5, 6), top_n=20,
+                            method='z_score', min_count=2, save_csv=False):
+    if not contests:
+        print("❌ Sem concursos.")
+        return []
+
+    method_names = {
+        'z_score': 'Z-SCORE (atraso vs própria média histórica)',
+        'delay': 'ATRASO ABSOLUTO (concursos desde a última aparição)',
+        'ratio': 'RAZÃO vs INTERVALO TEÓRICO',
+        'max_ratio': 'RAZÃO vs ATRASO MÁXIMO HISTÓRICO',
+    }
+
+    all_results = []
+    for k in ks:
+        print(f"\n{'='*78}")
+        print(f"📊 RANKING DE ATRASO — {CombinationDelayAnalyzer.NAMES[k]} (k={k})")
+        print(f"   Método: {method_names[method]} | min_count={min_count}")
+        print(f"{'='*78}")
+
+        analyzer = CombinationDelayAnalyzer(contests, k=k)
+        print(f"⏱️  Indexação: {analyzer.fit_time:.1f}s")
+
+        summ = analyzer.summary()
+        print(f"\n📈 SUMÁRIO")
+        print(f"   Universo total:       {summ['total_possible']:>10,}")
+        print(f"   Apareceram ≥ 1x:      {summ['appeared_at_least_once']:>10,}")
+        print(f"   Nunca apareceram:     {summ['never_appeared']:>10,}")
+        print(f"   P(aparecer/concurso)  {summ['p_theoretical']*100:>10.3f}%")
+        print(f"   Intervalo teórico:    {summ['theoretical_gap']:>10.2f} concursos")
+        print(f"   Concursos analisados: {summ['n_contests']:>10,}")
+
+        dist = analyzer.distribution_summary()
+        if dist:
+            print(f"\n📊 DISTRIBUIÇÃO DO ATRASO ATUAL (entre as que apareceram)")
+            print(f"   Média={dist['mean']:.2f}  σ={dist['std']:.2f}  "
+                  f"Min={dist['min']}  Máx={dist['max']}")
+            print(f"   P25={dist['p25']}  P50={dist['p50']}  P75={dist['p75']}  "
+                  f"P90={dist['p90']}  P95={dist['p95']}")
+
+        rows = analyzer.rank(method=method, top_n=top_n, min_count=min_count)
+        if not rows:
+            print(f"\n⚠️  Nenhuma combinação com count ≥ {min_count}.")
+            continue
+
+        print(f"\n🏆 TOP {top_n} MAIS ATRASADAS")
+        header = (f"{'#':>3} | {'Combinação':<20} | {'Última':>7} | {'Atraso':>6} | "
+                  f"{'Média':>6} | {'σ':>6} | {'Máx':>4} | {'N':>5} | "
+                  f"{'Score':>7} | {'%ile':>5} | {'T30':>3} | {'T100':>4}")
+        print(header)
+        print('-' * len(header))
+
+        for i, (score, combo, s, d) in enumerate(rows, 1):
+            combo_str = '-'.join(f"{x:02d}" for x in combo)
+            ultima = contests[s['last_seen']]['concurso']
+            mean_str = f"{s['mean_gap']:.2f}" if s['gap_count'] > 0 else "—"
+            sd = analyzer.std_gap(s)
+            sd_str = f"{sd:.2f}" if sd is not None else "—"
+            pct = analyzer.percentile_approx(s)
+            pct_str = f"{pct:.0f}" if pct is not None else "—"
+            trend = analyzer.trend(combo)
+            t30 = trend.get(30, {}).get('arrow', '—')
+            t100 = trend.get(100, {}).get('arrow', '—')
+            print(f"{i:>3} | {combo_str:<20} | {ultima:>7} | {d:>6} | "
+                  f"{mean_str:>6} | {sd_str:>6} | {s['max_gap']:>4} | "
+                  f"{s['count']:>5} | {score:>7.2f} | {pct_str:>5} | "
+                  f"{t30:>3} | {t100:>4}")
+            all_results.append({
+                'k': k, 'rank': i, 'combo': combo_str, 'method': method,
+                'last_concurso': ultima, 'current_delay': d,
+                'mean_gap': s['mean_gap'], 'std_gap': sd, 'max_gap': s['max_gap'],
+                'count': s['count'], 'score': float(score),
+                'percentile_approx': pct, 'trend_30': t30, 'trend_100': t100,
+            })
+
+    if save_csv and all_results:
+        try:
+            import csv as _csv
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            path = os.path.join(base_dir, f"ranking_atraso_{method}.csv")
+            with open(path, 'w', newline='', encoding='utf-8') as f:
+                w = _csv.DictWriter(f, fieldnames=list(all_results[0].keys()))
+                w.writeheader()
+                for row in all_results:
+                    w.writerow(row)
+            print(f"\n💾 Salvo em: {path}")
+        except Exception as e:
+            print(f"\n⚠️  Erro ao salvar CSV: {e}")
+
+    return all_results
+
+# ============================================================
+# WALK-FORWARD E EXPERIMENTOS
+# ============================================================
+def walk_forward_structural(contests, train_size=500, test_size=50, step=50,
+                            excluded=None, use_criteria=False):
+    print(f"\n🔬 WALK-FORWARD ESTRUTURAL")
+    rates = []
+    start = train_size
+    while start + test_size <= len(contests):
+        train = contests[start-train_size:start]
+        test = contests[start:start+test_size]
+        ranges = StructuralPredictor(train).predict_ranges(method='recent')
+        opt = PortfolioOptimizer(
+            train, excluded=excluded, use_criteria=use_criteria,
+            range_pares=ranges.get('pares'), range_moldura=ranges.get('moldura'),
+            range_primos=ranges.get('primos'), range_soma=ranges.get('soma'),
+            range_amplitude=ranges.get('amplitude'),
+            range_consecutivos=ranges.get('consecutivos'))
+        try:
+            p = opt.optimize(5, 10000, method='pair_covering')
+            bt = opt.backtest(p, test)
+            rates.append(bt['draws_with_win_rate'])
+            print(f"   Janela {start}: rate={bt['draws_with_win_rate']:.3f}")
+        except Exception as e:
+            print(f"   Janela {start}: ERRO — {e}")
+        start += step
+    if rates:
+        print(f"\n📊 Média: {np.mean(rates):.4f} ± {np.std(rates):.4f}")
+    return rates
+
+
 def four_arm_experiment(contests, n_games=5, n_candidates=10000,
                         n_replicates=10, test_size=200,
                         fixed=None, excluded=None, use_local_search=True):
@@ -1304,7 +1529,6 @@ def four_arm_experiment(contests, n_games=5, n_candidates=10000,
         pA = opt.select_covering(pool, n_games, level='pair')
         pB = opt.select_covering_adaptive(pool, n_games, profile, level='pair')
 
-        # Pré-computação compartilhada entre C e D
         (cp, ct, cz) = _precompute_cand_indices(pool)
         tgt = _compute_target_counts(pool, n_games)
         shared_base = {'cand_pair_idx': cp, 'cand_triple_idx': ct,
@@ -1362,36 +1586,6 @@ def four_arm_experiment(contests, n_games=5, n_candidates=10000,
     print("      O p-valor mede robustez frente à semente, NÃO generalização temporal.")
 
     return {'results': results, 'metrics': metrics}
-
-# ============================================================
-# WALK-FORWARD / 3 BRAÇOS (v49.6 mantido)
-# ============================================================
-def walk_forward_structural(contests, train_size=500, test_size=50, step=50,
-                            excluded=None, use_criteria=False):
-    print(f"\n🔬 WALK-FORWARD ESTRUTURAL")
-    rates = []
-    start = train_size
-    while start + test_size <= len(contests):
-        train = contests[start-train_size:start]
-        test = contests[start:start+test_size]
-        ranges = StructuralPredictor(train).predict_ranges(method='recent')
-        opt = PortfolioOptimizer(
-            train, excluded=excluded, use_criteria=use_criteria,
-            range_pares=ranges.get('pares'), range_moldura=ranges.get('moldura'),
-            range_primos=ranges.get('primos'), range_soma=ranges.get('soma'),
-            range_amplitude=ranges.get('amplitude'),
-            range_consecutivos=ranges.get('consecutivos'))
-        try:
-            p = opt.optimize(5, 10000, method='pair_covering')
-            bt = opt.backtest(p, test)
-            rates.append(bt['draws_with_win_rate'])
-            print(f"   Janela {start}: rate={bt['draws_with_win_rate']:.3f}")
-        except Exception as e:
-            print(f"   Janela {start}: ERRO — {e}")
-        start += step
-    if rates:
-        print(f"\n📊 Média: {np.mean(rates):.4f} ± {np.std(rates):.4f}")
-    return rates
 
 
 def three_arm_experiment(contests, n_games=5, n_candidates=10000,
@@ -1492,7 +1686,7 @@ def _ask_joint_weights():
 
 def main():
     print("=" * 70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v49.7.0")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v49.8.0")
     print("=" * 70)
 
     contests = load_all_contests('resultados_lotofacil.csv')
@@ -1521,7 +1715,8 @@ def main():
         print("12. Walk-forward estrutural")
         print("13. EXPERIMENTO 3 BRAÇOS")
         print("14. COMPARAR Pair Clássico vs Adaptive (v49.6)")
-        print("15. EXPERIMENTO 4 BRAÇOS (v49.7: classic/adaptive/joint/joint+profile)")
+        print("15. EXPERIMENTO 4 BRAÇOS (v49.7)")
+        print("16. RANKING DE ATRASO (trincas/quadras/quinas/senas) v49.8")
         print("0.  Sair")
         op = input("Escolha: ").strip()
 
@@ -1565,7 +1760,7 @@ def main():
                 print_null_comparison(null_r, "Gerada")
 
         elif op == '9':
-            print("\n   ⚠️ v49.7: treino/teste estanques")
+            print("\n   ⚠️ v49.8: treino/teste estanques")
             train = contests[:-200]; test = contests[-200:]
             ranges = StructuralPredictor(train).predict_ranges(method='recent')
             fixed = [15, 16, 20]
@@ -1591,6 +1786,38 @@ def main():
             bt = opt.backtest(portfolio, test)
             print(f"\n📊 BACKTEST OOS: rate={bt['draws_with_win_rate']:.4f} "
                   f"roi={bt['roi']:+.1f}%")
+
+        elif op == '12':
+            try:
+                ts = int(input("\n   Treino [500]: ").strip() or "500")
+                te = int(input("   Teste [50]: ").strip() or "50")
+                st = int(input("   Passo [50]: ").strip() or "50")
+            except:
+                ts, te, st = 500, 50, 50
+            es = input("   Excluídas: ").strip()
+            excluded = [int(x) for x in es.split()] if es else []
+            walk_forward_structural(contests, ts, te, st, excluded=excluded)
+
+        elif op == '13':
+            try:
+                ng = int(input("\n   n_games [5]: ").strip() or "5")
+                nc = int(input("   n_candidates [10000]: ").strip() or "10000")
+                nr = int(input("   n_replicates [100]: ").strip() or "100")
+                tsz = int(input("   test_size [200]: ").strip() or "200")
+            except:
+                ng, nc, nr, tsz = 5, 10000, 100, 200
+            fs = input("   Fixas: ").strip()
+            fixed = [int(x) for x in fs.split()] if fs else []
+            es = input("   Excluídas: ").strip()
+            excluded = [int(x) for x in es.split()] if es else []
+            ranges = _ask_structural_ranges()
+            groups = input_groups(fixed, [], excluded)
+            use_crit = input("   Braço A usa critérios? (s/n) [s]: ").strip().lower() != 'n'
+            three_arm_experiment(contests, n_games=ng, n_candidates=nc,
+                                 n_replicates=nr, test_size=tsz,
+                                 fixed=fixed, excluded=excluded,
+                                 structural_ranges=ranges, groups=groups,
+                                 use_criteria_in_A=use_crit)
 
         elif op == '14':
             print("\n⚖️ COMPARAÇÃO v49.6: Pair Clássico vs Adaptive")
@@ -1642,37 +1869,38 @@ def main():
                                 fixed=fixed, excluded=excluded,
                                 use_local_search=ls)
 
-        elif op == '12':
-            try:
-                ts = int(input("\n   Treino [500]: ").strip() or "500")
-                te = int(input("   Teste [50]: ").strip() or "50")
-                st = int(input("   Passo [50]: ").strip() or "50")
-            except:
-                ts, te, st = 500, 50, 50
-            es = input("   Excluídas: ").strip()
-            excluded = [int(x) for x in es.split()] if es else []
-            walk_forward_structural(contests, ts, te, st, excluded=excluded)
+        elif op == '16':
+            print("\n📊 RANKING DE ATRASO DE COMBINAÇÕES (v49.8)")
+            print("   ⚠️  Atraso NÃO é previsão — P(aparecer) = P_k sempre.")
+            print("   [1] Trincas (k=3)   [2] Quadras (k=4)")
+            print("   [3] Quinas  (k=5)   [4] Senas   (k=6)")
+            print("   [5] Todas")
+            choice = input("   Escolha [5]: ").strip() or "5"
+            ks = {'1': (3,), '2': (4,), '3': (5,), '4': (6,),
+                  '5': (3, 4, 5, 6)}.get(choice, (3, 4, 5, 6))
 
-        elif op == '13':
+            print("\n   Método de ranking:")
+            print("     [1] Z-score (atraso vs própria média histórica)")
+            print("     [2] Atraso absoluto")
+            print("     [3] Razão vs intervalo teórico")
+            print("     [4] Razão vs atraso máximo histórico")
+            mc = input("   Escolha [1]: ").strip() or "1"
+            method = {'1': 'z_score', '2': 'delay',
+                      '3': 'ratio', '4': 'max_ratio'}.get(mc, 'z_score')
+
             try:
-                ng = int(input("\n   n_games [5]: ").strip() or "5")
-                nc = int(input("   n_candidates [10000]: ").strip() or "10000")
-                nr = int(input("   n_replicates [100]: ").strip() or "100")
-                tsz = int(input("   test_size [200]: ").strip() or "200")
+                top_n = int(input("   Top N [20]: ").strip() or "20")
             except:
-                ng, nc, nr, tsz = 5, 10000, 100, 200
-            fs = input("   Fixas: ").strip()
-            fixed = [int(x) for x in fs.split()] if fs else []
-            es = input("   Excluídas: ").strip()
-            excluded = [int(x) for x in es.split()] if es else []
-            ranges = _ask_structural_ranges()
-            groups = input_groups(fixed, [], excluded)
-            use_crit = input("   Braço A usa critérios? (s/n) [s]: ").strip().lower() != 'n'
-            three_arm_experiment(contests, n_games=ng, n_candidates=nc,
-                                 n_replicates=nr, test_size=tsz,
-                                 fixed=fixed, excluded=excluded,
-                                 structural_ranges=ranges, groups=groups,
-                                 use_criteria_in_A=use_crit)
+                top_n = 20
+            try:
+                min_count = int(input("   Mínimo de aparições [2]: ").strip() or "2")
+            except:
+                min_count = 2
+            save = input("   Salvar CSV? (s/n) [n]: ").strip().lower() == 's'
+
+            rank_combination_delays(contests, ks=ks, top_n=top_n,
+                                    method=method, min_count=min_count,
+                                    save_csv=save)
 
         elif op == '6':
             bs = input("\n   Blocos [50,100,200,500]: ").strip()
