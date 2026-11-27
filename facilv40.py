@@ -2,23 +2,19 @@
 # -*- coding: utf-8 -*-
 
 """
-LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v49.5.0
+LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v49.6.0
 
-EVOLUÇÃO DO v49.4.3:
-✅ Histórico multi-janela (30/100/300) com regularização bayesiana (α=50)
-✅ Pair Covering ADAPTATIVO: ganho + histórico + balanço de dezenas + redundância
-✅ Correção de vazamento temporal no menu 9 (treino/teste estanques)
-✅ Novo menu 14: comparação pareada Pair clássico vs Adaptive (mesmo pool)
-✅ backtest_vs_null mantido (condição apenas em fixed/excluded)
-
-EVOLUÇÃO DO v49.4.2:
-✅ Semifixas respeitadas no modo exato (min/max validados por jogo)
-✅ allowed_pares/moldura/primos aplicados no modo exato
-✅ Universo efetivo calculado por combinatória exata (considera semifixas)
-✅ Relatório de rejeições por filtro (semifixas, allowed_*, ranges, grupos, critérios)
-✅ Covering explicita dupla amostragem: enumeração → amostra; amostra → covering (MAX_COVER)
-✅ Docstring corrigida: memória O(k) onde k = n_sample (reservoir)
-✅ Checagem de consistência quando não há filtros ativos
+EVOLUÇÃO DO v49.5.0:
+✅ Amostragem de semifixas corrigida (weighted k DENTRO do retry loop = rejection uniforme)
+✅ HistoricalProfile: regularização POR JANELA, depois mistura (matematicamente coerente)
+✅ Score adaptativo NORMALIZADO (componentes em escala comparável)
+✅ Pair covering adaptativo usa log utility Σ log(1+c_p) (retorno decrescente real)
+✅ Triple covering adaptativo usa bitmask + penalidade de repetição
+✅ target_counts extraído do pool válido (respeita fixas/grupos/filtros)
+✅ BUSCA LOCAL por substituição (pares incremental; trincas recomputação)
+✅ Menu 14: subamostra comum + métricas combinatórias + interpretação corrigida
+✅ backtest_vs_null aceita candidate_pool (nulo do mesmo universo válido)
+✅ portfolio_metrics: pares/trincas distintos, repetição, sobreposição, exposição
 """
 
 import numpy as np
@@ -257,6 +253,62 @@ def audit_portfolio(portfolio, groups=None, applied_criteria=True):
     return all_valid
 
 # ============================================================
+# MÉTRICAS DA CARTEIRA (v49.6)
+# ============================================================
+def portfolio_metrics(portfolio):
+    if not portfolio:
+        return {}
+    pair_counts = defaultdict(int)
+    triple_counts = defaultdict(int)
+    dezena_counts = np.zeros(25)
+    for g in portfolio:
+        gs = sorted(g)
+        for x in gs:
+            dezena_counts[x - 1] += 1
+        for a, b in combinations(gs, 2):
+            pair_counts[(a, b)] += 1
+        for t in combinations(gs, 3):
+            triple_counts[t] += 1
+
+    n_distinct_pairs = len(pair_counts)
+    n_distinct_triples = len(triple_counts)
+    total_pair_inc = sum(pair_counts.values())
+    total_triple_inc = sum(triple_counts.values())
+    avg_pair_rep = total_pair_inc / max(1, n_distinct_pairs)
+    avg_triple_rep = total_triple_inc / max(1, n_distinct_triples)
+
+    overlaps = []
+    for i in range(len(portfolio)):
+        for j in range(i + 1, len(portfolio)):
+            overlaps.append(len(set(portfolio[i]) & set(portfolio[j])))
+
+    return {
+        'n_distinct_pairs': n_distinct_pairs,
+        'n_distinct_triples': n_distinct_triples,
+        'avg_pair_repetition': avg_pair_rep,
+        'avg_triple_repetition': avg_triple_rep,
+        'avg_game_overlap': float(np.mean(overlaps)) if overlaps else 0.0,
+        'max_game_overlap': int(max(overlaps)) if overlaps else 0,
+        'dezena_counts': dezena_counts.tolist(),
+        'dezena_std': float(dezena_counts.std()),
+    }
+
+
+def print_portfolio_metrics(portfolio, label=""):
+    m = portfolio_metrics(portfolio)
+    if not m:
+        return
+    hdr = f"📊 MÉTRICAS DA CARTEIRA{' (' + label + ')' if label else ''}"
+    print(f"\n{hdr}")
+    print(f"   Pares distintos cobertos:    {m['n_distinct_pairs']:>5} / 300")
+    print(f"   Trincas distintas cobertas:  {m['n_distinct_triples']:>5} / 2300")
+    print(f"   Repetição média de pares:    {m['avg_pair_repetition']:.2f}")
+    print(f"   Repetição média de trincas:  {m['avg_triple_repetition']:.2f}")
+    print(f"   Sobreposição média:          {m['avg_game_overlap']:.2f}")
+    print(f"   Sobreposição máxima:         {m['max_game_overlap']}")
+    print(f"   Desvio-padrão de exposição:  {m['dezena_std']:.2f}")
+
+# ============================================================
 # CARREGAMENTO DE DADOS
 # ============================================================
 def load_all_contests(csv_file='resultados_lotofacil.csv'):
@@ -359,7 +411,7 @@ def backtest_portfolio(portfolio, test_draws):
     }
 
 # ============================================================
-# GERADOR BRUTO (modo rápido / tentativas)
+# GERADOR BRUTO
 # ============================================================
 class LooseGenerator:
     def generate_one(self, fixed=None, semifixed=None, min_semifixed=0, max_semifixed=None,
@@ -388,37 +440,57 @@ class LooseGenerator:
         excl_set = set(excluded)
         fixed_set = set(fixed) - excl_set
         semi_set = set(semifixed) - fixed_set - excl_set
-        banned = fixed_set | semi_set | excl_set
-        rest = list(set(range(1, 26)) - banned)
+        rest = list(set(range(1, 26)) - fixed_set - semi_set - excl_set)
         n_fix = len(fixed_set)
+        n_free = 15 - n_fix
+
+        if n_free < 0:
+            return None
 
         max_semi = len(semi_set) if max_semifixed is None else min(max_semifixed, len(semi_set))
         min_semi = max(min_semifixed, 0)
         if min_semi > max_semi:
             return None
 
-        n_semi = random.randint(min_semi, max_semi)
-        n_rest = 15 - n_fix - n_semi
-        if n_rest < 0 or n_rest > len(rest):
+        s = len(semi_set)
+        f = len(rest)
+        ks_list = list(range(min_semi, max_semi + 1))
+
+        # Pesos por combinações: P(k) ∝ C(s,k)·C(f, n_free-k).
+        # IMPORTANTE (v49.6): calculado UMA vez; a amostragem de k é feita
+        # DENTRO do retry loop para que retentativas por filtros resultem em
+        # rejection sampling uniforme sobre o universo válido.
+        weights = []
+        for k in ks_list:
+            if 0 <= k <= s and 0 <= n_free - k <= f:
+                weights.append(comb(s, k) * comb(f, n_free - k))
+            else:
+                weights.append(0)
+        total_w = sum(weights)
+        if total_w == 0:
             return None
 
         for _ in range(200):
+            n_semi = random.choices(ks_list, weights=weights, k=1)[0]
+            n_rest = n_free - n_semi
+
             semi_pick = set(random.sample(list(semi_set), n_semi)) if n_semi > 0 else set()
             rest_pick = set(random.sample(rest, n_rest)) if n_rest > 0 else set()
             game = sorted(fixed_set | semi_pick | rest_pick)
             if len(game) != 15:
                 continue
 
-            if allowed_pares is not None and sum(1 for x in game if x % 2 == 0) not in allowed_pares:
-                continue
-            if allowed_moldura is not None and sum(1 for x in game if x in MOLDURA) not in allowed_moldura:
-                continue
-            if allowed_primos is not None and sum(1 for x in game if x in PRIMES) not in allowed_primos:
-                continue
-
             pares = sum(1 for x in game if x % 2 == 0)
             mol = sum(1 for x in game if x in MOLDURA)
             prim = sum(1 for x in game if x in PRIMES)
+
+            if allowed_pares is not None and pares not in allowed_pares:
+                continue
+            if allowed_moldura is not None and mol not in allowed_moldura:
+                continue
+            if allowed_primos is not None and prim not in allowed_primos:
+                continue
+
             soma = sum(game)
             amp = max(game) - min(game)
             cons = sum(1 for i in range(len(game) - 1) if game[i+1] - game[i] == 1)
@@ -440,25 +512,25 @@ class LooseGenerator:
         return None
 
 # ============================================================
-# v49.5 — PERFIL HISTÓRICO REGULARIZADO
+# v49.6 — PERFIL HISTÓRICO REGULARIZADO (por janela)
 # ============================================================
 class HistoricalProfile:
     """
-    Mistura 0.5·P30 + 0.3·P100 + 0.2·P300 com regularização
-    em direção à frequência teórica (pseudo-contagens α).
+    Regulariza CADA janela individualmente (com o seu próprio n_w),
+    depois mistura com pesos 0.5 / 0.3 / 0.2.
 
-    Fornece:
-      - dezena_freq[d]  : P(dezena d aparecer em 1 jogo)  →  0.60 teórico
-      - pair_freq[a,b]  : P(par (a,b) aparecer em 1 jogo) →  0.35 teórico
+    Frequências teóricas:
+      P(dezena)  = 15/25        ≈ 0.600
+      P(par)     = (15·14)/(25·24) ≈ 0.350
+      P(trinca)  = 15·14·13/(25·24·23) ≈ 0.198  (referência; não usada aqui)
 
-    A regularização evita que oscilações amostrais (poucos concursos)
-    sejam interpretadas como vantagem real. α=50 equivale a "50 jogos
-    de informação teórica" adicionados ao prior.
+    A regularização bayesiana evita confundir oscilação amostral com sinal.
+    α=50 equivale a "50 jogos teóricos adicionados ao prior".
     """
     WINDOWS = (30, 100, 300)
     WEIGHTS = (0.5, 0.3, 0.2)
-    DEZENA_THEORETICAL = 15 / 25            # 0.600
-    PAIR_THEORETICAL   = (15/25) * (14/24)  # 0.350
+    DEZENA_THEORETICAL = 15 / 25
+    PAIR_THEORETICAL = (15/25) * (14/24)
 
     def __init__(self, contests, alpha=50.0):
         self.alpha = float(alpha)
@@ -473,9 +545,10 @@ class HistoricalProfile:
         if n == 0:
             return
 
-        dezena_frac = np.zeros(25)
-        pair_frac = np.zeros((25, 25))
+        dez_sum = np.zeros(25)
+        pair_sum = np.zeros((25, 25))
         weight_sum = 0.0
+        a = self.alpha
 
         for w, weight in zip(self.WINDOWS, self.WEIGHTS):
             n_w = min(w, n)
@@ -492,30 +565,29 @@ class HistoricalProfile:
                     for j in range(i + 1, len(dz)):
                         pair_counts[dz[i], dz[j]] += 1
                         pair_counts[dz[j], dz[i]] += 1
-            dezena_frac += weight * (counts / n_w)
-            pair_frac += weight * (pair_counts / n_w)
+
+            # regularização POR JANELA (usa n_w, não n)
+            dez_win = (counts + a * self.DEZENA_THEORETICAL) / (n_w + a)
+            pair_win = (pair_counts + a * self.PAIR_THEORETICAL) / (n_w + a)
+
+            dez_sum += weight * dez_win
+            pair_sum += weight * pair_win
             weight_sum += weight
 
-        if weight_sum == 0:
-            return
-        dezena_frac /= weight_sum
-        pair_frac /= weight_sum
-
-        n_eff = float(n)
-        a = self.alpha
-        self.dezena_freq = (dezena_frac * n_eff + a * self.DEZENA_THEORETICAL) / (n_eff + a)
-        self.pair_freq = (pair_frac * n_eff + a * self.PAIR_THEORETICAL) / (n_eff + a)
-        self.pair_freq = (self.pair_freq + self.pair_freq.T) / 2
-        np.fill_diagonal(self.pair_freq, 0.0)
+        if weight_sum > 0:
+            self.dezena_freq = dez_sum / weight_sum
+            self.pair_freq = pair_sum / weight_sum
+            self.pair_freq = (self.pair_freq + self.pair_freq.T) / 2
+            np.fill_diagonal(self.pair_freq, 0.0)
 
     def summary(self):
         dev = self.dezena_freq - self.DEZENA_THEORETICAL
         order = np.argsort(dev)
         print(f"\n📊 HISTORICAL PROFILE (n={self.n_contests}, α={self.alpha:.0f})")
-        print(f"   Dezenas mais frequentes vs teórico:")
+        print("   + frequentes vs teórico:")
         for idx in order[::-1][:5]:
             print(f"     {idx+1:2d}: {self.dezena_freq[idx]:.3f} ({dev[idx]:+.3f})")
-        print(f"   Dezenas menos frequentes vs teórico:")
+        print("   − frequentes vs teórico:")
         for idx in order[:5]:
             print(f"     {idx+1:2d}: {self.dezena_freq[idx]:.3f} ({dev[idx]:+.3f})")
 
@@ -563,8 +635,6 @@ class PortfolioOptimizer:
         ]
 
     # --------------------------------------------------------
-    # Universo efetivo considerando semifixas (combinatória exata)
-    # --------------------------------------------------------
     def _effective_universe_with_semifixas(self):
         fixed_set = set(self.fixed)
         excl_set = set(self.excluded)
@@ -588,8 +658,6 @@ class PortfolioOptimizer:
             return 0
         return sum(comb(s, k) * comb(f, n_free - k) for k in range(lo, hi + 1))
 
-    # --------------------------------------------------------
-    # MODO RÁPIDO: tentativas até completar pool
     # --------------------------------------------------------
     def generate_pool(self, n_candidates):
         pool, seen = [], set()
@@ -643,8 +711,6 @@ class PortfolioOptimizer:
             print("⚠️ Pool incompleto: limite de tentativas atingido.")
         return pool
 
-    # --------------------------------------------------------
-    # MODO EXATO: enumera universo + reservoir sampling O(k)
     # --------------------------------------------------------
     def enumerate_and_sample(self, n_sample, seed=None):
         rng = np.random.default_rng(seed)
@@ -817,20 +883,23 @@ class PortfolioOptimizer:
         return reservoir, stats
 
     # --------------------------------------------------------
-    # COVERING CLÁSSICO (v49.4.3 — mantido inalterado)
+    # COVERING CLÁSSICO (bitmask)
     # --------------------------------------------------------
-    def select_covering(self, candidates, n_select, level='pair'):
+    def select_covering(self, candidates, n_select, level='pair',
+                        max_cover=None):
         if len(candidates) < n_select:
             raise ValueError(f"Pool insuficiente: {len(candidates)} < {n_select}")
 
-        MAX_COVER = 50000 if level == 'pair' else 20000
+        if max_cover is None:
+            max_cover = 50000 if level == 'pair' else 20000
+
         total_available = len(candidates)
 
-        print(f"\n🔧 COVERING ({level})")
+        print(f"\n🔧 COVERING ({level}) — clássico")
         print(f"   Entrada (pool): {total_available:,}")
-        if total_available > MAX_COVER:
-            print(f"   MAX_COVER: {MAX_COVER:,} → truncando (subamostra do pool)")
-            working = random.sample(candidates, MAX_COVER)
+        if total_available > max_cover:
+            print(f"   MAX_COVER: {max_cover:,} → truncando")
+            working = random.sample(candidates, max_cover)
         else:
             print(f"   Sem truncar (pool ≤ MAX_COVER)")
             working = list(candidates)
@@ -861,23 +930,25 @@ class PortfolioOptimizer:
         return [working[i] for i in selected]
 
     # --------------------------------------------------------
-    # v49.5 — ADAPTIVE COVERING
+    # v49.6 — COVERING ADAPTATIVO (normalizado + log utility p/ pares)
     # --------------------------------------------------------
     def select_covering_adaptive(self, candidates, n_select, profile, level='pair',
-                                 w_gain=1.0, w_hist=10.0,
-                                 w_balance=1.0, w_overlap=5.0,
+                                 w_gain=1.0, w_hist=0.05,
+                                 w_balance=0.15, w_overlap=0.10,
                                  max_cover=None):
         """
-        Seleção adaptativa:
-            score = w_gain·C + w_hist·H − w_balance·ΔD − w_overlap·R
+        Score normalizado por jogo:
+            S = w_gain·gain_norm + w_hist·hist_norm
+                + w_balance·(−balance_norm) − w_overlap·overlap_norm
 
-        C  = pares/trincas NOVOS cobertos
-        H  = Σ (pair_freq[a,b] − 0.35)  (bônus histórico)
-        ΔD = soma incremental de (count_dezena − alvo)²  (custo de balanço)
-        R  = Σ max(0, overlap−8)² entre jogos já selecionados
+        gain_norm (pair):  log_utility = Σ_p log((2+c_p)/(1+c_p)) / (105·log2)
+        gain_norm (triple):(bits_novos) / 455
 
-        Pré-computa H para todos candidatos (estático), tornando o loop
-        O(n_select · pool · 15) em vez de O(n_select · pool · 15²).
+        balance_norm = Δcost / 15, onde
+            Δcost = 15 + 2·Σ_d(count_d + [d in game] − target_d)
+        target_d é a exposição esperada no POOL VÁLIDO.
+
+        overlap_norm = Σ_{já sel} max(0, |game ∩ sel_j| − 8)² / max(1, |sel|)
         """
         if len(candidates) < n_select:
             raise ValueError(f"Pool insuficiente: {len(candidates)} < {n_select}")
@@ -888,24 +959,29 @@ class PortfolioOptimizer:
         total = len(candidates)
         if total > max_cover:
             working = random.sample(candidates, max_cover)
-            print(f"\n🔧 ADAPTIVE {level.upper()} COVERING")
+            print(f"\n🔧 ADAPTIVE {level.upper()} COVERING (v49.6)")
             print(f"   Pool: {total:,} → truncado para {max_cover:,}")
         else:
             working = list(candidates)
-            print(f"\n🔧 ADAPTIVE {level.upper()} COVERING")
+            print(f"\n🔧 ADAPTIVE {level.upper()} COVERING (v49.6)")
             print(f"   Pool: {total:,} (sem truncar)")
 
-        # Máscaras de cobertura
-        t0 = time.time()
-        masks = [_pairs_mask(c) if level == 'pair' else _triples_mask(c) for c in working]
-        print(f"   Máscaras: {time.time()-t0:.2f}s")
+        n_cand = len(working)
 
-        # Pré-computa bônus histórico (estático por candidato)
-        t0 = time.time()
+        # --- target_counts extraído do pool válido ---
+        target_counts = np.zeros(25)
+        for g in working:
+            for d in g:
+                target_counts[d - 1] += 1
+        target_counts = target_counts / n_cand * n_select
+        print(f"   target: min={target_counts.min():.2f} max={target_counts.max():.2f} "
+              f"μ={target_counts.mean():.2f}")
+
+        # --- bônus histórico pré-computado (estático) ---
         bonus_mat = profile.pair_freq - profile.PAIR_THEORETICAL
         np.fill_diagonal(bonus_mat, 0.0)
-        n_cand = len(working)
-        hist_bonus = np.zeros(n_cand, dtype=float)
+        t_h = time.time()
+        hist_bonus = np.zeros(n_cand)
         for idx, g in enumerate(working):
             hb = 0.0
             for a_idx in range(15):
@@ -914,9 +990,20 @@ class PortfolioOptimizer:
                 for b_idx in range(a_idx + 1, 15):
                     hb += row[g[b_idx] - 1]
             hist_bonus[idx] = hb
-        print(f"   Bônus histórico: {time.time()-t0:.2f}s")
+        print(f"   Bônus histórico: {time.time()-t_h:.2f}s")
 
-        target = n_select * 15 / 25  # ≈ 3 dezenas por dezena em 5 jogos
+        # --- máscaras / pairs pré-computados ---
+        t0 = time.time()
+        if level == 'pair':
+            masks = None
+            cand_pairs = []
+            for g in working:
+                cand_pairs.append([(a - 1, b - 1) for a, b in combinations(sorted(g), 2)])
+            pair_counts_sel = defaultdict(int)
+        else:
+            masks = [_triples_mask(c) for c in working]
+            cand_pairs = None
+        print(f"   Pré-processamento: {time.time()-t0:.2f}s")
 
         covered = 0
         selected_idx = []
@@ -924,39 +1011,53 @@ class PortfolioOptimizer:
         dezena_counts = np.zeros(25)
         remaining = set(range(n_cand))
 
+        LOG2 = np.log(2.0)
+        PAIR_MAX_GAIN = 105 * LOG2   # ≈ 72.8
+        TRIPLE_MAX_GAIN = 455.0
+
         t1 = time.time()
         for _step in range(n_select):
             if not remaining:
                 break
 
             best_i, best_score = -1, -np.inf
+            n_sel = len(selected_sets)
+
             for i in remaining:
                 game = working[i]
 
-                # (a) ganho de cobertura (bitwise)
-                gain = (masks[i] & ~covered).bit_count()
+                # (a) ganho de cobertura
+                if level == 'pair':
+                    log_gain = 0.0
+                    for p in cand_pairs[i]:
+                        c = pair_counts_sel[p]
+                        log_gain += np.log((2 + c) / (1 + c))
+                    gain_norm = log_gain / PAIR_MAX_GAIN
+                else:
+                    gain_norm = (masks[i] & ~covered).bit_count() / TRIPLE_MAX_GAIN
 
-                # (b) bônus histórico pré-computado
-                hb = hist_bonus[i]
+                # (b) bônus histórico
+                hist_norm = hist_bonus[i] / (105 * 0.1) if 105 * 0.1 > 0 else 0.0
 
                 # (c) delta do custo de balanço
-                #     new_cost = old_cost + 15 + 2·Σ(counts[d]−target)
                 delta_cost = 15.0
                 for x in game:
-                    delta_cost += 2.0 * (dezena_counts[x - 1] - target)
+                    delta_cost += 2.0 * (dezena_counts[x - 1] - target_counts[x - 1])
+                balance_norm = delta_cost / 15.0
 
-                # (d) redundância com jogos já selecionados
+                # (d) redundância
                 gs = set(game)
                 overlap_pen = 0.0
                 for sg in selected_sets:
                     ov = len(gs & sg)
                     if ov > 8:
                         overlap_pen += (ov - 8) ** 2
+                overlap_norm = overlap_pen / max(1, n_sel)
 
-                score = (w_gain * gain
-                         + w_hist * hb
-                         - w_balance * delta_cost
-                         - w_overlap * overlap_pen)
+                score = (w_gain * gain_norm
+                         + w_hist * hist_norm
+                         - w_balance * balance_norm
+                         - w_overlap * overlap_norm)
 
                 if score > best_score:
                     best_score, best_i = score, i
@@ -965,20 +1066,173 @@ class PortfolioOptimizer:
                 break
 
             selected_idx.append(best_i)
-            covered |= masks[best_i]
             selected_sets.append(set(working[best_i]))
             for x in working[best_i]:
                 dezena_counts[x - 1] += 1
+            if level == 'pair':
+                for p in cand_pairs[best_i]:
+                    pair_counts_sel[p] += 1
+            else:
+                covered |= masks[best_i]
             remaining.discard(best_i)
 
         print(f"   Seleção: {time.time()-t1:.2f}s")
         return [working[i] for i in selected_idx]
 
     # --------------------------------------------------------
-    # OPTIMIZE
+    # v49.6 — BUSCA LOCAL (pares, incremental por log utility)
+    # --------------------------------------------------------
+    def local_search_pairs(self, portfolio, pool, profile,
+                           n_iter=5, max_candidates=200,
+                           w_gain=1.0, w_hist=0.05,
+                           w_balance=0.15, w_overlap=0.10,
+                           seed=None):
+        """
+        Substituição iterativa de 1 jogo por 1 candidato do pool.
+        Aceita se a qualidade global do portfólio (função normalizada,
+        log utility para pares) melhorar.
+        """
+        if len(pool) <= len(portfolio):
+            return portfolio
+
+        rng = random.Random(seed)
+        n_games = len(portfolio)
+
+        if len(pool) > 5000:
+            pool_sample = rng.sample(pool, 5000)
+        else:
+            pool_sample = list(pool)
+
+        target_counts = np.zeros(25)
+        for g in pool_sample:
+            for d in g:
+                target_counts[d - 1] += 1
+        target_counts = target_counts / len(pool_sample) * n_games
+
+        bonus_mat = profile.pair_freq - profile.PAIR_THEORETICAL
+        np.fill_diagonal(bonus_mat, 0.0)
+
+        LOG2 = np.log(2.0)
+        PAIR_MAX_GAIN = n_games * 105 * LOG2
+
+        def quality(games):
+            counts = defaultdict(int)
+            for g in games:
+                for p in combinations(sorted(g), 2):
+                    counts[p] += 1
+            log_u = sum(np.log(1 + c) for c in counts.values())
+            gain_norm = log_u / PAIR_MAX_GAIN
+
+            hb = 0.0
+            for g in games:
+                for a, b in combinations(sorted(g), 2):
+                    hb += bonus_mat[a - 1, b - 1]
+            hist_norm = hb / (n_games * 105 * 0.1)
+
+            dc = np.zeros(25)
+            for g in games:
+                for d in g:
+                    dc[d - 1] += 1
+            balance_norm = float(np.sum((dc - target_counts) ** 2)) / (n_games * 15.0)
+
+            ov_pen = 0.0
+            for i in range(len(games)):
+                for j in range(i + 1, len(games)):
+                    ov = len(set(games[i]) & set(games[j]))
+                    if ov > 8:
+                        ov_pen += (ov - 8) ** 2
+            overlap_norm = ov_pen / max(1, n_games)
+
+            return (w_gain * gain_norm
+                    + w_hist * hist_norm
+                    - w_balance * balance_norm
+                    - w_overlap * overlap_norm)
+
+        best = list(portfolio)
+        best_q = quality(best)
+
+        print(f"\n🔧 LOCAL SEARCH (pairs, {n_iter} iters × {max_candidates} cands/jogo)")
+        for iteration in range(n_iter):
+            improved = False
+            positions = list(range(n_games))
+            rng.shuffle(positions)
+            for pos in positions:
+                trial_cands = rng.sample(range(len(pool_sample)),
+                                         min(max_candidates, len(pool_sample)))
+                best_ci = -1
+                best_q_trial = best_q
+                for ci in trial_cands:
+                    trial = best.copy()
+                    trial[pos] = pool_sample[ci]
+                    q = quality(trial)
+                    if q > best_q_trial:
+                        best_q_trial = q
+                        best_ci = ci
+                if best_ci >= 0:
+                    best[pos] = pool_sample[best_ci]
+                    best_q = best_q_trial
+                    improved = True
+            print(f"   iter {iteration+1}: quality={best_q:.5f}"
+                  + (" (melhorou)" if improved else " (sem melhora)"))
+            if not improved:
+                break
+
+        return best
+
+    # --------------------------------------------------------
+    # v49.6 — BUSCA LOCAL para trincas (recomputação completa)
+    # --------------------------------------------------------
+    def local_search_triples(self, portfolio, pool, n_iter=3, max_candidates=100,
+                             seed=None):
+        if len(pool) <= len(portfolio):
+            return portfolio
+        rng = random.Random(seed)
+        n_games = len(portfolio)
+        if len(pool) > 3000:
+            pool_sample = rng.sample(pool, 3000)
+        else:
+            pool_sample = list(pool)
+
+        def quality(games):
+            tris = set()
+            for g in games:
+                tris.update(combinations(sorted(g), 3))
+            return len(tris)
+
+        best = list(portfolio)
+        best_q = quality(best)
+        print(f"\n🔧 LOCAL SEARCH (triples, {n_iter} iters × {max_candidates} cands/jogo)")
+        for iteration in range(n_iter):
+            improved = False
+            positions = list(range(n_games))
+            rng.shuffle(positions)
+            for pos in positions:
+                trial_cands = rng.sample(range(len(pool_sample)),
+                                         min(max_candidates, len(pool_sample)))
+                best_ci = -1
+                best_q_trial = best_q
+                for ci in trial_cands:
+                    trial = best.copy()
+                    trial[pos] = pool_sample[ci]
+                    q = quality(trial)
+                    if q > best_q_trial:
+                        best_q_trial = q
+                        best_ci = ci
+                if best_ci >= 0:
+                    best[pos] = pool_sample[best_ci]
+                    best_q = best_q_trial
+                    improved = True
+            print(f"   iter {iteration+1}: trincas distintas={best_q}"
+                  + (" (melhorou)" if improved else " (sem melhora)"))
+            if not improved:
+                break
+        return best
+
     # --------------------------------------------------------
     def optimize(self, n_games=5, n_candidates=600000, method='pair_covering',
-                 exact_universe=False, seed=None):
+                 exact_universe=False, seed=None,
+                 use_local_search=True,
+                 ls_iter=5, ls_max_candidates=200):
         print(f"\n🧩 CARTEIRA: {n_games} jogos | {method} | "
               f"pool={n_candidates:,} | crit={self.use_criteria} | grp={len(self.groups)}")
         print(f"   Modo: {'ENUMERAÇÃO EXATA' if exact_universe else 'TENTATIVAS'}")
@@ -987,7 +1241,6 @@ class PortfolioOptimizer:
             pool, stats = self.enumerate_and_sample(n_candidates, seed=seed)
             if not pool:
                 raise RuntimeError(f"Enumeração falhou: {stats}")
-
             print(f"\n📊 UNIVERSO E POOL")
             print(f"   Universo bruto (C(25,15)):         {stats['universe_full']:>15,}")
             print(f"   Efetivas (fixas/excluídas):        {stats['universe_effective']:>15,}")
@@ -1001,7 +1254,6 @@ class PortfolioOptimizer:
             print(f"   Cobertura sobre universo válido:   "
                   f"{stats['coverage_sample_over_valid']*100:.2f}%")
             print(f"   Tempo de enumeração:               {stats['elapsed']:.1f}s")
-
             print(f"\n📊 REJEIÇÕES POR FILTRO (ordem de avaliação)")
             rej = stats['rejections']
             total_rej = sum(rej.values())
@@ -1025,8 +1277,21 @@ class PortfolioOptimizer:
             portfolio = self.select_covering_adaptive(
                 pool, n_games, profile, level='pair'
             )
+            if use_local_search:
+                portfolio = self.local_search_pairs(
+                    portfolio, pool, profile,
+                    n_iter=ls_iter, max_candidates=ls_max_candidates,
+                    seed=seed,
+                )
         elif method == 'triple_covering':
             portfolio = self.select_covering(pool, n_games, level='triple')
+            if use_local_search:
+                portfolio = self.local_search_triples(
+                    portfolio, pool,
+                    n_iter=max(2, ls_iter // 2),
+                    max_candidates=max(50, ls_max_candidates // 2),
+                    seed=seed,
+                )
         else:
             portfolio = pool[:n_games]
         return portfolio
@@ -1034,18 +1299,27 @@ class PortfolioOptimizer:
     def backtest(self, portfolio, test_draws):
         return backtest_portfolio(portfolio, test_draws)
 
+    # --------------------------------------------------------
+    # v49.6 — backtest_vs_null aceita candidate_pool para nulo do MESMO universo
+    # --------------------------------------------------------
     def backtest_vs_null(self, portfolio, test_draws, n_null=1000, seed=42,
                          metric='draws_with_win_rate',
-                         fixed=None, excluded=None):
+                         fixed=None, excluded=None, candidate_pool=None):
         rng = np.random.default_rng(seed)
         real_bt = self.backtest(portfolio, test_draws)
         real_val = real_bt[metric]
-        conditioned = (fixed is not None) or (excluded is not None)
+
+        conditioned = (candidate_pool is not None
+                       or (fixed is not None) or (excluded is not None))
         null_vals = []
 
         for _ in range(n_null):
             try:
-                if conditioned:
+                if candidate_pool is not None:
+                    if len(candidate_pool) < len(portfolio):
+                        continue
+                    null_port = random.sample(candidate_pool, len(portfolio))
+                elif (fixed is not None) or (excluded is not None):
                     null_port = random_portfolio_conditioned(
                         len(portfolio), fixed, excluded, rng
                     )
@@ -1075,13 +1349,19 @@ class PortfolioOptimizer:
             'n_null': len(null_arr),
             'metric': metric,
             'conditioned': conditioned,
+            'from_pool': candidate_pool is not None,
         }
 
 
 def print_null_comparison(r, label="Carteira"):
     if r is None:
         return
-    tag = "CONDICIONADO" if r['conditioned'] else "IRRESTRITO"
+    if r.get('from_pool'):
+        tag = "NULO DO MESMO POOL"
+    elif r['conditioned']:
+        tag = "CONDICIONADO (fix/excl)"
+    else:
+        tag = "IRRESTRITO"
     print(f"\n🔬 BACKTEST vs. NULO ({tag}) — {label}")
     print(f"   Real: {r['real_metric']:.4f}")
     print(f"   Nulo (n={r['n_null']}): média={r['null_mean']:.4f}, "
@@ -1539,8 +1819,8 @@ def _ask_structural_ranges():
 def _ask_covering_method():
     print("\n   Método:")
     print("     [1] Pair covering clássico")
-    print("     [2] Pair covering ADAPTATIVO (v49.5)")
-    print("     [3] Triple covering clássico")
+    print("     [2] Pair covering ADAPTATIVO + local search (v49.6)")
+    print("     [3] Triple covering clássico + local search (v49.6)")
     s = input("   Escolha [1]: ").strip() or "1"
     return {'1': 'pair_covering', '2': 'pair_covering_adaptive',
             '3': 'triple_covering'}.get(s, 'pair_covering')
@@ -1548,7 +1828,7 @@ def _ask_covering_method():
 
 def main():
     print("=" * 70)
-    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v49.5.0")
+    print("🔬 LABORATÓRIO DE ANÁLISE ESTRUTURAL DA LOTOFÁCIL – v49.6.0")
     print("=" * 70)
 
     contests = load_all_contests('resultados_lotofacil.csv')
@@ -1576,7 +1856,7 @@ def main():
         print("11. Teste concurso a concurso")
         print("12. Walk-forward estrutural")
         print("13. EXPERIMENTO 3 BRAÇOS")
-        print("14. COMPARAR Pair Clássico vs Adaptive (v49.5)")
+        print("14. COMPARAR Pair Clássico vs Adaptive+LS (v49.6)")
         print("0.  Sair")
         op = input("Escolha: ").strip()
 
@@ -1602,15 +1882,15 @@ def main():
 
             print("\n   Modo de amostragem:")
             print("     [1] Tentativas (rápido)")
-            print("     [2] Universo exato (enumera todas as combinações efetivas,")
-            print("         conta válidas, amostra SEM reposição via reservoir)")
+            print("     [2] Universo exato")
             modo = input("   Escolha [1]: ").strip() or "1"
             exact = (modo == '2')
 
             default_pool = 50000 if exact else 600000
             pool = input_pool_size(default_pool)
-
             method = _ask_covering_method()
+
+            ls = (input("   Usar local search? (s/n) [s]: ").strip().lower() != 'n')
 
             opt = PortfolioOptimizer(
                 contests, fixed=fixed, semifixed=semifixed,
@@ -1618,16 +1898,21 @@ def main():
                 excluded=excluded, groups=groups, use_criteria=True,
                 **ranges,
             )
-            portfolio = opt.optimize(5, pool, method=method, exact_universe=exact)
+            portfolio = opt.optimize(5, pool, method=method, exact_universe=exact,
+                                     use_local_search=ls)
 
             for i, g in enumerate(portfolio, 1):
                 print(f" {i}. {g}")
             audit_portfolio(portfolio, groups, applied_criteria=True)
+            print_portfolio_metrics(portfolio, "gerada")
 
             if len(contests) > 200:
+                # nulo do mesmo pool (v49.6): usa os últimos 200
+                pool_bt = opt.generate_pool(5000) if not exact else None
                 null_r = opt.backtest_vs_null(
                     portfolio, contests[-200:],
                     n_null=500, fixed=fixed, excluded=excluded,
+                    candidate_pool=pool_bt,
                 )
                 print_null_comparison(null_r, "Gerada")
 
@@ -1665,18 +1950,23 @@ def main():
             modo = input("   Escolha [1]: ").strip() or "1"
             exact = (modo == '2')
             pool = input_pool_size(50000 if exact else 600000)
-
             method = _ask_covering_method()
+            ls = (input("   Usar local search? (s/n) [s]: ").strip().lower() != 'n')
 
             opt = PortfolioOptimizer(
                 contests, fixed=fixed, excluded=excluded,
                 groups=groups, use_criteria=True, **ranges,
             )
-            portfolio = opt.optimize(5, pool, method=method, exact_universe=exact)
+            portfolio = opt.optimize(5, pool, method=method, exact_universe=exact,
+                                     use_local_search=ls)
             audit_portfolio(portfolio, groups, applied_criteria=True)
+            print_portfolio_metrics(portfolio, "backtest 200")
+
+            pool_bt = opt.generate_pool(5000) if not exact else None
             null_r = opt.backtest_vs_null(
                 portfolio, contests[-200:],
                 n_null=500, fixed=fixed, excluded=excluded,
+                candidate_pool=pool_bt,
             )
             print_null_comparison(null_r, "Backtest 200")
 
@@ -1727,8 +2017,7 @@ def main():
             StructuralPredictor(contests).predict_ranges(method=m)
 
         elif op == '9':
-            # ⚠️ CORRIGIDO: sem vazamento temporal
-            print("\n   ⚠️ v49.5: treino/teste estanques (sem vazamento temporal)")
+            print("\n   ⚠️ v49.6: treino/teste estanques (sem vazamento temporal)")
             train = contests[:-200]
             test = contests[-200:]
 
@@ -1743,6 +2032,7 @@ def main():
             exact = (modo == '2')
             pool = input_pool_size(50000 if exact else 600000)
             method = _ask_covering_method()
+            ls = (input("   Usar local search? (s/n) [s]: ").strip().lower() != 'n')
 
             opt = PortfolioOptimizer(
                 train, fixed=fixed, excluded=excluded,
@@ -1750,16 +2040,21 @@ def main():
                 range_primos=ranges.get('primos'), range_soma=ranges.get('soma'),
                 range_amplitude=ranges.get('amplitude'),
                 range_consecutivos=ranges.get('consecutivos'),
-                groups=groups,
-                use_criteria=False,   # ⚠️ critérios foram ajustados em dados antigos
+                groups=groups, use_criteria=False,
             )
-            portfolio = opt.optimize(5, pool, method=method, exact_universe=exact)
+            portfolio = opt.optimize(5, pool, method=method, exact_universe=exact,
+                                     use_local_search=ls)
             audit_portfolio(portfolio, groups, applied_criteria=False)
+            print_portfolio_metrics(portfolio, "estrutural OOS")
+
             bt = opt.backtest(portfolio, test)
             print(f"\n📊 BACKTEST OOS (200): rate={bt['draws_with_win_rate']:.4f} "
                   f"roi={bt['roi']:+.1f}%")
+
+            pool_bt = opt.generate_pool(5000) if not exact else None
             null_r = opt.backtest_vs_null(
                 portfolio, test, n_null=500, fixed=fixed, excluded=excluded,
+                candidate_pool=pool_bt,
             )
             print_null_comparison(null_r, "Estrutural OOS")
 
@@ -1813,8 +2108,9 @@ def main():
             )
 
         elif op == '14':
-            print("\n⚖️ COMPARAÇÃO v49.5: Pair Clássico vs. Pair Adaptativo")
-            print("   Protocolo: treino/teste estanques, mesmo pool para ambos.")
+            print("\n⚖️ COMPARAÇÃO v49.6: Pair Clássico vs Adaptive+LS")
+            print("   Protocolo: treino/teste estanques, MESMO pool para ambos,")
+            print("   mesma semente, local search habilitado no adaptativo.")
             if len(contests) < 400:
                 print("   ❌ Histórico insuficiente (< 400 concursos).")
                 continue
@@ -1826,19 +2122,26 @@ def main():
             es = input("   Excluídas: ").strip()
             excluded = [int(x) for x in es.split()] if es else []
             try:
-                pool_size = int(input("   Tamanho do pool [50000]: ").strip() or "50000")
+                pool_size = int(input("   Tamanho do pool [20000]: ").strip() or "20000")
             except:
-                pool_size = 50000
+                pool_size = 20000
             try:
                 n_games = int(input("   Jogos por carteira [5]: ").strip() or "5")
             except:
                 n_games = 5
             try:
-                n_rep = int(input("   Réplicas [30]: ").strip() or "30")
+                n_rep = int(input("   Réplicas [20]: ").strip() or "20")
             except:
-                n_rep = 30
+                n_rep = 20
+            ls = (input("   Local search no adaptativo? (s/n) [s]: ").strip().lower() != 'n')
 
-            results = {'classic': [], 'adaptive': []}
+            # Corrigido: subamostra comum antes de qualquer seleção.
+            # Mantém pool_size abaixo de MAX_COVER para não haver divergência.
+            MAX_COVER = 50000
+            pool_size = min(pool_size, MAX_COVER)
+
+            results = {'classic': [], 'adaptive': [],
+                       'classic_m': [], 'adaptive_m': []}
             t_start = time.time()
             for rep in range(n_rep):
                 random.seed(rep * 997 + 1)
@@ -1847,26 +2150,60 @@ def main():
                                          use_criteria=False)
                 pool = opt.generate_pool(pool_size)
 
-                p_c = opt.select_covering(pool, n_games, level='pair')
-                results['classic'].append(opt.backtest(p_c, test)['draws_with_win_rate'])
+                # Pool comum, sem subamostragem divergente
+                common_pool = list(pool)
+                if len(common_pool) > MAX_COVER:
+                    common_pool = random.sample(common_pool, MAX_COVER)
 
-                profile = HistoricalProfile(train)
-                p_a = opt.select_covering_adaptive(pool, n_games, profile, level='pair')
-                results['adaptive'].append(opt.backtest(p_a, test)['draws_with_win_rate'])
+                p_c = opt.select_covering(common_pool, n_games, level='pair',
+                                          max_cover=MAX_COVER)
+                p_a = opt.select_covering_adaptive(common_pool, n_games,
+                                                    HistoricalProfile(train),
+                                                    level='pair',
+                                                    max_cover=MAX_COVER)
+                if ls:
+                    p_a = opt.local_search_pairs(
+                        p_a, common_pool, HistoricalProfile(train),
+                        n_iter=3, max_candidates=150,
+                        seed=rep * 997 + 7,
+                    )
+
+                bt_c = opt.backtest(p_c, test)
+                bt_a = opt.backtest(p_a, test)
+                results['classic'].append(bt_c['draws_with_win_rate'])
+                results['adaptive'].append(bt_a['draws_with_win_rate'])
+                results['classic_m'].append(portfolio_metrics(p_c))
+                results['adaptive_m'].append(portfolio_metrics(p_a))
 
                 if (rep + 1) % 5 == 0:
                     print(f"   réplica {rep+1}/{n_rep} "
                           f"(elapsed={time.time()-t_start:.0f}s)")
 
             print("\n📊 RESULTADOS OOS (200 concursos finais)")
-            for k, arr in results.items():
-                arr = np.array(arr)
+            for k in ('classic', 'adaptive'):
+                arr = np.array(results[k])
                 print(f"   {k:<10} rate={arr.mean():.4f} ± {arr.std():.4f}")
 
             ca, ad = np.array(results['classic']), np.array(results['adaptive'])
             t, p = ttest_rel(ad, ca, alternative='greater')
-            print(f"\nAdaptive > Classic: diff={np.mean(ad-ca):+.4f} "
-                  f"t={t:+.2f} p={p:.4f} {'🔍' if p < 0.05 else '  '}")
+            print(f"\nAdaptive+LS > Classic (pareado por réplica): "
+                  f"diff={np.mean(ad-ca):+.4f} t={t:+.2f} p={p:.4f} "
+                  f"{'🔍' if p < 0.05 else '  '}")
+            print("   ⚠️ Interpretação: réplicas compartilham os mesmos 200 testes.")
+            print("      O p-valor mede robustez frente à semente, NÃO generalização")
+            print("      temporal. Para isso, use walk-forward (menu 12) em vários períodos.")
+
+            # Média das métricas combinatórias
+            print("\n📊 MÉTRICAS COMBINATÓRIAS MÉDIAS")
+            keys = ['n_distinct_pairs', 'n_distinct_triples',
+                    'avg_pair_repetition', 'avg_triple_repetition',
+                    'avg_game_overlap', 'dezena_std']
+            for k in keys:
+                c_vals = [m[k] for m in results['classic_m'] if m]
+                a_vals = [m[k] for m in results['adaptive_m'] if m]
+                if c_vals and a_vals:
+                    print(f"   {k:<22} classic={np.mean(c_vals):.2f}  "
+                          f"adaptive={np.mean(a_vals):.2f}")
 
         elif op == '0':
             break
